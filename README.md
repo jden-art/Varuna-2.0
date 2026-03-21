@@ -61,16 +61,23 @@ Physical deployment:
 
 ## 2. The Core Measurement Principle — Buoy-Tether Pendulum (OLP)
 
-OLP = Output Linkage Pendulum. A buoy tethered to a fixed riverbed anchor by a cable of known length L.
+
+
+
+# Water Level Detection Mechanism — Complete Explanation
+
+---
+
+## THE PHYSICAL SETUP
 
 ```
-SIDE VIEW — TAUT TETHER:
+SIDE VIEW OF DEPLOYED SYSTEM:
 
 Water Surface ~~~~~~~~~~●~~~~~~~~~~~~~
                        /|
                       / |
                      /  |
-                L   /   |  H (water level above riverbed)
+                L   /   |  H (what we want to measure)
   (fixed wire)     /    |
                   / θ   |
                  /      |
@@ -79,125 +86,686 @@ Riverbed ─────●─────────+────────�
             ANCHOR    (projection)
 ```
 
-**The geometry:**
+Three physical components:
+
+```
+1. ANCHOR
+   • Fixed point bolted/weighted to the riverbed
+   • Position never changes
+   • This is the origin of our measurement
+
+2. TETHER (OLP — Output Linkage Pendulum)
+   • Fixed length wire connecting anchor to buoy
+   • Length L is PRECISELY KNOWN (measured at installation)
+   • L is chosen to equal the FLOOD THRESHOLD water level
+   • Made of stiff braided cable or wire (minimal stretch)
+   • Does NOT change length over time
+
+3. BUOY (Capsule)
+   • Floats at the water surface (density < water)
+   • Contains MPU6050 (gyro + accelerometer)
+   • Contains pressure sensor
+   • Contains microcontroller + radio
+   • Bottom-heavy design (ballast low, electronics low)
+   • Tether attaches at the VERY BOTTOM of the capsule
+```
+
+---
+
+## THE FUNDAMENTAL GEOMETRY
+
+The buoy MUST float at the water surface. The tether CONSTRAINS the buoy to move along a circular arc of radius L centered at the anchor.
+
+These two facts create a **right triangle**:
+
+```
+                    ● Buoy (at water surface)
+                   /|
+                  / |
+                 /  |
+            L   /   |  H = water level above riverbed
+  (hypotenuse)/    |  (vertical leg)
+              / θ   |
+             /      |
+            /       |
+  Anchor  ●─────────+
+              d
+        (horizontal leg)
+```
+
+Three sides:
+```
+HYPOTENUSE:   L = tether length (KNOWN CONSTANT)
+VERTICAL LEG: H = water level height (WHAT WE WANT)
+HORIZONTAL:   d = horizontal displacement (don't care)
+```
+
+One angle:
+```
+θ = angle between tether and vertical
+    (MEASURED by MPU6050)
+```
+
+**The equation:**
+
 ```
 ┌───────────────────────────────────┐
 │                                   │
 │        H = L × cos(θ)            │
 │                                   │
-│   L = tether length (KNOWN)       │
-│   θ = angle from vertical         │
-│       (MEASURED by MPU6050)       │
-│   H = water height (DERIVED)      │
+│   L is known.                     │
+│   θ is measured.                  │
+│   Therefore H is determined.      │
 │                                   │
 └───────────────────────────────────┘
-
-This is fundamentally different from H = L × sin(θ).
-cos(θ) gives the VERTICAL projection of the tether.
-The buoy floats at the surface, so this vertical
-projection equals the water depth above the anchor.
 ```
 
-**Why current-independent:**
-```
-The buoy ALWAYS floats at the water surface.
-Its height IS the water level, regardless of current.
-Current only changes the buoy's HORIZONTAL position,
-which changes d (horizontal displacement) but NOT H.
+This is it. This is the entire core measurement.
 
-Same H → same θ → same cos(θ) → same measurement.
-```
+---
 
-**Four operating modes** based on water level relative to L:
+## WHY THIS WORKS REGARDLESS OF CURRENT
+
+This is the most important property. Watch what happens at **constant water level** with **different current speeds**:
 
 ```
-Mode 0: SLACK    H << L     Tether loose, buoy upright, H unknown but safe
-Mode 1: TAUT     H < L      Tether tight, H = L×cos(θ), precise measurement
-Mode 2: FLOOD    H ≈ L      θ → 0°, H ≈ L, flood threshold reached
-Mode 3: SUBMERGED H > L     Buoy pulled underwater, H = L + ΔP/(ρg)
+NO CURRENT:              MODERATE CURRENT:         STRONG CURRENT:
 
-                WATER LEVEL RISING →
+      ● buoy                  ● buoy                      ● buoy
+      |                      /                            /
+      | θ=0°                / θ=30°                      / θ=60°
+      |                    /                             /
+  L   |   H=L            / L    H                      / L       H
+      |                  /                              /
+      |                 /                              /
+      |                /                              /
+──────●────       ────●──────d──             ────────●──────d────────
+
+H = L×cos(0°)    H = L×cos(30°)             H = L×cos(60°)
+H = L             H = 0.866L                 H = 0.5L
+
+WAIT — these give DIFFERENT H values!
+But the water level is THE SAME in all three cases!
+```
+
+**No.** Read again. If the water level is the same in all three cases, then H is the same, and therefore θ is the same. The current pushes the buoy **horizontally**, but:
+
+```
+The buoy ALWAYS floats at the surface → its height IS the water level
+The buoy is constrained to the arc → H² + d² = L²
+Therefore → cos(θ) = H/L REGARDLESS of d
+
+Different current just changes d (horizontal position)
+Same H → same θ → same measurement
+The three diagrams above are WRONG — they show different H values
+which would mean different water levels, not different currents
+```
+
+Let me show it correctly:
+
+```
+SAME water level H, different currents:
+
+Calm:           Moderate:           Fast:
+● (at surface)  ● (at surface)      ● (at surface)
+|               /                    /
+| θ₁           / θ₁                / θ₁
+|              /                   /   ← ALL SAME ANGLE
+|             /                   /       because ALL at same height H
+●            ●                   ●
+
+cos(θ₁) = H/L in ALL cases ✓
+Current only changes WHERE on the surface the buoy sits
+NOT how high the surface is
+```
+
+**The only thing that changes H is the actual water level rising or falling.**
+
+---
+
+## WHAT THE MPU6050 ACTUALLY MEASURES
+
+The MPU6050 sits inside the buoy. It has two sensor types:
+
+### Accelerometer (Gives Tilt from Gravity)
+
+```
+BUOY TILTED AT ANGLE θ:
+
+    Gravity direction: straight down (always)
+    Buoy's local Z-axis: along the capsule's long axis
+    
+    In buoy's reference frame:
+    
+        az = g × cos(θ)    ← component along capsule axis
+        ax = g × sin(θ)    ← component perpendicular to axis
+        
+    Therefore:
+        θ = atan2(ax, az)
+```
+
+**Problem:** On a buoy in a river, the accelerometer also picks up wave bobbing, vibration, turbulence. These corrupt the reading.
+
+### Gyroscope (Gives Angular Velocity)
+
+```
+    ω = dθ/dt    (how fast the buoy is rotating)
+    
+    Integrate to get angle:
+        θ(t) = θ₀ + ∫ω dt
+        
+    Problem: integration drift (20-80°/hour)
+    After 1 hour the accumulated error could be 80°
+```
+
+### Sensor Fusion (Combining Both)
+
+Neither sensor alone works. Together they do:
+
+```
+COMPLEMENTARY FILTER:
+
+    θ_fused = 0.97 × (θ_prev + ω × dt) + 0.03 × atan2(ax, az)
+              ─────────────────────────   ─────────────────────
+              Gyro: accurate short-term   Accel: accurate long-term
+              (no vibration noise)         (no drift)
+              (but drifts over time)       (but noisy in waves)
+
+    Result: ±0.5-2° accuracy
+    This is what we use for θ in H = L × cos(θ)
+```
+
+Or better: use the MPU6050's **built-in DMP** which does this fusion in hardware and outputs clean angle values directly.
+
+---
+
+## THE FOUR OPERATING MODES
+
+Water level can be in four regimes relative to tether length L. Each requires different detection logic:
+
+### MODE 0: SLACK TETHER (H significantly below L)
+
+```
+Water Surface ~~~●~~~
+                 |
+                 | buoy floats freely
+                 |
+                 ⌢  tether hangs loose
+                 |    (distance to anchor < L)
+                 |
+Riverbed ────────●──── Anchor
+```
+
+**What happens physically:**
+- Water level H is much less than tether length L
+- The buoy floats directly above (or near) the anchor
+- The tether is NOT pulled taut — it droops with slack
+- The buoy is free to orient however buoyancy dictates
+- Buoyancy makes it perfectly upright (θ_buoy ≈ 0°)
+
+**What sensors read:**
+```
+Accelerometer:  ax ≈ 0, ay ≈ 0, az ≈ g
+                (pure gravity, no lateral component)
+                lateral_accel = sqrt(ax² + ay²) ≈ 0
+
+Gyroscope:      ω ≈ 0 (buoy sitting still)
+
+Pressure:       P ≈ P_atmospheric
+                (buoy at surface, sensor near waterline)
+```
+
+**How we detect this mode:**
+```
+IF lateral_accel < 0.15 m/s²
+AND tilt < 3°
+AND pressure ≈ P_atmospheric
+THEN → MODE 0: SLACK
+```
+
+**What we report:**
+```
+"Water level is BELOW flood threshold"
+"System is in SAFE condition"
+H < L but exact value unknown
+Alert level: GREEN (normal)
+```
+
+**Why we DON'T need exact H here:**
+Because L was chosen as the flood threshold. If H < L, the situation is safe. We don't need to know if H = 0.3L or H = 0.6L — both are safe. The system's PURPOSE is flood warning, not precise continuous measurement of low water levels.
+
+---
+
+### MODE 1: TAUT TETHER (H approaching L)
+
+```
+Water Surface ~~~~~~●~~~~~~~~~
+                   /|
+                  / |
+                 /  |
+            L   / θ | H (approaching L)
+               /    |
+              / θ   |
+             /      |
+Riverbed ───●───────+────
+          Anchor
+```
+
+**What happens physically:**
+- Water has risen enough (or current is strong enough) to pull tether taut
+- Buoy is constrained to the circular arc
+- Tether is straight and under tension
+- The right triangle geometry applies perfectly
+- θ is well-defined and measurable
+
+**Transition from MODE 0 to MODE 1:**
+As water rises, at some point the buoy's distance from anchor equals L. The tether goes taut. This can also happen when current pushes the buoy far enough horizontally that the tether stretches to full length.
+
+**What sensors read:**
+```
+Accelerometer:  ax ≠ 0 (lateral component from tether tension)
+                lateral_accel = sqrt(ax² + ay²) > 0.15 m/s²
+                
+                The tether pulls on the bottom of the buoy.
+                This pull has a horizontal component that shows
+                up as persistent lateral acceleration.
+
+Gyroscope:      θ is measurable and changing with water level
+                ω shows slow changes as water rises/falls
+
+Pressure:       P ≈ P_atmospheric (still floating at surface)
+```
+
+**How we detect this mode:**
+```
+IF lateral_accel > 0.15 m/s²
+AND tilt > 3°
+AND pressure ≈ P_atmospheric
+THEN → MODE 1: TAUT
+```
+
+**What we compute:**
+```
+θ = fused angle from DMP or complementary filter
+H = L × cos(θ)
+
+Example with L = 2.0m:
+  θ = 60° → H = 2.0 × cos(60°) = 1.00m
+  θ = 45° → H = 2.0 × cos(45°) = 1.41m
+  θ = 30° → H = 2.0 × cos(30°) = 1.73m
+  θ = 15° → H = 2.0 × cos(15°) = 1.93m
+  θ = 5°  → H = 2.0 × cos(5°)  = 1.99m
+  θ = 0°  → H = 2.0 × cos(0°)  = 2.00m = L (FLOOD!)
+```
+
+**What we report:**
+```
+"Water level: H = [value] meters"
+"Water level is at [H/L × 100]% of flood threshold"
+Alert level: YELLOW (elevated) when H/L > 0.7
+```
+
+---
+
+### MODE 2: FLOOD REACHED (H ≈ L)
+
+```
+Water Surface ~~~~~~●~~~~~~~~~~~~~
+                    |
+                    | θ ≈ 0° (nearly vertical)
+                    |
+                L   |  H ≈ L
+                    |
+                    |
+                    |
+Riverbed ───────────●────
+                  Anchor
+```
+
+**What happens physically:**
+- Water level has reached (or nearly reached) the tether length
+- Tether is nearly vertical
+- Buoy is almost directly above anchor
+- θ approaches 0°
+- cos(θ) approaches 1.0
+- H approaches L
+
+**What sensors read:**
+```
+Accelerometer:  Tilt is very small (θ → 0°)
+                lateral_accel is decreasing
+                Still detectable as taut (tension is vertical)
+
+Gyroscope:      θ ≈ 0-5° and may be slowly changing
+
+Pressure:       P ≈ P_atmospheric (still at surface)
+                OR beginning to show slight submersion
+```
+
+**How we detect this mode:**
+```
+IF tether is TAUT (from MODE 1 detection)
+AND θ < 10° (nearly vertical)
+AND H/L > 0.95 (computed water level within 5% of L)
+THEN → MODE 2: FLOOD
+```
+
+**Sensitivity concern at this mode:**
+
+```
+dH/dθ = -L × sin(θ)
+
+At θ = 2°:  dH/dθ = -L × sin(2°) = -0.035L per degree
+            1° error → only 3.5cm error (for L=1m)
+            
+At θ = 0°:  dH/dθ = 0
+            cos(θ) is FLAT at the top
+            Cannot distinguish θ=0° from θ=1° easily
+```
+
+At this point the water level reading becomes imprecise because cosine is flat near 0°. But it does not matter — we KNOW the water is at flood level. The pressure sensor takes over for any further rise.
+
+**What we report:**
+```
+"⚠️ FLOOD LEVEL REACHED"
+"Water level: H ≈ L = [value] meters"
+Alert level: RED (flood)
+```
+
+---
+
+### MODE 3: SUBMERGED (H > L)
+
+```
+Water Surface ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                    ↑ still rising
+               ─────┼──── depth below surface
+                    |
+                    ● Buoy (PULLED UNDERWATER)
+                    |
+                    | tether (fully vertical, taut)
+                L   |
+                    |
+                    |
+Riverbed ───────────●────
+                  Anchor
+```
+
+**What happens physically:**
+- Water has risen ABOVE the tether length
+- The buoy CANNOT reach the surface — tether holds it down
+- The buoy is completely submerged
+- Depth below surface = H - L
+- Water pressure increases with depth
+
+**What sensors read:**
+```
+Accelerometer:  θ ≈ 0° (tether vertical)
+                May show turbulence from being underwater in current
+
+Gyroscope:      θ ≈ 0°, little change
+
+Pressure:       P = P_atmospheric + ρ × g × (H - L)
+                ─────────────────────────────────────
+                THIS IS THE KEY MEASUREMENT NOW
+                
+                P_gauge = P_measured - P_atmospheric
+                depth = P_gauge / (ρ × g)
+                H = L + depth
+```
+
+**How we detect this mode:**
+```
+IF pressure > P_atmospheric + SUBMERSION_THRESHOLD
+   (threshold ≈ 500 Pa, equivalent to ~5cm of water)
+THEN → MODE 3: SUBMERGED
+```
+
+**What we compute:**
+```
+depth_below_surface = (P_measured - P_atm) / (ρ_water × g)
+
+H_total = L + depth_below_surface
+
+Example with L = 2.0m:
+  P_gauge = 980 Pa  → depth = 0.10m → H = 2.10m
+  P_gauge = 4900 Pa → depth = 0.50m → H = 2.50m
+  P_gauge = 9800 Pa → depth = 1.00m → H = 3.00m
+```
+
+**What we report:**
+```
+"🚨 CRITICAL: WATER ABOVE FLOOD LEVEL"
+"Water level: H = [L + depth] meters"
+"Buoy submerged [depth] meters below surface"
+Alert level: BLACK (critical emergency)
+```
+
+---
+
+## COMPLETE MODE TRANSITION DIAGRAM
+
+```
+                    WATER LEVEL RISING →
+                    
   0m          H₁           H₂            L          H_max
   ├───────────┼────────────┼─────────────┼───────────┤
+  
   ◄── MODE 0 ─►◄──── MODE 1 ────────────►◄─ MODE 2 ─►◄ MODE 3 ►
      SLACK          TAUT                    FLOOD      SUBMERGED
      GREEN          YELLOW                  RED        BLACK
-```
+     
+     H unknown      H = L×cos(θ)           H ≈ L      H = L + ΔP/ρg
+     H < L          H measured precisely    Transition Pressure-based
+     SAFE           MONITORING              ALERT!     EMERGENCY!
+     
+  Sensor:         Sensor:                 Sensor:    Sensor:
+  lateral_a≈0     lateral_a>0.15          θ→0°       P >> P_atm
+  P ≈ P_atm       θ gives H              P rising   depth = ΔP/ρg
 
-**L is chosen at installation to equal the flood threshold.** This means:
-- θ → 0° IS the flood alarm (natural threshold)
-- Slack tether = safe (no need to measure exact low water levels)
-- Only one constant (L) needs to be known precisely
 
----
-
-## 2A. Mode Detection Engine
-
-```
-EVERY LOOP ITERATION:
-
-┌──────────────────────────────┐
-│  READ ALL SENSORS            │
-│  • ax, ay, az (accel)        │
-│  • gx, gy, gz (gyro)        │
-│  • P (pressure from BMP280)  │
-│  • Compute θ (fusion)        │
-│  • Compute lateral_accel     │
-│    = sqrt(ax² + ay²)         │
-└────────────┬─────────────────┘
-             │
-             ▼
-┌──────────────────────────────┐
-│  P > P_baseline + 500 Pa ?  │──YES──► MODE 3: SUBMERGED
-└────────────┬─────────────────┘         H = L + ΔP/(ρg)
-             │NO                         Alert: BLACK
-             ▼
-┌──────────────────────────────┐
-│  lateral_accel > 0.15 m/s²  │
-│  AND tilt > 3° ?             │──NO───► MODE 0: SLACK
-└────────────┬─────────────────┘         H < L (safe)
-             │YES                        Alert: GREEN
-             ▼
-┌──────────────────────────────┐
-│  θ < 10°                    │
-│  AND H_computed > 0.95 × L  │──YES──► MODE 2: FLOOD
-└────────────┬─────────────────┘         H ≈ L
-             │NO                         Alert: RED
-             ▼
-        MODE 1: TAUT
-        H = L × cos(θ)
-        Alert: YELLOW (if H/L > 0.7)
-
-TRANSITION HYSTERESIS:
-  MODE 0 → 1: lateral_accel crosses ABOVE 0.15 m/s²
-  MODE 1 → 0: lateral_accel drops BELOW 0.10 m/s²
-               (different thresholds prevent oscillation)
-
-  MODE 1 → 2: θ drops below 10°
-  MODE 2 → 1: θ rises above 12° (hysteresis band)
-
-  MODE 2 → 3: ΔP rises above 500 Pa
-  MODE 3 → 2: ΔP drops below 400 Pa (hysteresis)
-
-ACCURACY BY MODE:
-  MODE 0: N/A (safe, no measurement needed)
-  MODE 1: ±2-8cm (depends on θ; better at large θ)
-  MODE 2: ±5-10cm (cos flat near 0°; pressure begins assisting)
-  MODE 3: ±1-2cm (pressure-based, very accurate)
-```
-
-**Note on `calculateWaterHeight()` function:**
-```
-OLD (leaning post):  H = L × sin(θ)    ← Horizontal deflection
-NEW (buoy tether):   H = L × cos(θ)    ← Vertical projection
-
-The function calculateWaterHeight(thetaDeg) must use cos, not sin.
-The variable name "horizontalDist" in the CSV output now represents
-the horizontal displacement d = L × sin(θ) of the buoy from the
-anchor point (useful for diagnostics, not for water level).
+  TRANSITION TRIGGERS:
+  
+  MODE 0 → 1:  lateral_accel crosses above 0.15 m/s²
+               AND tilt exceeds 3°
+               (tether just went taut)
+               
+  MODE 1 → 2:  θ drops below 10°
+               AND computed H > 0.95 × L
+               (water approaching flood level)
+               
+  MODE 2 → 3:  pressure exceeds P_atm + 500 Pa
+               (buoy going underwater)
+               
+  MODE 3 → 2:  pressure drops below P_atm + 500 Pa
+               (water receding, buoy surfacing)
+               
+  MODE 2 → 1:  θ rises above 10°
+               (water dropping from flood level)
+               
+  MODE 1 → 0:  lateral_accel drops below 0.10 m/s²
+               (tether going slack — note hysteresis:
+                0.15 to trigger, 0.10 to release)
 ```
 
 ---
+
+## ACCURACY AT EACH MODE
+
+```
+MODE    METHOD              ACCURACY        NOTES
+────    ──────              ────────        ─────
+  0     None needed         N/A             H < L = safe. Done.
+  
+  1     H = L×cos(θ)        ±2-8cm          Depends on θ range:
+        θ from MPU6050                      θ=60°: ±2cm per degree
+        fused angle                         θ=30°: ±5cm per degree
+                                            θ=10°: ±7cm per degree
+                                            
+  2     H ≈ L               ±5-10cm         cos(θ) insensitive near θ=0
+        Transition zone                     Pressure begins to help
+        
+  3     H = L + ΔP/(ρg)     ±1-2cm          Pressure sensors are very
+        Pressure-based                      accurate for depth measurement
+```
+
+---
+
+## NUMERICAL WALKTHROUGH
+
+Real example with **L = 2.0 meters** (flood threshold at 2m above riverbed):
+
+```
+SCENARIO 1: Normal day, water at 0.8m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  H = 0.8m, L = 2.0m
+  Distance from anchor to buoy = 0.8m < L = 2.0m
+  Tether: SLACK
+  
+  Sensors: lateral_accel ≈ 0, pressure ≈ atmospheric
+  Mode: 0 (GREEN)
+  Report: "Water level below flood threshold. Safe."
+
+
+SCENARIO 2: Heavy rain, water rising to 1.4m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  H = 1.4m, L = 2.0m
+  θ = arccos(1.4/2.0) = arccos(0.7) = 45.6°
+  Tether: TAUT (current or geometry pulls it tight)
+  
+  Sensors: lateral_accel = 0.4 m/s², tilt = 45.6°
+  Mode: 1 (YELLOW)
+  Computed: H = 2.0 × cos(45.6°) = 1.40m
+  Report: "Water level: 1.40m (70% of flood threshold)"
+
+
+SCENARIO 3: Storm, water at 1.9m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  H = 1.9m, L = 2.0m
+  θ = arccos(1.9/2.0) = arccos(0.95) = 18.2°
+  Tether: TAUT, nearly vertical
+  
+  Sensors: tilt = 18.2°, pressure ≈ atmospheric
+  Mode: 1 approaching MODE 2 (YELLOW → RED)
+  Computed: H = 2.0 × cos(18.2°) = 1.90m
+  Report: "⚠️ Water level: 1.90m (95% of flood threshold)"
+
+
+SCENARIO 4: Flood, water at exactly 2.0m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  H = 2.0m = L
+  θ = arccos(2.0/2.0) = arccos(1.0) = 0°
+  Tether: TAUT, perfectly vertical
+  
+  Sensors: tilt ≈ 0°, pressure beginning to show submersion
+  Mode: 2 (RED)
+  Computed: H = 2.0 × cos(0°) = 2.0m
+  Report: "🚨 FLOOD! Water at flood threshold: 2.0m"
+
+
+SCENARIO 5: Severe flood, water at 2.5m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  H = 2.5m > L = 2.0m
+  Buoy submerged 0.5m below surface
+  θ ≈ 0° (tether vertical, pulled down)
+  
+  Sensors: pressure = P_atm + 1000×9.81×0.5 = P_atm + 4905 Pa
+  Mode: 3 (BLACK)
+  Computed: depth = 4905 / (1000 × 9.81) = 0.50m
+            H = 2.0 + 0.5 = 2.50m
+  Report: "🚨🚨 CRITICAL: Water 0.5m ABOVE flood level! H = 2.5m"
+```
+
+---
+
+## THE COMPLETE DECISION FLOWCHART
+
+```
+        ┌──────────────────────────┐
+        │  READ ALL SENSORS        │
+        │  • ax, ay, az (accel)    │
+        │  • gx, gy, gz (gyro)    │
+        │  • P (pressure)         │
+        │  • Compute θ (fusion)   │
+        └────────────┬─────────────┘
+                     │
+                     ▼
+        ┌──────────────────────────┐
+        │  P > P_atm + 500 Pa ?   │
+        └─────┬──────────┬─────────┘
+              │YES       │NO
+              ▼          ▼
+     ┌────────────┐   ┌──────────────────────┐
+     │  MODE 3    │   │                      │
+     │  SUBMERGED │   │  lateral_accel       │
+     │            │   │  > 0.15 m/s²         │
+     │  depth =   │   │  AND tilt > 3° ?     │
+     │  ΔP/(ρg)   │   └───┬──────────┬───────┘
+     │            │       │YES       │NO
+     │  H = L +   │       ▼          ▼
+     │  depth     │  ┌─────────┐  ┌─────────┐
+     │            │  │ TETHER  │  │ TETHER  │
+     │  🚨 BLACK  │  │ IS TAUT │  │ IS SLACK│
+     └────────────┘  └────┬────┘  └────┬────┘
+                          │            │
+                          ▼            ▼
+                   ┌────────────┐  ┌────────────┐
+                   │  θ < 10°   │  │  MODE 0    │
+                   │  AND       │  │  SLACK     │
+                   │  H > 0.95L │  │            │
+                   │  ?         │  │  H < L     │
+                   └──┬────┬───┘  │  (safe)    │
+                      │YES │NO    │            │
+                      ▼    ▼      │  🟢 GREEN  │
+               ┌────────┐┌─────┐ └────────────┘
+               │ MODE 2 ││MODE │
+               │ FLOOD  ││ 1   │
+               │        ││TAUT │
+               │ H ≈ L  ││     │
+               │        ││H =  │
+               │🔴 RED  ││L×   │
+               │        ││cosθ │
+               └────────┘│     │
+                         │🟡   │
+                         │YELLW│
+                         └─────┘
+```
+
+---
+
+## WHAT MAKES THIS SYSTEM CLEVER
+
+```
+PROPERTY                              WHY IT MATTERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Current-independent measurement     θ gives H regardless of
+                                       how fast the river flows
+
+2. Slack = Safe                        Don't need to solve the
+                                       hardest measurement case
+                                       because it is the safe case
+
+3. Two measurement principles          Trig (H<L) and pressure (H>L)
+   cover the full range                seamlessly hand off to each other
+
+4. Natural flood threshold             L = flood level by design
+                                       θ → 0 IS the flood alarm
+                                       No calibration table needed
+
+5. Self-validating                     Pressure confirms trig reading
+                                       near the transition (H ≈ L)
+                                       If they disagree → sensor fault
+
+6. Graceful degradation                If MPU6050 fails → pressure
+                                       still detects flood (MODE 3)
+                                       If pressure fails → trig still
+                                       works for H < L (MODE 1)
+
+7. Single known constant               Only need to know L precisely
+                                       No flow calibration needed
+                                       for water level measurement
+```
 
 ## 3. Sensor Fusion & Complementary Filter
 
