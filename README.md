@@ -1024,7 +1024,890 @@ Continue attempting I2C recovery every 60 seconds
 5. Re-initialize I2C bus at 100kHz
 ```
 
-For detailed failure taxonomy covering all sensor, system, and physical failure modes with detection algorithms, see Section 17: Failure Detection & Diagnostics System.
+
+
+## 17. Failure Detection & Diagnostics System
+
+The system implements three categories of failure detection, each with autonomous on-device detection and server-coordinated diagnostics.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                FAILURE DETECTION ARCHITECTURE                    │
+│                                                                 │
+│  ALWAYS ACTIVE (on-device, every loop):                        │
+│  ├── A1: MPU6050 latch-up / frozen output detection            │
+│  ├── A2: MPU6050 drift / gravity magnitude check               │
+│  ├── A3: BMP280 range check / staleness / cross-validation     │
+│  ├── B1: Battery voltage monitoring & staged shutdown          │
+│  ├── B2: Watchdog timer (MCU crash recovery)                   │
+│  ├── B3: SIM800L communication health                          │
+│  ├── C1-PASSIVE: GPS origin drift detection                    │
+│  └── C2-PASSIVE: Draft pressure trend (leak detection)         │
+│                                                                 │
+│  SERVER-TRIGGERED (activate via GSM command):                  │
+│  ├── C1-FULL: Tether break diagnostic suite                    │
+│  │   ├── Oscillation period analysis                           │
+│  │   ├── Lateral acceleration sustained-slack check            │
+│  │   └── GPS displacement + heading analysis                   │
+│  ├── C3: Anchor shift detection (L_eff comparison)             │
+│  └── FULL_DIAG: Run all diagnostics, report to server          │
+│                                                                 │
+│  CONTINUOUS SELF-CALIBRATION:                                  │
+│  ├── Atmospheric pressure baseline (while at surface)          │
+│  ├── Gravity reference correction (in SLACK mode)              │
+│  └── Draft baseline tracking (biofouling/leak detection)       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 17.1 Origin Coordinate System — GPS Geofence
+
+At deployment, the system stores the GPS position as the **anchor origin**. Every GPS fix is compared to this origin. If the buoy drifts beyond a configurable radius (default = OLP length + margin), the system flags a potential detachment.
+
+```
+DEPLOYMENT:
+  Store: originLat, originLon (from first valid GPS fix after CAL)
+  Store: geofenceRadiusM = olpLength / 100.0 (convert cm to meters)
+         + GEOFENCE_MARGIN_M (default 5.0 meters for GPS error)
+
+                    Geofence boundary
+                   ╱                  ╲
+                 ╱     Safe zone        ╲
+               ╱    (buoy can reach      ╲
+              │      anywhere on arc)      │
+              │                            │
+              │        ● Origin            │
+              │     (anchor GPS)           │
+               ╲                          ╱
+                 ╲                      ╱
+                   ╲__________________╱
+                   
+                   radius = L + margin
+
+EVERY GPS FIX:
+  distance = distanceFromOrigin(currentLat, currentLon,
+                                originLat, originLon)
+  
+  IF distance > geofenceRadiusM:
+    geofenceBreachCount++
+    
+    IF geofenceBreachCount >= 3 (consecutive):
+      → FLAG: TETHER_DETACHMENT_SUSPECTED
+      → Include in next HTTP POST to server
+      → Server dispatches alert to all tiers:
+        "VARUNA ALERT: Buoy may be detached.
+         Distance from anchor: [X]m
+         Position: [lat],[lon]
+         Heading: [bearing]° from origin"
+      → Increase GPS fix rate to continuous
+      → Begin logging position trail
+      → Set flag: tetherBreachDetected = true
+      → Server can issue DIAG_TETHER command for full analysis
+          
+  ELSE:
+    geofenceBreachCount = 0
+```
+
+**Distance calculation (flat-earth approximation for short distances):**
+```
+For distances < 10km, simplified formula is sufficient:
+
+  dLat = (currentLat - originLat) × 111320.0   (meters)
+  dLon = (currentLon - originLon) × 111320.0 × cos(originLat × π/180)
+  distance = sqrt(dLat² + dLon²)               (meters)
+
+Accuracy: ±0.1% at equator, ±0.5% at 60° latitude
+More than sufficient for 1-5 meter geofence detection
+```
+
+**Origin coordinate persistence:**
+```
+EEPROM storage:
+  EEPROM_ORIGIN_LAT_ADDR    (4 bytes, float)
+  EEPROM_ORIGIN_LON_ADDR    (4 bytes, float)
+  EEPROM_ORIGIN_MAGIC_ADDR  (1 byte, 0xGF)
+  EEPROM_GEOFENCE_RADIUS    (4 bytes, float, meters)
+
+Set at deployment using handheld debugger:
+  SETORIGIN              (capture current GPS as origin)
+  SETORIGIN:<lat>,<lon>  (manual coordinates)
+  SETFENCE:<meters>      (set geofence radius)
+
+Queryable via console diagnostic:
+  GETCONFIG reports origin and fence values
+  GPSFIX reports distance from origin
+```
+
+---
+
+### 17.2 Category A — Sensor Failures
+
+#### A1: MPU6050 Latch-Up (Frozen Output)
+
+```
+WHAT HAPPENS:
+  Electrical noise or moisture causes I2C bus lock.
+  MPU6050 returns identical values every read, or 0xFF on all bytes.
+
+DETECTION (runs every loop iteration):
+
+  Maintain variance buffer of last 50 accelerometer readings:
+  
+  accelVarianceBuffer[50]   ← rolling window of |a| magnitudes
+  
+  Every 50 readings:
+    variance = computeVariance(accelVarianceBuffer, 50)
+    
+    A floating buoy in water ALWAYS has micro-motion:
+    thermal drift, micro-currents, wind ripple.
+    Variance should NEVER be exactly zero.
+    
+    IF variance < 0.0001 m/s²:
+      mpuFrozenCount++
+      
+      IF mpuFrozenCount >= 3 (consecutive variance windows):
+        → FLAG: MPU6050_FROZEN
+        → Attempt recovery:
+           1. I2C bus recovery (9 SCL clocks)
+           2. MPU6050 power cycle (reg 0x6B = 0x80, then 0x00)
+           3. Re-read WHO_AM_I register
+           4. If WHO_AM_I ≠ 0x68 → I2C_BUS_FAULT
+           5. If WHO_AM_I == 0x68 but still frozen → MPU6050_HARDWARE_FAULT
+        → Report to serial: "FAULT:MPU6050_FROZEN:RECOVERY_[OK/FAIL]"
+        → If recovery fails → mpuHealthy = false
+        
+    ELSE:
+      mpuFrozenCount = 0
+
+  ALSO — I2C register validation (every 60 seconds):
+    whoami = mpuReadReg(0x75)
+    IF whoami ≠ 0x68 AND whoami ≠ 0x72:
+      → I2C_BUS_CORRUPTION
+      → Full bus recovery sequence
+```
+
+#### A2: MPU6050 Drift Beyond Correction
+
+```
+WHAT HAPPENS:
+  Temperature change shifts accelerometer offset.
+  Gyro bias drifts faster than complementary filter corrects.
+
+DETECTION:
+
+  Gravity magnitude check (every reading):
+    g_measured = sqrt(ax² + ay² + az²)
+    
+    IF |g_measured - 9.81| > 1.0 m/s²:
+      gravityErrorCount++
+      
+      IF gravityErrorCount >= 20 (consecutive):
+        → FLAG: ACCEL_CALIBRATION_DRIFT
+        → Check context: is buoy under extreme acceleration?
+           (wave impact, collision — transient, should clear)
+        → If sustained > 5 seconds:
+           → ACCEL_HARDWARE_FAULT or ORIENTATION_LOST
+           
+    ELSE:
+      gravityErrorCount = 0
+
+  SLACK mode auto-correction (continuous self-calibration):
+    IF currentMode == MODE_0_SLACK:
+      Buoy is floating upright, no tether tension.
+      Accelerometer SHOULD read: ax ≈ 0, ay ≈ 0, az ≈ 9.81
+      
+      IF |az - 9.81| > 0.5 OR |ax| > 0.5 OR |ay| > 0.5:
+        → FLAG: ACCEL_OFFSET_DRIFT
+        → Auto-correct offsets:
+           accelOffsetX = -ax_measured
+           accelOffsetY = -ay_measured
+           accelOffsetZ = 9.81 - az_measured
+        → Apply to all future readings
+        → Log: "AUTOCAL:ACCEL_OFFSET_CORRECTED"
+        → This is SELF-CALIBRATION, not a fault
+        
+      This runs only in MODE 0 because that is the only mode
+      where the buoy's orientation is known a priori (upright).
+```
+
+#### A3: BMP280 Pressure Sensor Failure
+
+```
+WHAT HAPPENS:
+  Water intrusion destroys sensor element.
+  Sensor reads 0, maximum value, or constant stuck value.
+
+DETECTION (runs every BMP280 read, every 5 seconds):
+
+  Range check:
+    IF currentPressure < 300 hPa OR currentPressure > 1200 hPa:
+      → Atmospheric pressure on Earth: 870-1084 hPa
+      → Even at 10m depth: P < 2000 hPa
+      → FAULT: PRESSURE_OUT_OF_RANGE
+      → bmpAvailable = false
+
+  Staleness check:
+    Maintain pressureVarianceBuffer[20]
+    
+    IF pressureVariance < 0.01 hPa over 20 readings:
+      → Even in calm conditions, pressure fluctuates
+         from micro-waves, wind, thermal changes
+      → FAULT: PRESSURE_SENSOR_FROZEN
+      → Attempt: re-initialize BMP280
+      → If still frozen: bmpAvailable = false
+
+  Cross-validation with tilt (MODE 1, tether TAUT):
+    IF currentMode == MODE_1_TAUT AND theta > 20°:
+      Buoy is significantly tilted → definitely at surface.
+      Pressure SHOULD be near atmospheric baseline.
+      
+      IF currentPressure > baselinePressure + 50 hPa:
+        → Pressure says deeply submerged
+        → Tilt says clearly at surface
+        → FAULT: PRESSURE_TILT_DISAGREEMENT
+        → Trust tilt (MPU6050), flag pressure as suspect
+        → Report: "FAULT:PRESSURE_CROSS_CHECK_FAIL"
+        
+    IF currentMode == MODE_3_SUBMERGED AND theta > 15°:
+      → Pressure says submerged, tilt says angled (surface)
+      → Contradiction → one sensor is wrong
+      → Apply confidence weighting:
+         If pressure changed gradually → trust pressure
+         If pressure jumped suddenly → suspect pressure fault
+```
+
+---
+
+### 17.3 Category B — System Failures
+
+#### B1: Battery Death (Staged Shutdown)
+
+```
+Handled by readBatteryLevel() with piecewise Li-ion curve.
+(See Section 6 for voltage-to-percent mapping)
+
+STAGED RESPONSE:
+
+  VOLTAGE     PERCENT    STATE         ACTION
+  ─────────   ───────    ─────         ──────────────────────────
+  > 3.85V     > 70%      GOOD          Normal operation
+  
+  3.50-3.85V  20-70%     OK            Normal, report in telemetry
+  
+  3.30-3.50V  5-20%      LOW           • Extend sample intervals
+                                       • Reduce GPRS to conserve mode
+                                       • Reduce obstruction light
+                                         duty cycle
+                                       • Report LOW in HTTP POST
+                                       
+  3.00-3.30V  0-5%       CRITICAL      • Emergency mode:
+                                         measure + transmit 1×/hour
+                                       • Disable obstruction lights
+                                       • Force EEPROM save
+                                       • Report CRITICAL in HTTP POST
+                                       
+  < 3.00V     0%         CUTOFF        • Force save all state
+                                       • Deep sleep (no wake timer)
+                                       • Protects cells from damage
+                                       
+  3 consecutive readings below cutoff required to prevent
+  transient voltage dips from triggering false shutdown.
+```
+
+#### B2: MCU Crash / Lockup
+
+```
+HANDLED BY: ESP32 hardware watchdog timer
+
+  Setup: WDT_TIMEOUT_SEC = 120 seconds
+  Initially configured at 180 seconds during setup() (extended
+  for sensor initialization and SIM800L boot), then reconfigured
+  to 120 seconds for operational mode.
+  
+  Every loop iteration: esp_task_wdt_reset()
+  During long operations (AT commands, SMS send): reset inside loops
+  
+  IF loop() hangs for > 120 seconds:
+    → Hardware watchdog triggers panic
+    → ESP32 performs hard reset
+    → System reboots
+    → setup() runs again
+    → EEPROM warm boot restores state (if < 30 min old)
+    → System resumes monitoring
+  
+  AFTER REBOOT — detect reason:
+    esp_reset_reason_t reason = esp_reset_reason()
+    
+    IF reason == ESP_RST_TASK_WDT OR reason == ESP_RST_WDT:
+      watchdogResetCount++  (stored in RTC memory, survives reset)
+      
+      Report: "STATUS:WATCHDOG_RECOVERY:COUNT=[N]"
+      
+      IF watchdogResetCount > 10 (in 24 hours):
+        → FAULT: FREQUENT_CRASHES
+        → Report in HTTP POST health score
+        → Server flags station for service
+        → Possible causes: memory leak, I2C bus permanent
+           fault, SIM800L hanging system
+```
+
+#### B3: SIM800L Communication Failure
+
+```
+  AT command timeout      → Retry up to 5 times
+  No network registration → Periodic re-check every 30 seconds
+  GPRS upload failure     → 3 fails → flag GPRS_OFFLINE
+  Signal lost             → Periodic re-registration check
+  Module unresponsive     → Hardware reset (RST pin LOW 200ms)
+  
+  SERVER-SIDE MONITORING:
+    Server expects GPRS heartbeat at transmitInterval.
+    IF no data received for 3× transmitInterval:
+      → Server flags buoy as SILENT on dashboard
+      → Server can attempt SMS diagnostic command to buoy
+      → If buoy responds → GPRS path broken, SMS path works
+      → If no response → buoy may be offline or out of range
+```
+
+---
+
+### 17.4 Category C — Physical Failures
+
+#### C1: Tether Break Detection
+
+**Two-tier detection: passive (always on) + active (server-triggered)**
+
+```
+TIER 1 — PASSIVE (always active, no server command needed):
+
+  GPS GEOFENCE CHECK (every valid GPS fix):
+  
+    distance = distanceFromOrigin(currentLat, currentLon,
+                                  originLat, originLon)
+    
+    IF distance > geofenceRadiusM:
+      geofenceBreachConsecutive++
+      
+      IF geofenceBreachConsecutive >= 3:
+        → ALERT: TETHER_DETACHMENT_SUSPECTED
+        → Flag in next HTTP POST to server
+        → Server dispatches:
+           "VARUNA CRITICAL: Buoy detached!
+            Dist from anchor: [X]m
+            Position: [lat],[lon]
+            Moving: [bearing]° at [speed]km/h"
+        → Begin continuous GPS logging (position trail)
+        → Set flag: tetherBreachDetected = true
+        → Server can issue DIAG_TETHER for full analysis
+          
+    ELSE:
+      geofenceBreachConsecutive = 0
+
+
+TIER 2 — ACTIVE DIAGNOSTICS (triggered by server command):
+
+  Server sends SMS: "DIAG_TETHER" to buoy
+  
+  Buoy executes full tether diagnostic suite:
+
+  ┌─────────────────────────────────────────────────────┐
+  │  TETHER BREAK DIAGNOSTIC SUITE                      │
+  │                                                     │
+  │  TEST 1: Sustained Slack Check                      │
+  │  ──────────────────────────                         │
+  │  Monitor lateral_accel for 5 minutes:               │
+  │                                                     │
+  │  IF lateral_accel < 0.10 m/s² sustained > 5 min    │
+  │  AND currentMode == MODE_0_SLACK:                   │
+  │    → Buoy has NO tether tension for extended period │
+  │    → In flowing water, this should not happen       │
+  │    → RESULT: TETHER_TENSION_ABSENT                  │
+  │                                                     │
+  │  TEST 2: Oscillation Period Analysis                │
+  │  ──────────────────────────────────                 │
+  │  Attempt to measure pendulum oscillation:           │
+  │  Sample tilt angle at 10 Hz for 60 seconds.         │
+  │  Compute FFT or zero-crossing period.               │
+  │                                                     │
+  │  IF no periodic oscillation detected:               │
+  │    oscillationPeriod = UNDEFINED (∞)                │
+  │    → No pendulum restoring force                    │
+  │    → RESULT: NO_OSCILLATION_DETECTED                │
+  │                                                     │
+  │  IF oscillation detected:                           │
+  │    T = measured period                              │
+  │    L_eff = g × (T/2π)²                             │
+  │    Compare to L_KNOWN (olpLength)                   │
+  │    IF |L_eff - L_KNOWN| < 15%:                     │
+  │      → RESULT: TETHER_INTACT (oscillation matches) │
+  │    ELSE:                                            │
+  │      → RESULT: TETHER_LENGTH_ANOMALY               │
+  │                                                     │
+  │  TEST 3: GPS Displacement Analysis                  │
+  │  ────────────────────────────────                   │
+  │  Record GPS position every 10 seconds for 5 min.   │
+  │  Compute: total displacement, heading, speed.       │
+  │                                                     │
+  │  IF displacement > geofenceRadiusM:                 │
+  │    → Buoy has moved beyond tether reach             │
+  │    → RESULT: BUOY_DISPLACED_BEYOND_TETHER           │
+  │                                                     │
+  │  IF speed > 0.5 m/s sustained AND no oscillation:  │
+  │    → Buoy moving freely with current               │
+  │    → RESULT: BUOY_DRIFTING_FREE                     │
+  │                                                     │
+  │  COMPOSITE VERDICT:                                 │
+  │  ──────────────────                                 │
+  │  IF (TENSION_ABSENT OR NO_OSCILLATION)             │
+  │  AND (DISPLACED OR DRIFTING):                       │
+  │    → VERDICT: TETHER_BROKEN (high confidence)      │
+  │                                                     │
+  │  IF TENSION_ABSENT but NOT DISPLACED:               │
+  │    → VERDICT: TETHER_POSSIBLY_BROKEN                │
+  │    → (could be very calm water with no current)     │
+  │                                                     │
+  │  IF oscillation matches AND within geofence:        │
+  │    → VERDICT: TETHER_INTACT                         │
+  │                                                     │
+  │  Report full results via SMS reply + GPRS upload    │
+  └─────────────────────────────────────────────────────┘
+```
+
+**SMS diagnostic reply format:**
+```
+"VARUNA TETHER DIAG:
+ Tension: [PRESENT/ABSENT]
+ Oscillation: [T=Xs/NONE]
+ L_eff: [X]cm vs L=[Y]cm
+ GPS dist: [X]m from origin
+ Speed: [X]m/s
+ Verdict: [INTACT/BROKEN/UNKNOWN]"
+```
+
+---
+
+#### C2: Buoy Leak / Water Ingress Detection
+
+**Always active — passive monitoring**
+
+```
+DRAFT PRESSURE TREND MONITORING:
+
+  Track the pressure reading when buoy is at surface
+  (MODE 0 or MODE 1) as "draft pressure":
+  
+  draftPressure = currentPressure - baselinePressure
+  
+  This represents how deep the buoy sits in the water.
+  As water enters the capsule, mass increases, buoy sits lower,
+  draft pressure increases.
+
+  Maintain 24-hour draft history:
+    draftHistory[24]   ← one reading per hour (hourly average)
+    draftHistoryIdx    ← circular index
+    draftHistoryCount  ← entries filled
+  
+  Every hour (when buoy is at surface):
+    Store current average draft pressure in draftHistory[]
+    
+    IF draftHistoryCount >= 24:
+      draftRate = (draftCurrent - draft24hAgo) / 24.0
+      (hPa per hour)
+      
+      Biofouling:  draftRate ≈ 0.001-0.01 hPa/hr (weeks to show)
+      Slow leak:   draftRate ≈ 0.05-0.5 hPa/hr (days to show)
+      Fast leak:   draftRate > 0.5 hPa/hr (hours to concern)
+
+      IF draftRate > 0.5 hPa/hr:
+        → ALERT: POSSIBLE_LEAK
+        → Flag in HTTP POST health score
+        → Server dispatches: "VARUNA: Draft increasing [X] hPa/hr.
+                Possible water ingress. Inspect buoy."
+                
+      IF draftRate > 2.0 hPa/hr:
+        → ALERT: ACTIVE_LEAK
+        → Flag in HTTP POST as critical health issue
+        → Server dispatches: "VARUNA CRITICAL: Rapid draft increase.
+                Active water ingress suspected.
+                Retrieve buoy immediately."
+
+  CROSS-CHECK — Sinking Detection:
+    IF pressure increasing (buoy going deeper)
+    AND currentMode == MODE_1_TAUT (tether taut)
+    AND theta NOT approaching 0° (water not actually rising):
+      → Pressure up + tilt unchanged = buoy sinking, not flood
+      → ALERT: BUOY_SINKING
+      → Server dispatches: "VARUNA CRITICAL: Buoy sinking without
+              water rise. Water ingress confirmed. Retrieve immediately."
+
+  OPTIONAL HUMIDITY SENSOR (DHT11 inside capsule):
+    IF available:
+      Read every 5 minutes
+      IF humidity > 80%:
+        → ALERT: MOISTURE_DETECTED
+      IF humidity > 95%:
+        → ALERT: MOISTURE_CRITICAL
+        → Possible condensation on electronics
+```
+
+---
+
+#### C3: Anchor Shift Detection
+
+**Server-triggered diagnostic**
+
+```
+Server sends SMS: "DIAG_ANCHOR" to buoy
+
+Buoy executes anchor position analysis:
+
+  ┌─────────────────────────────────────────────────────┐
+  │  ANCHOR SHIFT DIAGNOSTIC                            │
+  │                                                     │
+  │  TEST 1: Effective Tether Length (L_eff)            │
+  │  ─────────────────────────────────────              │
+  │  Measure oscillation period T over 60 seconds.      │
+  │  L_eff = g × (T / 2π)²                             │
+  │                                                     │
+  │  Compare to L_KNOWN:                                │
+  │    IF L_eff < L_KNOWN - 10%:                       │
+  │      → Tether effectively shortened                 │
+  │      → Possible: sediment burial of anchor/base     │
+  │      → RESULT: TETHER_SHORTENED                     │
+  │                                                     │
+  │    IF L_eff > L_KNOWN + 10%:                       │
+  │      → Tether effectively lengthened                │
+  │      → Possible: anchor dragged, tether stretched   │
+  │      → RESULT: TETHER_LENGTHENED                    │
+  │                                                     │
+  │    IF |L_eff - L_KNOWN| < 10%:                     │
+  │      → RESULT: TETHER_LENGTH_NORMAL                 │
+  │                                                     │
+  │  TEST 2: Equilibrium Angle Shift                    │
+  │  ─────────────────────────────                      │
+  │  In TAUT mode, record average θ over 5 minutes.    │
+  │  Compare to historical average at similar water      │
+  │  levels (from archived data).                        │
+  │                                                     │
+  │  IF θ_current differs from θ_historical by > 10°   │
+  │  at similar water level:                             │
+  │    → Anchor position has changed                    │
+  │    → RESULT: EQUILIBRIUM_SHIFTED                    │
+  │                                                     │
+  │  TEST 3: GPS Centroid Shift                         │
+  │  ──────────────────────                             │
+  │  Record GPS positions over 10 minutes.              │
+  │  Compute centroid (average position).               │
+  │  Compare to historical centroid.                     │
+  │                                                     │
+  │  IF centroid shifted > 2m from deployment centroid: │
+  │    → Anchor has moved laterally                     │
+  │    → RESULT: ANCHOR_DISPLACED                       │
+  │                                                     │
+  │  COMPOSITE REPORT:                                  │
+  │    L_eff vs L_KNOWN, equilibrium angle,             │
+  │    GPS centroid shift, recommended action            │
+  └─────────────────────────────────────────────────────┘
+
+SMS diagnostic reply:
+"VARUNA ANCHOR DIAG:
+ L_eff: [X]cm (known: [Y]cm, diff: [Z]%)
+ Eq.angle: [X]° (historical: [Y]°)
+ Centroid shift: [X]m
+ Verdict: [NORMAL/SEDIMENT/DRAGGED]"
+```
+
+---
+
+### 17.5 Server-Triggered Diagnostic Commands
+
+These commands are sent from the server (or an authorized field engineer phone) via SMS. The buoy executes the diagnostic suite and replies with results.
+
+```
+DIAGNOSTIC COMMANDS (via SMS from authorized number):
+
+  DIAG_TETHER        Full tether integrity check
+                     (5 minutes of data collection)
+                     → Reply: tension, oscillation, GPS, verdict
+
+  DIAG_ANCHOR        Anchor position analysis
+                     (10 minutes of data collection)
+                     → Reply: L_eff, angle shift, centroid, verdict
+
+  DIAG_LEAK          Force immediate leak/draft analysis
+                     (uses existing 24h draft history)
+                     → Reply: draft rate, humidity, verdict
+
+  DIAG_SENSORS       Full sensor health report
+                     → Reply: MPU6050 status, BMP280 status,
+                       variance readings, gravity magnitude,
+                       cross-validation results
+
+  DIAG_ALL           Run ALL diagnostics sequentially
+                     (≈20 minutes total)
+                     → Reply: comprehensive health report
+                     → Also uploaded via GPRS as JSON
+
+  DIAG_ABORT         Cancel running diagnostic
+                     (if taking too long or conditions changed)
+
+TIMING:
+  DIAG_TETHER:  ~5 minutes  (oscillation + GPS sampling)
+  DIAG_ANCHOR:  ~10 minutes (longer GPS averaging)
+  DIAG_LEAK:    ~10 seconds (reads existing history)
+  DIAG_SENSORS: ~30 seconds (variance computation)
+  DIAG_ALL:     ~20 minutes (sequential, all above)
+
+DURING DIAGNOSTICS:
+  Normal flood monitoring CONTINUES
+  Diagnostics run in parallel using existing sensor data
+  Flood alerts are NOT suppressed during diagnostics
+  Watchdog is fed during long diagnostic operations
+```
+
+---
+
+### 17.6 Continuous Self-Calibration
+
+These calibrations run automatically without server commands or manual intervention.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  AUTO-CALIBRATION 1: Atmospheric Pressure Baseline              │
+│  ──────────────────────────────────────────────                 │
+│  WHEN: Buoy confirmed at surface (MODE 0, 1, or 2)            │
+│  HOW:  Rolling 48-sample average, updated every 30 min         │
+│  WHY:  Weather fronts shift P by ±2-4 hPa over hours          │
+│        Must track this to detect submersion accurately          │
+│  STATUS: ✅ Implemented (baselinePressure)                      │
+│                                                                 │
+│  AUTO-CALIBRATION 2: Gravity Reference Vector                  │
+│  ──────────────────────────────────────────────                 │
+│  WHEN: MODE 0 (SLACK — buoy floating upright freely)           │
+│  HOW:  Accelerometer should read (0, 0, 9.81)                 │
+│        Any deviation = accumulated offset drift                 │
+│        Correct: offset = expected - measured                    │
+│  WHY:  Temperature changes shift MEMS accel offset             │
+│        by 0.5-2 mg/°C (0.005-0.02 m/s²)                       │
+│  INTERVAL: Every time MODE 0 persists > 60 seconds             │
+│                                                                 │
+│  AUTO-CALIBRATION 3: Tether Length Verification                │
+│  ──────────────────────────────────────────────                 │
+│  WHEN: MODE 1 (TAUT — buoy oscillating on tether)             │
+│  HOW:  Measure pendulum oscillation period T                   │
+│        L_eff = g × (T/2π)²                                    │
+│        Compare to olpLength                                    │
+│  WHY:  Detects sediment burial, tether stretch,                │
+│        anchor shift without manual measurement                  │
+│  INTERVAL: Every 10 minutes while in MODE 1                    │
+│  ALERT: If |L_eff - olpLength| > 15% for > 1 hour            │
+│                                                                 │
+│  AUTO-CALIBRATION 4: Draft Baseline                            │
+│  ──────────────────────────────────────────────                 │
+│  WHEN: Buoy at surface (MODE 0 or 1)                          │
+│  HOW:  Track pressure offset from atmospheric                   │
+│        (represents how deep buoy sits = draft)                 │
+│        Slow upward drift = biofouling or water ingress         │
+│  INTERVAL: Hourly average stored for 24 hours                  │
+│  ALERT: Rate > 0.5 hPa/hr → possible leak                     │
+│                                                                 │
+│  CANNOT AUTO-CALIBRATE (requires manual):                      │
+│  ──────────────────────────────────────────                     │
+│  ❌ Absolute water level (need staff gauge)                     │
+│  ❌ Absolute current speed (need flow meter)                    │
+│  ❌ Physical tether length (need tape measure)                  │
+│  ❌ Origin GPS coordinates (set at deployment)                  │
+│  These require manual verification quarterly.                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 17.7 Health Score — Composite System Health Metric
+
+All failure detections feed into a single health score reported in telemetry:
+
+```
+HEALTH SCORE (0-100):
+
+  Component              Weight    Score
+  ─────────────────────  ──────    ─────
+  MPU6050 status         20 pts    20 = healthy, 10 = recovering,
+                                   0 = offline
+  BMP280 status          15 pts    15 = healthy, 0 = offline
+  Battery level          15 pts    15 = >70%, 10 = 20-70%,
+                                   5 = 5-20%, 0 = <5%
+  GPS fix quality        10 pts    10 = fix+HDOP<3, 5 = fix+HDOP>3,
+                                   0 = no fix
+  SIM/communication      10 pts    10 = registered+RSSI>10,
+                                   5 = registered+weak,
+                                   0 = unregistered
+  Tether integrity       15 pts    15 = confirmed intact,
+                                   10 = not recently checked,
+                                   0 = breach detected
+  Buoy integrity         10 pts    10 = no leak indicators,
+                                   5 = slow draft increase,
+                                   0 = active leak suspected
+  Sensor agreement       5 pts     5 = cross-checks pass,
+                                   0 = disagreements detected
+
+  Total: sum of components
+
+  REPORTING:
+    Score 80-100: GREEN  — "System healthy"
+    Score 60-79:  YELLOW — "Degraded, monitoring continues"
+    Score 40-59:  ORANGE — "Significant issues, service recommended"
+    Score 20-39:  RED    — "Critical degradation, service required"
+    Score 0-19:   BLACK  — "System failure, data unreliable"
+
+  Health score included in:
+    • Every GPRS data upload (JSON field "health")
+    • Every serial CSV output (field 39)
+    • SMS STATUS reply
+    • DIAG_ALL report
+```
+
+---
+
+### 17.8 Field Calibration Procedure
+
+#### When to Calibrate
+
+```
+EVENT                     CALIBRATION NEEDED
+━━━━━━━━━━━━━━━━━━━━      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Initial deployment        FULL calibration (all parameters)
+After maintenance         Verification calibration
+After flood event         Verification (anchor may have moved)
+Quarterly check           Spot verification
+After firmware update     Sensor recalibration
+After battery replacement IMU recalibration (CoM may shift)
+Seasonal (temp change)    Pressure baseline update
+```
+
+#### Full Calibration Protocol (Initial Deployment)
+
+```
+STEP 1: DRY CALIBRATION (Before deployment, in lab/workshop)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1a. IMU CALIBRATION (via handheld debugger)
+      • Place buoy on flat, level surface
+      • Power on, wait 30 seconds for stabilization
+      • Issue CAL command from handheld debugger
+      • Gyro: 1000 samples averaged for offset
+      • Accel: 500 samples averaged for reference gravity
+      • Store offsets
+
+  1b. PRESSURE SENSOR CALIBRATION
+      • Record pressure reading in open air
+      • Compare to known local atmospheric pressure
+        (from weather service or calibrated barometer)
+      • Store offset in EEPROM if needed
+
+  1c. PHYSICAL MEASUREMENTS
+      • Measure and record:
+          L (tether length) with tape measure ± 1 cm
+          Capsule dimensions ± 1 mm
+          Total buoy mass with batteries ± 1 g
+      • Set OLP length via handheld debugger: OLP:<cm>
+
+  1d. BUOYANCY VERIFICATION
+      • Place buoy in tank of water
+      • Verify it floats (if it sinks, add flotation)
+      • Measure actual draft (waterline position) with ruler
+
+  1e. TETHER LENGTH VERIFICATION
+      • Stretch tether to full length under ~5N tension
+      • Measure with tape measure
+      • Record L_verified ± 0.5 cm
+
+
+STEP 2: WET CALIBRATION (At deployment site)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  2a. REFERENCE WATER LEVEL
+      • Install temporary staff gauge near deployment point
+      • Read water level: H_reference
+      • OR: measure from fixed point down to water surface
+
+  2b. DEPLOY AND VERIFY
+      • Anchor the buoy
+      • Wait 5 minutes for stabilization
+      • System reports: H_system = L × cos(θ)
+      • Compare: H_error = H_system - H_reference
+      • |H_error| < 5 cm → PASS ✅
+      • |H_error| 5-15 cm → ADJUST calibration offset
+      • |H_error| > 15 cm → INVESTIGATE
+
+  2c. ORIGIN COORDINATES
+      • Issue SETORIGIN command from handheld debugger
+      • Captures current GPS as anchor origin
+      • Sets geofence radius = L + 5m margin
+
+  2d. OSCILLATION BASELINE
+      • Gently push buoy sideways and release
+      • System records oscillation period
+      • L_eff computed and compared to L_KNOWN
+      • |L_eff - L_KNOWN| < 15% → PASS ✅
+
+  2e. P_atm BASELINE
+      • While buoy floating at surface:
+      • Record P_atm_tracked value
+      • Compare to weather service P_atm
+
+  2f. DOCUMENT DEPLOYMENT
+      Record and store (in EEPROM + written log):
+      • Date, time, GPS coordinates
+      • L_KNOWN, H_reference at deployment
+      • All calibration offsets
+      • Battery voltage at deployment
+      • Firmware version
+      • Anchor type and installation method
+      • River name and station identifier
+```
+
+#### Verification Calibration (Quarterly)
+
+```
+TIME: ~30 minutes on site
+
+1. READ STAFF GAUGE (or measure water level manually)
+   H_manual = ___ m
+
+2. READ SYSTEM OUTPUT (via diagnostic command or console)
+   H_system = ___ m
+
+3. COMPARE
+   Error = H_system - H_manual
+   |Error| < 5 cm   → PASS ✅  System is accurate
+   |Error| 5-15 cm  → WARNING ⚠️  Recalibrate offset
+   |Error| > 15 cm  → FAIL ❌  Investigate
+
+4. CHECK TETHER
+   • Visual inspection: tether intact, no debris
+   • Tug test: firm connection at buoy and anchor
+   • Verify tether length hasn't changed if possible
+
+5. CHECK BUOY
+   • Visual: biofouling level? Damage? Waterline position?
+   • Compare waterline to deployment photo
+   • Wipe excessive growth if present
+
+6. CHECK SYSTEM HEALTH
+   • Issue BATT command: battery voltage?
+   • Issue FLOODSTATUS: health score?
+   • Check GPRS connectivity: NETTEST
+   • Review any alerts in server log
+
+7. RECORD
+   • Log all readings and observations
+   • Photo of buoy and staff gauge
+   • Update calibration offset if needed
+```
 
 ---
 
@@ -2649,3 +3532,7 @@ This document covers the complete VARUNA Flood Monitoring System:
 - **Part 1** (Sections 1-17): System architecture, physical measurement principle (buoy-tether pendulum), sensor fusion, flood detection state machine, server-centric alert architecture, adaptive sampling, SIM800L communication, RTC/GPS integration, EEPROM persistence, obstruction lights, algorithm toggle, XIAO C3 OTA agent, BMP280 pressure/depth, sensor health, and the complete failure detection & diagnostics system with self-calibration and field calibration procedures.
 
 - **Part 2** (Sections 18-37): Decision matrix implementation, step-down algorithm, rate of change calculation, sustained rise detection, override mechanisms, cold start logic, complete setup() and loop() execution flows, light sleep, GPRS data upload format, SPIFFS archival, the full 33-command console reference with rationale for every inclusion and exclusion, real-time data flow diagram, timing budget, 39-field CSV output format, data logging, inter-system communication summary, design decisions & tradeoffs table, system state summary, and utility functions.
+
+---
+
+I will continue with Section 17 onward when you say **end 09**.
