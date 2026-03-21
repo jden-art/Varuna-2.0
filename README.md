@@ -1,5 +1,703 @@
 
 
+# VARUNA FLOOD MONITORING SYSTEM — COMPLETE TECHNICAL DOCUMENTATION
+
+---
+
+## Part 1: System Architecture, Sensors, and Core Algorithms
+
+---
+
+## 1. System Architecture Overview
+
+This is a **multi-sensor, multi-communication flood monitoring station** built on an **ESP32-S3**, deployed as a sealed buoy capsule tethered to a fixed riverbed anchor. It measures water level through **tether-angle geometry** (pendulum principle) with pressure-based depth measurement for submerged conditions, and transmits data to a cloud server via GPRS for server-side alert dispatch.
+
+> **Design rationale:** Having the device manage its own alert dispatch created a hard dependency between the hardware in the field and the contact list it was trying to reach. Updating who gets notified required either physical access to the device or sending configuration commands via SMS — both impractical in a real deployment with dozens of stations across a river basin. Moving this responsibility to the server means the contact list, escalation rules, notification channels, and message formatting can all be changed through a web interface at any time, independently of the hardware. A Tahsildar gets transferred — update one field in the database. No firmware flash, no SMS command, no field visit.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    ESP32-S3 (Main MCU)                   │
+│              Mounted inside sealed buoy capsule          │
+│                                                         │
+│  I2C Bus 0 (GPIO 8/9)    I2C Bus 1 (GPIO 4/5)         │
+│  ├── MPU6050 (tilt)       ├── DS1307 (RTC)             │
+│  │   (tether angle θ)     └── BMP280 (pressure/depth)  │
+│  │                                                      │
+│  UART1 (GPIO 6/7)  ──── GPS Module (9600 baud)        │
+│  UART2 (GPIO 15/16) ──── SIM800L GSM (9600 baud)      │
+│                                                         │
+│  ┌─── XIAO C3 Interface ──────────────────────────┐    │
+│  │  GPIO 14 (SW-UART TX) ──→ C3 RX: CSV feed      │    │
+│  │  GPIO 43 (UART TX)    ──→ C3 RX: OTA data line │    │
+│  │  GPIO 44 (UART RX)    ←── C3 TX: OTA responses │    │
+│  │  GPIO 0  (BOOT/IO0)   ←── C3: bootloader ctrl  │    │
+│  │  EN pin  (RESET)       ←── C3: reset control    │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  GPIO 2 ──────── Battery ADC (voltage divider)          │
+│  GPIO 12 ─────── Algorithm Toggle Button                │
+│  GPIO 13 ─────── Algorithm Status LED                   │
+│  GPIO 3 ──────── Status LED                             │
+│  GPIO 17 ─────── SIM800L Reset                          │
+│  5× Red LEDs ─── Marine Obstruction Lights              │
+└─────────────────────────────────────────────────────────┘
+
+Physical deployment:
+  ┌──────────────────┐
+  │   BUOY CAPSULE   │  ← Sealed, waterproof, bottom-heavy
+  │   (floats or     │     Contains all electronics
+  │    submerges)     │     Tether attaches at bottom
+  └────────┬─────────┘
+           │
+     TETHER (length L = OLP length)
+     Braided steel cable, precisely measured
+           │
+  ═════════●══════════════  RIVERBED
+        ANCHOR
+     (fixed, weighted)
+```
+
+---
+
+## 2. The Core Measurement Principle — Buoy-Tether Pendulum (OLP)
+
+OLP = Output Linkage Pendulum. A buoy tethered to a fixed riverbed anchor by a cable of known length L.
+
+```
+SIDE VIEW — TAUT TETHER:
+
+Water Surface ~~~~~~~~~~●~~~~~~~~~~~~~
+                       /|
+                      / |
+                     /  |
+                L   /   |  H (water level above riverbed)
+  (fixed wire)     /    |
+                  / θ   |
+                 /      |
+                /       |
+Riverbed ─────●─────────+──────────────
+            ANCHOR    (projection)
+```
+
+**The geometry:**
+```
+┌───────────────────────────────────┐
+│                                   │
+│        H = L × cos(θ)            │
+│                                   │
+│   L = tether length (KNOWN)       │
+│   θ = angle from vertical         │
+│       (MEASURED by MPU6050)       │
+│   H = water height (DERIVED)      │
+│                                   │
+└───────────────────────────────────┘
+
+This is fundamentally different from H = L × sin(θ).
+cos(θ) gives the VERTICAL projection of the tether.
+The buoy floats at the surface, so this vertical
+projection equals the water depth above the anchor.
+```
+
+**Why current-independent:**
+```
+The buoy ALWAYS floats at the water surface.
+Its height IS the water level, regardless of current.
+Current only changes the buoy's HORIZONTAL position,
+which changes d (horizontal displacement) but NOT H.
+
+Same H → same θ → same cos(θ) → same measurement.
+```
+
+**Four operating modes** based on water level relative to L:
+
+```
+Mode 0: SLACK    H << L     Tether loose, buoy upright, H unknown but safe
+Mode 1: TAUT     H < L      Tether tight, H = L×cos(θ), precise measurement
+Mode 2: FLOOD    H ≈ L      θ → 0°, H ≈ L, flood threshold reached
+Mode 3: SUBMERGED H > L     Buoy pulled underwater, H = L + ΔP/(ρg)
+
+                WATER LEVEL RISING →
+  0m          H₁           H₂            L          H_max
+  ├───────────┼────────────┼─────────────┼───────────┤
+  ◄── MODE 0 ─►◄──── MODE 1 ────────────►◄─ MODE 2 ─►◄ MODE 3 ►
+     SLACK          TAUT                    FLOOD      SUBMERGED
+     GREEN          YELLOW                  RED        BLACK
+```
+
+**L is chosen at installation to equal the flood threshold.** This means:
+- θ → 0° IS the flood alarm (natural threshold)
+- Slack tether = safe (no need to measure exact low water levels)
+- Only one constant (L) needs to be known precisely
+
+---
+
+## 2A. Mode Detection Engine
+
+```
+EVERY LOOP ITERATION:
+
+┌──────────────────────────────┐
+│  READ ALL SENSORS            │
+│  • ax, ay, az (accel)        │
+│  • gx, gy, gz (gyro)        │
+│  • P (pressure from BMP280)  │
+│  • Compute θ (fusion)        │
+│  • Compute lateral_accel     │
+│    = sqrt(ax² + ay²)         │
+└────────────┬─────────────────┘
+             │
+             ▼
+┌──────────────────────────────┐
+│  P > P_baseline + 500 Pa ?  │──YES──► MODE 3: SUBMERGED
+└────────────┬─────────────────┘         H = L + ΔP/(ρg)
+             │NO                         Alert: BLACK
+             ▼
+┌──────────────────────────────┐
+│  lateral_accel > 0.15 m/s²  │
+│  AND tilt > 3° ?             │──NO───► MODE 0: SLACK
+└────────────┬─────────────────┘         H < L (safe)
+             │YES                        Alert: GREEN
+             ▼
+┌──────────────────────────────┐
+│  θ < 10°                    │
+│  AND H_computed > 0.95 × L  │──YES──► MODE 2: FLOOD
+└────────────┬─────────────────┘         H ≈ L
+             │NO                         Alert: RED
+             ▼
+        MODE 1: TAUT
+        H = L × cos(θ)
+        Alert: YELLOW (if H/L > 0.7)
+
+TRANSITION HYSTERESIS:
+  MODE 0 → 1: lateral_accel crosses ABOVE 0.15 m/s²
+  MODE 1 → 0: lateral_accel drops BELOW 0.10 m/s²
+               (different thresholds prevent oscillation)
+
+  MODE 1 → 2: θ drops below 10°
+  MODE 2 → 1: θ rises above 12° (hysteresis band)
+
+  MODE 2 → 3: ΔP rises above 500 Pa
+  MODE 3 → 2: ΔP drops below 400 Pa (hysteresis)
+
+ACCURACY BY MODE:
+  MODE 0: N/A (safe, no measurement needed)
+  MODE 1: ±2-8cm (depends on θ; better at large θ)
+  MODE 2: ±5-10cm (cos flat near 0°; pressure begins assisting)
+  MODE 3: ±1-2cm (pressure-based, very accurate)
+```
+
+**Note on `calculateWaterHeight()` function:**
+```
+OLD (leaning post):  H = L × sin(θ)    ← Horizontal deflection
+NEW (buoy tether):   H = L × cos(θ)    ← Vertical projection
+
+The function calculateWaterHeight(thetaDeg) must use cos, not sin.
+The variable name "horizontalDist" in the CSV output now represents
+the horizontal displacement d = L × sin(θ) of the buoy from the
+anchor point (useful for diagnostics, not for water level).
+```
+
+---
+
+## 3. Sensor Fusion & Complementary Filter
+
+```
+                    MPU6050
+              (inside floating buoy)
+                   ╱       ╲
+        Accelerometer    Gyroscope
+        (gravity + tether (angular velocity
+         tension vector)   of buoy rotation)
+                   ╲       ╱
+              Complementary Filter
+              α = 0.98 (gyro-heavy)
+                      │
+              Filtered Tilt θ (X, Y)
+                      │
+              Combined angle from vertical
+                      │
+              H = L × cos(θ)
+```
+
+**Why 98% gyro weight on a buoy:**
+```
+Problem: Buoy is on water. Waves, current turbulence, and
+         impacts create high-frequency accelerations that
+         corrupt the accelerometer reading.
+
+Gyroscope: Immune to linear acceleration. Reports only
+           rotational velocity. Excellent for short-term
+           angle tracking through wave noise.
+
+Accelerometer: Reports true gravity direction over time
+               (drift-free), but contaminated by every
+               wave bump, current eddy, and collision.
+
+Solution: Trust gyro 98% for smooth short-term tracking.
+          Use accel 2% to correct long-term gyro drift.
+          
+Result: ±0.5-2° accuracy even in choppy water.
+```
+
+The complementary filter formula:
+```
+filtTiltX = α × (filtTiltX + gyroRate × dt) + (1-α) × accelAngle
+
+Where:
+  α = 0.98 (ALPHA constant)
+  dt = time since last reading (seconds)
+  gyroRate = (gyroX - gyroOffsetX) / 131.0 (degrees/second)
+  accelAngle = atan2(ay, sqrt(ax² + az²)) × 180/π (degrees)
+```
+
+**Additional sensor: Lateral acceleration for tether detection**
+```
+When tether is SLACK: buoy floats freely, upright
+  → lateral_accel = sqrt(ax² + ay²) ≈ 0
+
+When tether is TAUT: cable pulls on buoy bottom
+  → lateral_accel > 0.15 m/s² (persistent pull)
+  → This distinguishes MODE 0 from MODE 1
+```
+
+**Calibration** (`recalibrate()`):
+- Gyroscope offset measured at startup (average of 1000 samples while stationary)
+- Accelerometer reference gravity direction recorded (500 samples, filtered for |g| ∈ [0.9, 1.1])
+- Reference tilt angles computed:
+  - `refTiltX = atan2(refAccY, sqrt(refAccX² + refAccZ²)) × 180/π`
+  - `refTiltY = atan2(-refAccX, sqrt(refAccY² + refAccZ²)) × 180/π`
+- These define the "zero angle" reference
+- Should be performed with buoy floating freely (MODE 0) for best results
+- Corrected tilt = filtered tilt - reference tilt
+- Combined angle: `θ = sqrt(correctedTiltX² + correctedTiltY²)`
+
+---
+
+## 4. Flood Detection State Machine (System 1)
+
+This is a **two-dimensional classification** followed by a **response matrix**:
+
+### Dimension 1: Height Zones
+```
+Water Height (cm)
+    │
+    │  DANGER zone        ──── dangerLevelCm (250 cm default)
+    │  ████████████████
+    │  WARNING zone       ──── warningLevelCm (180 cm)
+    │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+    │  ALERT zone         ──── alertLevelCm (120 cm)
+    │  ░░░░░░░░░░░░░░░
+    │  NORMAL zone
+    └──────────────────────── Time
+```
+
+### Dimension 2: Rate of Change Categories
+```
+Rate (cm/15min)    Category
+< 0                RATE_FALLING
+0 – 2.0            RATE_SLOW
+2.0 – 5.0          RATE_MODERATE
+> 5.0              RATE_FAST
+> 30.0             RATE_EXTREME (special override)
+> 50.0             RATE_CATASTROPHIC (special override)
+```
+
+### Response Matrix (Zone × Rate × Sustained → Response Level)
+
+```
+                    NOT Sustained                    Sustained Rise
+                    ─────────────                    ──────────────
+              SLOW      MODERATE    FAST       SLOW      MODERATE    FAST
+            ┌──────────────────────────────┬──────────────────────────────┐
+   NORMAL   │ NORMAL    NORMAL    NORMAL   │ NORMAL     WATCH     WATCH  │
+            ├──────────────────────────────┼──────────────────────────────┤
+   ALERT    │ WATCH      WATCH    WATCH    │ WATCH     WARNING   WARNING │
+            ├──────────────────────────────┼──────────────────────────────┤
+   WARNING  │ WARNING   WARNING    FLOOD   │ FLOOD      FLOOD   CRITICAL│
+            ├──────────────────────────────┼──────────────────────────────┤
+   DANGER   │ FLOOD    CRITICAL  CRITICAL  │ CRITICAL  CRITICAL CRITICAL│
+            └──────────────────────────────┴──────────────────────────────┘
+```
+
+### State Transition Rules — Anti-Oscillation Logic
+
+The system uses **hysteresis and time gates** to prevent false alerts:
+
+```
+                    ┌───────────┐
+         ┌────────►│  CRITICAL  │◄── Instant on DANGER+FAST
+         │         └──────┬────┘    or sustained extreme rate
+         │                │
+         │    Requires 4 consecutive    Min hold: 900s
+         │    lower readings + time     
+         │                │
+         │         ┌──────▼────┐
+         │    ┌───►│   FLOOD   │◄── DANGER zone or WARNING+FAST
+         │    │    └──────┬────┘    Min hold: 1800s
+         │    │           │
+         │    │    4 consecutive lower readings
+         │    │           │
+         │    │    ┌──────▼────┐
+         ├────┤───►│  WARNING  │◄── WARNING zone or ALERT+FAST
+         │    │    └──────┬────┘    Min hold: 1800s
+         │    │           │
+         │    │    4 consecutive lower readings
+         │    │           │
+         │    │    ┌──────▼────┐
+         │    └───►│   WATCH   │◄── ALERT zone or moderate rate
+         │         └──────┬────┘    Min hold: 900s
+         │                │
+         │    8 consecutive normal readings
+         │                │
+         │         ┌──────▼────┐
+         └─────────│  NORMAL   │    Default state
+                   └───────────┘
+```
+
+**Step-down logic:**
+```
+STEPDOWN_READINGS_REQUIRED = 4   // Must see 4 consecutive lower-zone readings
+STEPDOWN_NORMAL_READINGS   = 8   // 8 readings needed to return to NORMAL
+
+Plus minimum time at each level:
+MIN_TIME_CRITICAL  = 900   // 15 minutes minimum at CRITICAL
+MIN_TIME_FLOOD     = 1800  // 30 minutes minimum at FLOOD
+MIN_TIME_WARNING   = 1800  // 30 minutes
+MIN_TIME_WATCH     = 900   // 15 minutes
+```
+
+Escalation is instant; de-escalation is gradual.
+
+**AFTER any level transition:**
+- New level stored for inclusion in next HTTP POST payload
+- EEPROM state saved (`forceSaveEeprom`)
+- Serial status printed
+- The device does NOT dispatch any SMS or voice alert
+- The server detects the level change from the next payload and handles all notification routing
+
+**What the server sees at each level:**
+```
+WATCH:    Included in next HTTP POST → server notifies ops team
+WARNING:  Included in next HTTP POST → server notifies local officials
+FLOOD:    Included in next HTTP POST → server notifies district authorities
+CRITICAL: Included in next HTTP POST → server notifies all + SEOC + IVR
+```
+
+### Sustained Rise Detection
+
+A circular buffer of 4 readings tracks whether water is **consistently rising**:
+
+```
+float sustainedBuffer[4];        // Last 4 water height readings
+uint32_t sustainedTimeBuffer[4]; // Timestamps
+
+Algorithm:
+  1. Add new reading to circular buffer
+  2. If buffer not full (< 4 readings) → sustained = false
+  3. Extract ordered sequence from circular buffer
+  4. Check net rising: ordered[3] > ordered[0] + 0.5cm
+  5. Count rising pairs:
+     (h₁ > h₀ + 0.5) → +1
+     (h₂ > h₁ + 0.5) → +1
+     (h₃ > h₂ + 0.5) → +1
+  6. sustainedRise = netRising AND (riseCount ≥ 2)
+```
+
+```
+Example — Sustained Rise DETECTED:
+  [100.0, 101.5, 103.0, 105.2]
+  Net: 105.2 > 100.0 + 0.5 ✓
+  Pairs rising: 3 of 3 ≥ 2 ✓
+  → sustainedRise = TRUE
+
+Example — NOT Sustained (oscillating):
+  [100.0, 102.0, 99.5, 101.0]
+  Net: 101.0 > 100.0 + 0.5 ✓
+  Pairs rising: only 1 (102→99.5 drops, 99.5→101.0 rises)
+  → riseCount = 1 < 2
+  → sustainedRise = FALSE
+```
+
+**Buffer flush on interval change:** When sampling interval changes dramatically (e.g., from 30min to 2min during escalation), old readings at the long interval are invalidated — the buffer is filled with the last reading to avoid comparing readings taken 30 minutes apart with ones taken 2 minutes apart.
+
+---
+
+## 5. Communication Architecture — Device Reports, Server Alerts
+
+### The Division of Responsibility
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  DEVICE (ESP32-S3 in buoy)          SERVER (cloud)              │
+│  ─────────────────────────          ───────────────              │
+│                                                                  │
+│  • Reads sensors                    • Receives HTTP POST        │
+│  • Detects operating mode           • Stores reading history    │
+│  • Computes water height            • Compares response level   │
+│  • Evaluates flood state              to previous known level   │
+│  • Determines response level        • On level CHANGE:         │
+│  • Sends ONE HTTP POST per            dispatches notifications  │
+│    transmit interval                  via SMS, WhatsApp, IVR,   │
+│  • Done.                              email                     │
+│                                     • Manages all contact lists │
+│  The device does NOT:               • Handles cooldowns         │
+│  • Store contact numbers            • Sends de-escalation msgs  │
+│  • Send alert SMS                   • Sends all-clear msgs     │
+│  • Make voice calls                 • Provides web dashboard    │
+│  • Wait for acknowledgments         • Logs all events          │
+│  • Manage escalation chains                                     │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### What the Device Sends
+
+Every transmit interval, the SIM800L makes one HTTP POST to the server. The payload contains everything the server needs:
+
+```json
+{
+  "d": "VARUNA_GDV_KG01",
+  "lat": 16.5100,
+  "lon": 81.8200,
+  "health": 85,
+  "mode": 1,
+  "originDist": 1.3,
+  "draftRate": 0.02,
+  "r": [
+    {
+      "t": 1742556720,
+      "h": 275.3,
+      "r": 12.45,
+      "z": 3,
+      "l": 4,
+      "b": 78,
+      "s": 1
+    }
+  ]
+}
+```
+
+```
+Payload fields:
+  d          = Station identifier (unique per deployment)
+  lat, lon   = GPS coordinates
+  health     = Composite health score (0-100)
+  mode       = Current operating mode (0-3)
+  originDist = Distance from anchor origin (meters)
+  draftRate  = Draft pressure change rate (hPa/hr)
+  r[]        = Readings array (buffered since last transmit)
+    t = Unix timestamp
+    h = Water height (cm)
+    r = Rate of change (cm/15min)
+    z = Zone classification (0=NORMAL, 1=ALERT, 2=WARNING, 3=DANGER)
+    l = Response level (0=NORMAL, 1=WATCH, 2=WARNING, 3=FLOOD, 4=CRITICAL)
+    b = Battery percent
+    s = Sustained rise flag (0/1)
+```
+
+The device's role ends the moment the HTTP POST receives a 2xx response.
+
+### What the Server Does on Receiving a POST
+
+```
+INCOMING PAYLOAD
+      │
+      ▼
+┌──────────────────────────────────────────────┐
+│  1. Parse and validate JSON                   │
+│  2. Store readings in time-series database    │
+│  3. Extract latest response level (l)        │
+│  4. Compare to previousStoredLevel            │
+│     for this station                          │
+└──────────────────┬───────────────────────────┘
+                   │
+          ┌────────┼─────────┐
+          │        │         │
+     l > prev  l == prev  l < prev
+     ESCALATE  NO CHANGE  DE-ESCALATE
+          │        │         │
+          ▼        ▼         ▼
+   Send alerts  Check if   Send de-esc
+   to contacts  reminder   messages
+   at new level is due     to prev contacts
+                   │         │
+                   ▼         │
+              Sustained?     ▼
+              Send reminder  l == NORMAL?
+              at cooldown    Send ALL CLEAR
+              interval       Reset event
+```
+
+### Server-Side Notification Dispatch
+
+**Level transitions trigger SMS to specific Indian government contacts:**
+
+```
+TRANSITION                CONTACTS NOTIFIED              CHANNEL
+──────────────────────    ──────────────────────────     ────────
+NORMAL → WATCH            Internal ops team only         Dashboard
+                          (no government officials)      
+
+WATCH → WARNING           Sarpanch / Ward officer        SMS
+                          Tahsildar circle office         SMS
+
+WARNING → FLOOD           District Control Room           SMS + IVR
+                          District Collector duty #       SMS + IVR
+                          Local police station            SMS
+                          duty officer
+
+FLOOD → CRITICAL          All FLOOD contacts              SMS (no cooldown)
+                          State Emergency Operations      SMS + IVR
+                          Centre (SEOC)
+
+Any level → lower level   Everyone notified at the       SMS
+                          higher level gets
+                          de-escalation message
+
+Any level → NORMAL        Everyone contacted during      SMS
+                          the entire event gets
+                          ALL CLEAR message
+```
+
+### Server-Side Cooldown & Reminder Logic
+
+```
+The cooldown exists to handle SUSTAINED levels, not to
+throttle the device. The device only sends one POST per
+interval anyway.
+
+SUSTAINED LEVEL REMINDERS:
+  WATCH:     No reminder (ops team sees dashboard)
+  WARNING:   Reminder every 60 minutes
+  FLOOD:     Reminder every 30 minutes
+  CRITICAL:  Reminder every 15 minutes
+
+Reminders are worded DIFFERENTLY from escalation alerts:
+
+  Escalation: "VARUNA FLOOD ALERT | Station: Godavari-KG-01 |
+               Level: 275cm (DANGER) | Rising at 12cm/15min |
+               GPS: 16.5N 81.8E | 14:32 IST 21-Mar-2026"
+
+  Reminder:   "VARUNA STATUS UPDATE | Station: Godavari-KG-01 |
+               Level: 280cm (DANGER) | FLOOD ALERT ONGOING |
+               Rising at 8cm/15min | Duration: 45min |
+               GPS: 16.5N 81.8E | 15:17 IST 21-Mar-2026"
+
+Recipients can immediately tell whether the situation
+WORSENED (escalation) or is PERSISTING (reminder).
+```
+
+### SMS Message Format
+
+```
+Designed for Indian government officials receiving from unknown numbers.
+Structured, credible, no abbreviations:
+
+ESCALATION ALERT:
+┌─────────────────────────────────────────────────────────────┐
+│ VARUNA FLOOD ALERT | Station: Godavari-KG-01 |             │
+│ Level: 275cm (DANGER) | Rising at 12cm/15min |             │
+│ GPS: 16.5N 81.8E | 14:32 IST 21-Mar-2026                  │
+└─────────────────────────────────────────────────────────────┘
+
+STATUS REMINDER:
+┌─────────────────────────────────────────────────────────────┐
+│ VARUNA STATUS UPDATE | Station: Godavari-KG-01 |           │
+│ Level: 280cm (DANGER) | FLOOD ALERT ONGOING |              │
+│ Rising at 8cm/15min | Duration: 45min |                    │
+│ GPS: 16.5N 81.8E | 15:17 IST 21-Mar-2026                  │
+└─────────────────────────────────────────────────────────────┘
+
+DE-ESCALATION:
+┌─────────────────────────────────────────────────────────────┐
+│ VARUNA LEVEL CHANGE | Station: Godavari-KG-01 |            │
+│ Level DROPPED: FLOOD → WARNING |                            │
+│ Current: 210cm | Falling at 3cm/15min |                    │
+│ Monitoring continues | 15:45 IST 21-Mar-2026               │
+└─────────────────────────────────────────────────────────────┘
+
+ALL CLEAR:
+┌─────────────────────────────────────────────────────────────┐
+│ VARUNA ALL CLEAR | Station: Godavari-KG-01 |               │
+│ Water level returned to NORMAL |                            │
+│ Current: 95cm | Peak during event: 285cm |                 │
+│ Event duration: 3hr 20min |                                │
+│ Normal monitoring resumed | 17:52 IST 21-Mar-2026          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Contact Management
+
+```
+All contacts stored in server database.
+Managed through web interface.
+No SMS commands, no device-side storage.
+
+Server database schema (simplified):
+
+  contacts:
+    id            INT
+    station_id    VARCHAR
+    name          VARCHAR     (e.g., "Tahsildar, Kakinada Circle")
+    phone         VARCHAR     (e.g., "+919876543210")
+    trigger_level INT         (minimum level to notify)
+    channels      SET         (SMS, WhatsApp, IVR, Email)
+    active        BOOLEAN
+    notes         TEXT
+
+  notifications_log:
+    id            INT
+    station_id    VARCHAR
+    contact_id    INT
+    level         INT
+    message       TEXT
+    channel       VARCHAR
+    sent_at       TIMESTAMP
+    delivered     BOOLEAN
+    
+If a Tahsildar is transferred and replaced:
+  → Update one row in contacts table
+  → New person starts receiving from next event
+  → No firmware change, no field visit, no SMS command
+```
+
+### GPRS as Primary, SMS as Diagnostic-Only
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  COMMUNICATION CHANNELS                                      │
+│                                                              │
+│  PRIMARY: GPRS HTTP POST                                     │
+│  ├── Every transmit interval                                 │
+│  ├── Carries full sensor payload                             │
+│  ├── Server confirms with HTTP 2xx                           │
+│  ├── Retry on failure, archive to SPIFFS if persistent       │
+│  └── If 3 consecutive failures → flag GPRS_OFFLINE           │
+│                                                              │
+│  FALLBACK: Serial dump + SPIFFS archive (if GPRS offline)   │
+│  ├── Buffered data written to serial output                  │
+│  ├── Archived to SPIFFS for later retrieval                  │
+│  └── Data not lost, just delayed                             │
+│                                                              │
+│  DIAGNOSTIC: Inbound SMS (from authorized field engineers)   │
+│  ├── STATUS → device replies with current state              │
+│  ├── Maintenance commands as documented                      │
+│  └── DIAG_* → diagnostic suite commands                      │
+│                                                              │
+│  NOT USED FOR:                                               │
+│  ✗ Sending alert SMS to authorities                          │
+│  ✗ Storing contact numbers                                   │
+│  ✗ Making voice calls                                        │
+│  ✗ Waiting for acknowledgments                               │
+│  ✗ Managing escalation chains                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+
+
 ## 6. Adaptive Sampling System (System 2)
 
 The system **dynamically adjusts** how often it reads sensors and transmits data based on flood response level and battery condition:
