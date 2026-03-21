@@ -1,4 +1,2481 @@
+# Varuna — Complete Implementation Roadmap
 
+---
+
+## How This is Organized
+
+```
+PHASE 0: Workspace & Tools
+PHASE 1: Individual Sensor Drivers (one at a time, bench)
+PHASE 2: Core Measurement Engine (tilt → water height)
+PHASE 3: Flood Detection State Machine
+PHASE 4: Communication (SIM800L + GPRS)
+PHASE 5: Server (receive data, dispatch alerts)
+PHASE 6: Power Management & Adaptive Sampling
+PHASE 7: Persistence (EEPROM + SPIFFS)
+PHASE 8: Failure Detection & Diagnostics
+PHASE 9: Console Commands (serial interface)
+PHASE 10: Web Console (browser dashboard)
+PHASE 11: C3 Companion (CSV feed + OTA)
+PHASE 12: Integration Testing (all systems together)
+PHASE 13: Enclosure & Waterproofing
+PHASE 14: Field Calibration & Deployment
+
+Each phase has:
+  • WHAT you're building
+  • WHAT you need before starting
+  • EXACT steps
+  • HOW to test it
+  • DONE WHEN criteria
+```
+
+---
+
+## PHASE 0 — Workspace, Tools, and Parts
+
+### Step 0.1: Get All Hardware
+
+```
+MICROCONTROLLERS:
+  □ ESP32-S3 dev board (with USB-C, UART pins exposed)
+  □ Seeed XIAO ESP32-C3
+
+SENSORS:
+  □ MPU6050 breakout board (GY-521)
+  □ BMP280 breakout board
+  □ DS1307 RTC module (with CR2032 battery)
+  □ GPS module (NEO-6M or similar, UART output, 9600 baud)
+
+COMMUNICATION:
+  □ SIM800L module (with external antenna)
+  □ 2× SIM cards with data plans (one for S3, one for C3)
+  □ SIM800L buck converter (4.0V, SIM800L is picky about voltage)
+
+POWER:
+  □ 8× 18650 Li-Ion cells (2600mAh each)
+  □ 18650 battery holder (parallel configuration)
+  □ Voltage divider resistors: 33kΩ + 100kΩ
+  □ 100nF ceramic capacitor
+  □ TP4056 charging module (or similar)
+
+LEDS & INTERFACE:
+  □ 5× red LEDs + resistors (obstruction lights)
+  □ 2× LEDs (status + algorithm indicator)
+  □ 1× momentary push button (algorithm toggle)
+  □ 10kΩ pull-up resistor for button
+
+WIRING:
+  □ Breadboard(s) — at least 2 full-size
+  □ Jumper wires (M-M, M-F, F-F)
+  □ Logic level shifters (if needed for 3.3V/5V)
+
+TOOLS:
+  □ Multimeter
+  □ USB cables (for ESP32-S3 and XIAO C3)
+  □ Soldering iron + solder (for final assembly)
+```
+
+### Step 0.2: Set Up Development Environment
+
+```
+□ Install Arduino IDE 2.x (or PlatformIO — your preference)
+□ Install ESP32 board package:
+    Arduino → Boards Manager → search "esp32" → install by Espressif
+□ Select board: "ESP32S3 Dev Module"
+□ Install NO external libraries (everything is written from scratch)
+    The firmware uses:
+      - Wire.h (built-in, for I2C)
+      - HardwareSerial.h (built-in, for UART)
+      - EEPROM.h (built-in)
+      - SPIFFS.h (built-in)
+      - esp_task_wdt.h (built-in, watchdog)
+      - esp_sleep.h (built-in, light sleep)
+    All sensor drivers are custom (no Adafruit, no SparkFun libs)
+
+□ Verify: compile an empty sketch for ESP32-S3, upload, see serial output
+□ Set serial monitor to 115200 baud
+```
+
+### Step 0.3: Create Project Structure
+
+```
+Create a single .ino file to start. You'll keep everything in
+one file (as the documentation describes — no separate .h/.cpp).
+
+varuna_flood_monitor/
+  └── varuna_flood_monitor.ino
+
+Start with:
+
+  #include <Wire.h>
+  #include <HardwareSerial.h>
+  #include <EEPROM.h>
+  #include <SPIFFS.h>
+  #include <esp_task_wdt.h>
+  #include <esp_sleep.h>
+
+  // ─── PIN DEFINITIONS ───
+  #define SDA_0  8
+  #define SCL_0  9
+  #define SDA_1  4
+  #define SCL_1  5
+  #define GPS_RX 6
+  #define GPS_TX 7
+  #define SIM_RX 15
+  #define SIM_TX 16
+  #define SIM_RST 17
+  #define BATTERY_PIN 2
+  #define STATUS_LED 3
+  #define ALGO_BUTTON 12
+  #define ALGO_LED 13
+  #define C3_FEED_PIN 14
+
+  // ─── CONSTANTS ───
+  #define ALPHA 0.98
+  #define WDT_TIMEOUT_SEC 120
+
+  void setup() {
+    Serial.begin(115200);
+    Serial.println("VARUNA BOOT");
+  }
+
+  void loop() {
+    delay(1000);
+  }
+
+□ Upload this. See "VARUNA BOOT" in serial monitor.
+□ DONE WHEN: Blank project compiles and runs on ESP32-S3.
+```
+
+---
+
+## PHASE 1 — Individual Sensor Drivers
+
+**Rule: Get each sensor working alone before combining anything.**
+
+---
+
+### Step 1.1: I2C Bus Setup
+
+```
+WHAT: Initialize two independent I2C buses.
+
+ADD TO setup():
+
+  TwoWire I2C_0 = TwoWire(0);
+  TwoWire I2C_1 = TwoWire(1);
+
+  void setup() {
+    Serial.begin(115200);
+    
+    I2C_0.begin(SDA_0, SCL_0, 100000);  // Bus 0: MPU6050
+    I2C_1.begin(SDA_1, SCL_1, 100000);  // Bus 1: RTC + BMP280
+    
+    Serial.println("I2C buses initialized");
+  }
+
+WIRE:
+  MPU6050: SDA → GPIO 8, SCL → GPIO 9, VCC → 3.3V, GND → GND
+  BMP280:  SDA → GPIO 4, SCL → GPIO 5, VCC → 3.3V, GND → GND
+  DS1307:  SDA → GPIO 4, SCL → GPIO 5, VCC → 5V*, GND → GND
+  (* DS1307 needs 5V. If your board is 3.3V only,
+     use level shifters or switch to DS3231 which runs at 3.3V)
+
+TEST:
+  Write an I2C scanner for each bus:
+  
+  void scanBus(TwoWire &bus, const char* name) {
+    Serial.printf("Scanning %s...\n", name);
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      bus.beginTransmission(addr);
+      if (bus.endTransmission() == 0) {
+        Serial.printf("  Found device at 0x%02X\n", addr);
+      }
+    }
+  }
+
+  Call scanBus(I2C_0, "Bus 0") and scanBus(I2C_1, "Bus 1")
+
+EXPECTED:
+  Bus 0: Found device at 0x68 (MPU6050)
+  Bus 1: Found device at 0x68 (DS1307) and 0x76 (BMP280)
+
+□ DONE WHEN: All three devices detected on correct buses.
+```
+
+---
+
+### Step 1.2: MPU6050 Driver
+
+```
+WHAT: Read raw accelerometer and gyroscope values.
+
+WRITE THESE FUNCTIONS:
+
+  1. mpuWriteReg(reg, value)
+     → I2C_0 write single byte to MPU6050 register
+  
+  2. mpuReadReg(reg) → uint8_t
+     → I2C_0 read single byte from MPU6050 register
+  
+  3. initMPU6050() → bool
+     → Wake up: write 0x00 to register 0x6B
+     → Set sample rate divider: reg 0x19 = 0x07
+     → Set DLPF: reg 0x1A = 0x03
+     → Set gyro range ±250°/s: reg 0x1B = 0x00
+     → Set accel range ±2g: reg 0x1C = 0x00
+     → Read WHO_AM_I (reg 0x75) → should be 0x68 or 0x72
+     → Return true if WHO_AM_I valid
+  
+  4. readMPU6050()
+     → Burst read 14 bytes starting from register 0x3B
+     → Parse into: ax, ay, az (accel), temp, gx, gy, gz (gyro)
+     → Convert accel: value / 16384.0 (for ±2g range) → in g
+     → Convert gyro: value / 131.0 (for ±250°/s range) → in °/s
+     → Print all values to serial
+
+WIRE:
+  Already done in Step 1.1.
+
+TEST:
+  Call readMPU6050() every 100ms in loop()
+  Print: ax, ay, az (in g), gx, gy, gz (in °/s)
+
+  With sensor flat on table:
+    ax ≈ 0, ay ≈ 0, az ≈ 1.0 (gravity)
+    gx ≈ 0, gy ≈ 0, gz ≈ 0
+
+  Tilt sensor 45°:
+    ax or ay should show ~0.7g
+    az should show ~0.7g
+
+  Rotate sensor:
+    gx, gy, or gz should show rotation rate
+
+□ DONE WHEN: Raw accel and gyro values make physical sense.
+  Gravity reads ~1g on Z when flat.
+  Tilting changes accel components correctly.
+  Rotating shows gyro response.
+```
+
+---
+
+### Step 1.3: MPU6050 Calibration
+
+```
+WHAT: Measure and store gyroscope offsets and accelerometer reference.
+
+WRITE THESE FUNCTIONS:
+
+  float gyroOffsetX, gyroOffsetY, gyroOffsetZ;
+  float refAccX, refAccY, refAccZ;
+  float refTiltX, refTiltY;
+
+  5. calibrateGyro()
+     → Keep sensor STILL
+     → Read gyro 1000 times, 2ms apart
+     → Average each axis → gyroOffset{X,Y,Z}
+     → These are the "zero" values when not rotating
+
+  6. calibrateAccel()
+     → Keep sensor STILL and LEVEL
+     → Read accel 500 times, 3ms apart
+     → For each reading: compute totalG = sqrt(ax² + ay² + az²)
+     → Only keep readings where 0.9 < totalG < 1.1
+     → Average valid readings → refAcc{X,Y,Z}
+     → Compute reference tilt:
+       refTiltX = atan2(refAccY, sqrt(refAccX² + refAccZ²)) × 180/PI
+       refTiltY = atan2(-refAccX, sqrt(refAccY² + refAccZ²)) × 180/PI
+
+TEST:
+  Run calibration in setup()
+  Print offsets:
+    Gyro offsets should be small (< 5 °/s typically)
+    Accel reference should be near (0, 0, 1.0)
+    Reference tilts should be near 0° if sensor is level
+
+□ DONE WHEN: Calibration runs, offsets are small and consistent
+  across multiple runs.
+```
+
+---
+
+### Step 1.4: Complementary Filter
+
+```
+WHAT: Fuse accel + gyro into stable tilt angle.
+
+ADD THESE VARIABLES:
+  float filtTiltX = 0, filtTiltY = 0;
+  unsigned long prevTime = 0;
+
+WRITE THIS LOGIC (in loop):
+
+  7. Every loop iteration:
+     → Read MPU6050
+     → Calculate dt = (millis() - prevTime) / 1000.0
+     → Clamp: if dt > 2.0, dt = 0.01
+     → prevTime = millis()
+     
+     → Accel angle:
+       accelTiltX = atan2(ay, sqrt(ax*ax + az*az)) * 180.0/PI
+       accelTiltY = atan2(-ax, sqrt(ay*ay + az*az)) * 180.0/PI
+     
+     → Gyro rate (with offset correction):
+       gyroRateX = (raw_gx / 131.0) - gyroOffsetX
+       gyroRateY = (raw_gy / 131.0) - gyroOffsetY
+     
+     → Complementary filter:
+       filtTiltX = 0.98 * (filtTiltX + gyroRateX * dt) + 0.02 * accelTiltX
+       filtTiltY = 0.98 * (filtTiltY + gyroRateY * dt) + 0.02 * accelTiltY
+     
+     → Subtract reference:
+       correctedTiltX = filtTiltX - refTiltX
+       correctedTiltY = filtTiltY - refTiltY
+     
+     → Combined angle from vertical:
+       theta = sqrt(correctedTiltX * correctedTiltX + 
+                    correctedTiltY * correctedTiltY)
+
+TEST:
+  Print theta every 100ms
+  Sensor flat → theta ≈ 0°
+  Tilt 30° → theta ≈ 30°
+  Tilt 45° → theta ≈ 45°
+  Tilt 90° → theta ≈ 90°
+  
+  Shake sensor → theta should stay stable (not jump wildly)
+  Hold at angle for 60 seconds → should not drift
+
+□ DONE WHEN: theta matches physical angle within ±2°.
+  Stable under vibration. No significant drift over 1 minute.
+```
+
+---
+
+### Step 1.5: BMP280 Driver
+
+```
+WHAT: Read pressure and temperature.
+
+WRITE THESE FUNCTIONS:
+
+  8. bmpReadReg(reg) → uint8_t
+     → I2C_1 read from BMP280
+
+  9. bmpWriteReg(reg, value)
+     → I2C_1 write to BMP280
+
+  10. initBMP280() → bool
+      → Read chip ID from reg 0xD0
+      → Accept: 0x58, 0x56, 0x57, or 0x60
+      → Read calibration data:
+         - T1 (unsigned 16-bit) from reg 0x88-0x89
+         - T2 (signed 16-bit) from reg 0x8A-0x8B
+         - T3 (signed 16-bit) from reg 0x8C-0x8D
+         - P1 through P9 from reg 0x8E-0x9F
+      → Configure: reg 0xF4 = 0x57, reg 0xF5 = 0x10
+      → Return true
+
+  11. bmpReadData(float *temperature, float *pressure)
+      → Read 6 bytes: reg 0xF7-0xFC
+      → Raw pressure = (byte0 << 12) | (byte1 << 4) | (byte2 >> 4)
+      → Raw temperature = (byte3 << 12) | (byte4 << 4) | (byte5 >> 4)
+      → Apply Bosch compensation formulas:
+         Temperature compensation → bmpTFine variable
+         Pressure compensation using bmpTFine
+      → Output: temperature in °C, pressure in hPa
+
+  NOTE: The compensation formulas are in the BMP280 datasheet.
+  Use the integer arithmetic versions (not floating point).
+  They look complex but are just a sequence of multiply/add/shift.
+
+TEST:
+  Read every 1 second, print pressure and temperature
+  Expected at sea level: ~1013 hPa, room temperature
+  Expected at altitude: lower (drops ~1 hPa per 8.5m elevation)
+  
+  Blow warm air on sensor → temperature rises
+  Seal sensor in container and squeeze → pressure rises
+
+□ DONE WHEN: Pressure reads within ±5 hPa of a known reference.
+  Temperature reads room temperature correctly.
+  Values are stable (not jumping).
+```
+
+---
+
+### Step 1.6: DS1307 RTC Driver
+
+```
+WHAT: Read and write date/time that persists across power cycles.
+
+WRITE THESE FUNCTIONS:
+
+  12. bcdToDec(uint8_t val) → uint8_t
+      → ((val >> 4) * 10) + (val & 0x0F)
+
+  13. decToBcd(uint8_t val) → uint8_t
+      → ((val / 10) << 4) | (val % 10)
+
+  14. initRTC() → bool
+      → I2C_1 read 7 bytes from address 0x68, register 0x00
+      → Check clock-halt bit (byte 0, bit 7) → clear if set
+      → Convert 12hr to 24hr format if bit 6 of byte 2 is set
+      → Disable square wave: write 0x00 to register 0x07
+      → Return true
+
+  15. readRTC(year, month, day, hour, minute, second)
+      → Read 7 bytes from register 0x00
+      → Decode BCD: seconds, minutes, hours, day-of-week,
+        day, month, year
+      → Year = 2000 + decoded_year
+
+  16. writeRTC(year, month, day, hour, minute, second)
+      → Encode to BCD
+      → Write 7 bytes to register 0x00
+      → Ensure clock-halt bit is clear
+
+  17. dateToUnix(year, month, day, hour, minute, second) → uint32_t
+      → Count days from 1970-01-01
+      → Add leap year corrections
+      → Multiply by 86400, add hours*3600 + minutes*60 + seconds
+
+WIRE:
+  Already on I2C Bus 1 from Step 1.1.
+  Make sure CR2032 battery is installed in RTC module.
+
+TEST:
+  In setup(): write a known time (e.g., 2025-01-15 10:30:00)
+  In loop(): read and print every second
+  → Time should increment by 1 second each time
+  
+  Power off the ESP32 for 30 seconds
+  Power on → read time → should show ~30 seconds later
+  (This proves the battery backup is working)
+
+□ DONE WHEN: RTC keeps time, survives power cycle,
+  reads/writes correctly in 24-hour format.
+```
+
+---
+
+### Step 1.7: GPS NMEA Parser
+
+```
+WHAT: Parse GPS position, time, and quality from NMEA sentences.
+
+WIRE:
+  GPS TX → GPIO 6 (ESP32 RX)
+  GPS RX → GPIO 7 (ESP32 TX)  (may not be needed)
+  GPS VCC → 3.3V (or 5V depending on module)
+  GPS GND → GND
+
+SETUP:
+  HardwareSerial GPS_Serial(1);  // UART1
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+WRITE THESE FUNCTIONS:
+
+  18. processGPS()
+      → While GPS_Serial.available():
+        → Read byte, accumulate into nmeaBuffer[120]
+        → On newline:
+          → validateNMEAChecksum(buffer) → bool
+          → If valid: parseNMEA(buffer)
+
+  19. validateNMEAChecksum(buffer) → bool
+      → Find '$' and '*'
+      → XOR all bytes between them
+      → Compare to hex value after '*'
+
+  20. parseNMEA(buffer)
+      → Split by commas
+      → If starts with $GPGGA or $GNGGA:
+        → Extract: time, lat, lon, fix quality,
+          satellites, HDOP, altitude
+      → If starts with $GPRMC or $GNRMC:
+        → Extract: time, lat, lon, speed, date
+
+  21. nmeaToDecimal(raw, direction) → float
+      → degrees = int(raw / 100)
+      → minutes = raw - degrees * 100
+      → decimal = degrees + minutes / 60.0
+      → If direction == 'S' or 'W': negate
+
+VARIABLES:
+  float gpsLat, gpsLon, gpsAlt, gpsSpeed, gpsHdop;
+  int gpsSatellites;
+  bool gpsFixValid;
+  int gpsHour, gpsMin, gpsSec;
+  int gpsDay, gpsMonth, gpsYear;
+
+TEST:
+  Take GPS module near a window (needs sky view)
+  Print raw NMEA sentences first → verify they arrive
+  Then enable parsing → print decoded values
+  
+  Time to first fix: 30 seconds to 10 minutes (cold start)
+  After fix: lat/lon should match your actual location
+  Check on Google Maps
+
+□ DONE WHEN: GPS returns valid position that matches your
+  actual location. Satellite count > 4. Fix valid = true.
+```
+
+---
+
+### Step 1.8: SIM800L Basic Communication
+
+```
+WHAT: Send AT commands and get responses from SIM800L.
+
+WIRE:
+  SIM800L TX → GPIO 15 (ESP32 RX)
+  SIM800L RX → GPIO 16 (ESP32 TX)
+  SIM800L RST → GPIO 17
+  SIM800L VCC → 4.0V (NOT 3.3V! Use buck converter or LDO)
+  SIM800L GND → GND
+  External antenna connected
+
+  ⚠️ CRITICAL: SIM800L needs 4.0V ± 0.4V and up to 2A peak
+     during transmission. A weak power supply causes random
+     resets. Use a dedicated buck converter or large capacitor.
+
+SETUP:
+  HardwareSerial SIM_Serial(2);  // UART2
+  SIM_Serial.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+
+WRITE THESE FUNCTIONS:
+
+  22. send_at_command(command, expected, timeout_ms) → result
+      → Send command + "\r\n" to SIM_Serial
+      → Accumulate response bytes
+      → Check for expected substring or "ERROR"
+      → Return AT_SUCCESS, AT_TIMEOUT, or AT_ERROR
+
+  23. initSIM800L() → bool
+      → Hardware reset: GPIO 17 LOW 200ms, HIGH, wait 2s
+      → send_at_command("AT", "OK", 2000) — up to 5 retries
+      → send_at_command("ATE0", "OK", 1000)
+      → send_at_command("AT+CMGF=1", "OK", 1000)
+      → send_at_command("AT+CPIN?", "READY", 5000)
+      → send_at_command("AT+CREG?", "0,1", 5000) — or "0,5" for roaming
+      → send_at_command("AT+CSQ", "OK", 2000) — read signal
+      → Return true if all pass
+
+TEST:
+  Insert SIM card (data plan active)
+  Run initSIM800L() in setup()
+  Print each AT response
+  
+  Expected:
+    AT → OK
+    AT+CPIN? → +CPIN: READY
+    AT+CREG? → +CREG: 0,1 (registered, home network)
+    AT+CSQ → +CSQ: 15,0 (signal strength, 10-31 is usable)
+
+□ DONE WHEN: SIM800L responds to AT commands.
+  SIM card detected. Network registered. Signal > 10.
+```
+
+---
+
+### Step 1.9: SIM800L GPRS HTTP POST
+
+```
+WHAT: Send a JSON payload to a server via GPRS.
+
+WRITE THESE FUNCTIONS:
+
+  24. gprsInit() → bool
+      → AT+SAPBR=3,1,"Contype","GPRS"
+      → AT+SAPBR=3,1,"APN","<your_apn>"  (e.g., "airtelgprs.com")
+      → AT+SAPBR=1,1  (open bearer)
+      → AT+SAPBR=2,1  (check IP assigned)
+      → Return true if IP received
+
+  25. gprsPostData(payload, length) → bool
+      → AT+HTTPINIT
+      → AT+HTTPPARA="CID",1
+      → AT+HTTPPARA="URL","<server_url>"
+      → AT+HTTPPARA="CONTENT","application/json"
+      → AT+HTTPDATA=<length>,10000
+      → Wait for "DOWNLOAD"
+      → Send payload bytes
+      → AT+HTTPACTION=1
+      → Wait for +HTTPACTION:1,<status>,<length>
+      → Check status == 200
+      → AT+HTTPTERM
+      → Return true if 200
+
+FOR TESTING, you need something to receive the POST.
+Easiest option: use a free service like webhook.site:
+  1. Go to webhook.site
+  2. Copy your unique URL
+  3. Set that as your server URL
+  4. Send POST → see it appear on the webpage
+
+TEST PAYLOAD:
+  char testPayload[] = "{\"d\":\"TEST\",\"h\":100}";
+  gprsPostData(testPayload, strlen(testPayload));
+
+□ DONE WHEN: JSON payload appears on webhook.site.
+  HTTP response code 200 received by SIM800L.
+```
+
+---
+
+### Step 1.10: Battery ADC Reading
+
+```
+WHAT: Read battery voltage through voltage divider.
+
+WIRE:
+  Battery+ ─── 33kΩ ──┬── GPIO 2 (ADC)
+                       │
+                     100kΩ
+                       │
+                      GND
+  
+  Add 100nF ceramic cap between GPIO 2 and GND.
+
+WRITE:
+
+  26. readBatteryVoltage() → float (millivolts)
+      → analogRead(BATTERY_PIN)
+      → Convert 12-bit ADC (0-4095) to voltage:
+        adcVoltage = reading * 3300.0 / 4095.0  (mV at ADC pin)
+        batteryVoltage = adcVoltage * 133.0 / 100.0  (undo divider)
+      → Return batteryVoltage in mV
+
+  27. batteryPercentage(voltage_mV) → float
+      → Piecewise Li-Ion curve:
+        ≥ 4100mV → 90 + (v-4100)*10/100
+        ≥ 3850mV → 70 + (v-3850)*20/250
+        ≥ 3700mV → 40 + (v-3700)*30/150
+        ≥ 3500mV → 20 + (v-3500)*20/200
+        ≥ 3300mV → 5 + (v-3300)*15/200
+        ≥ 3000mV → 0 + (v-3000)*5/300
+        < 3000mV → 0
+      → Clamp 0-100
+
+SETUP:
+  analogReadResolution(12);
+
+TEST:
+  Connect a known voltage source (e.g., bench supply)
+  Set to 4.2V → should read ~100%
+  Set to 3.7V → should read ~40-50%
+  Set to 3.3V → should read ~5%
+  
+  OR: connect your 18650 battery and check reading
+  against multimeter measurement.
+
+□ DONE WHEN: Voltage reading matches multimeter within ±50mV.
+  Percentage follows piecewise curve.
+```
+
+---
+
+**PHASE 1 CHECKPOINT:**
+```
+At this point you have 10 independent, tested modules:
+  ✓ I2C bus scan
+  ✓ MPU6050 raw read
+  ✓ MPU6050 calibration
+  ✓ Complementary filter → theta
+  ✓ BMP280 pressure/temp
+  ✓ DS1307 RTC read/write
+  ✓ GPS NMEA parser
+  ✓ SIM800L AT commands
+  ✓ SIM800L GPRS POST
+  ✓ Battery ADC
+
+None of them depend on each other yet.
+Each one works in isolation.
+NOW you start combining.
+```
+
+---
+
+## PHASE 2 — Core Measurement Engine
+
+### Step 2.1: Water Height from Tilt (MODE 1)
+
+```
+WHAT: Compute H = L × cos(θ)
+
+ADD:
+  float olpLength = 200.0;  // cm — your tether length
+  float waterHeight = 0.0;
+
+IN LOOP:
+  waterHeight = olpLength * cos(theta * PI / 180.0);
+
+TEST:
+  Hold sensor flat (θ ≈ 0°) → H ≈ L (200cm)
+  Tilt 30° → H ≈ 173cm (200 × cos30°)
+  Tilt 45° → H ≈ 141cm
+  Tilt 60° → H ≈ 100cm
+  Tilt 90° → H ≈ 0cm
+
+  Use a protractor or phone inclinometer to verify angles.
+
+□ DONE WHEN: H = L×cos(θ) matches expected values at
+  several known angles within ±5cm.
+```
+
+---
+
+### Step 2.2: Lateral Acceleration (Tether Detection)
+
+```
+WHAT: Detect whether tether is slack or taut.
+
+ADD:
+  float lateralAccel = 0.0;
+
+IN LOOP (after reading MPU6050):
+  lateralAccel = sqrt(ax*ax + ay*ay);  // in g units
+  // Convert to m/s²: lateralAccel_ms2 = lateralAccel * 9.81;
+
+LOGIC:
+  bool tetherTaut = (lateralAccel * 9.81 > 0.15) && (theta > 3.0);
+
+TEST:
+  Sensor sitting on table (no tension) → lateralAccel ≈ 0 → SLACK
+  Hold sensor tilted with a string pulling on it → lateralAccel > 0 → TAUT
+  
+  This is hard to test on bench. For now, just verify the
+  numbers change when you tilt/pull the sensor.
+
+□ DONE WHEN: lateralAccel is near zero when flat,
+  increases when tilted under tension.
+```
+
+---
+
+### Step 2.3: Mode Detection Engine
+
+```
+WHAT: Classify operating mode 0-3.
+
+ADD:
+  int currentMode = 0;  // 0=SLACK, 1=TAUT, 2=FLOOD, 3=SUBMERGED
+  float pressureDeviation = 0.0;
+
+WRITE:
+  28. detectMode()
+      → Read current pressure
+      → pressureDeviation = currentPressure - baselinePressure
+      
+      → IF pressureDeviation > 5.0 (hPa):  // 5 hPa ≈ 5cm depth
+           currentMode = 3;  // SUBMERGED
+           depth = pressureDeviation / 0.0981;  // cm
+           waterHeight = olpLength + depth;
+      
+      → ELSE IF lateralAccel*9.81 > 0.15 AND theta > 3.0:
+           IF theta < 10.0 AND waterHeight > 0.95 * olpLength:
+             currentMode = 2;  // FLOOD
+             waterHeight = olpLength;
+           ELSE:
+             currentMode = 1;  // TAUT
+             waterHeight = olpLength * cos(theta * PI / 180.0);
+      
+      → ELSE:
+           currentMode = 0;  // SLACK
+           waterHeight = 0;  // below threshold, safe
+
+TEST:
+  Sensor flat, no tension → MODE 0
+  Sensor tilted, simulated tension → MODE 1, check H value
+  Sensor nearly vertical (θ < 10°) → MODE 2 (need H > 0.95L)
+  Wrap sensor in plastic bag, dip in water → MODE 3
+  (pressure increases → submersion detected)
+  
+  NOTE: MODE 3 test needs BMP280 sealed. If you can't submerge
+  it, simulate by blowing air at the sensor through a tube
+  (slight pressure increase).
+
+□ DONE WHEN: All 4 modes can be triggered and correctly
+  identified. Water height computed appropriately for each.
+```
+
+---
+
+### Step 2.4: Pressure Baseline Tracking
+
+```
+WHAT: Maintain rolling atmospheric pressure baseline.
+
+ADD:
+  #define BASELINE_SIZE 48
+  float baselineBuffer[BASELINE_SIZE];
+  int baselineIndex = 0;
+  int baselineCount = 0;
+  float baselinePressure = 0;
+  unsigned long lastBaselineUpdate = 0;
+  #define BASELINE_INTERVAL 1800000  // 30 minutes
+
+WRITE:
+  29. updateBaseline(pressure)
+      → Only call when currentMode != 3 (not submerged)
+      → If millis() - lastBaselineUpdate < BASELINE_INTERVAL: return
+      → baselineBuffer[baselineIndex] = pressure
+      → baselineIndex = (baselineIndex + 1) % BASELINE_SIZE
+      → if baselineCount < BASELINE_SIZE: baselineCount++
+      → Recompute average of all entries → baselinePressure
+      → lastBaselineUpdate = millis()
+
+  Initialize: take 10 rapid readings in setup(), average as
+  initial baselinePressure.
+
+TEST:
+  Print baselinePressure every minute
+  Should be stable (±0.5 hPa over an hour indoors)
+  If you have a weather front passing, it may drift 1-3 hPa
+
+□ DONE WHEN: Baseline tracks atmospheric pressure.
+  Not updated during simulated submersion.
+```
+
+---
+
+**PHASE 2 CHECKPOINT:**
+```
+You now have:
+  ✓ Water height from tilt angle
+  ✓ Tether slack/taut detection
+  ✓ 4-mode detection engine
+  ✓ Pressure baseline tracking
+  ✓ Depth measurement for submerged mode
+
+The CORE PHYSICS of the system works.
+You can pick up the sensor, tilt it, and see a water height.
+```
+
+---
+
+## PHASE 3 — Flood Detection State Machine
+
+### Step 3.1: Zone Classification
+
+```
+WHAT: Classify water height into 4 zones.
+
+ADD:
+  float alertLevelCm = 120.0;
+  float warningLevelCm = 180.0;
+  float dangerLevelCm = 250.0;
+
+  int currentZone = 0;  // 0=NORMAL, 1=ALERT, 2=WARNING, 3=DANGER
+
+WRITE:
+  30. classifyZone(heightCm) → int
+      → if height >= dangerLevelCm: return 3 (DANGER)
+      → if height >= warningLevelCm: return 2 (WARNING)
+      → if height >= alertLevelCm: return 1 (ALERT)
+      → return 0 (NORMAL)
+
+TEST:
+  classifyZone(50)  → 0 (NORMAL)
+  classifyZone(130) → 1 (ALERT)
+  classifyZone(200) → 2 (WARNING)
+  classifyZone(260) → 3 (DANGER)
+
+□ DONE WHEN: All four zones return correctly.
+```
+
+---
+
+### Step 3.2: Rate of Change
+
+```
+WHAT: Calculate how fast water is rising or falling.
+
+ADD:
+  float previousHeight = -1;
+  unsigned long previousHeightTime = 0;
+  float ratePer15Min = 0;
+
+WRITE:
+  31. calculateRateOfChange(currentHeight, currentTime)
+      → If previousHeight < 0: initialize, return
+      → elapsed = (currentTime - previousHeightTime) / 1000.0 (seconds)
+      → If elapsed < 60: return (too soon, noisy)
+      → change = currentHeight - previousHeight
+      → ratePer15Min = change * (900.0 / elapsed)  (normalize to 15 min)
+      → Clamp: if |ratePer15Min| > 200: ratePer15Min = 0 (glitch)
+      → Update previousHeight, previousHeightTime
+
+  32. classifyRate(ratePer15Min) → int
+      → if rate < 0: return 0 (FALLING → treated as SLOW)
+      → if rate < 2.0: return 0 (SLOW)
+      → if rate < 5.0: return 1 (MODERATE)
+      → return 2 (FAST)
+
+TEST:
+  Simulate by manually setting waterHeight to increasing values:
+    100, 102, 104, 106 over 4 minutes
+    → rate should show ~2-3 cm/15min → MODERATE
+
+□ DONE WHEN: Rate calculation produces sensible values.
+  Rate categories match thresholds.
+```
+
+---
+
+### Step 3.3: Sustained Rise Detection
+
+```
+WHAT: Detect if water has been consistently rising.
+
+ADD:
+  #define SUSTAINED_BUF_SIZE 4
+  float sustainedBuffer[SUSTAINED_BUF_SIZE];
+  uint32_t sustainedTimeBuffer[SUSTAINED_BUF_SIZE];
+  int sustainedBufIndex = 0;
+  int sustainedBufCount = 0;
+  bool sustainedRise = false;
+
+WRITE:
+  33. updateSustainedBuffer(height, timestamp)
+      → Store in circular buffer
+      → If count < 4: sustainedRise = false; return
+      → Extract ordered sequence (oldest → newest)
+      → netRising = (newest > oldest + 0.5)
+      → Count rising pairs (each > previous + 0.5)
+      → sustainedRise = netRising AND (riseCount >= 2)
+
+TEST:
+  Feed: [100, 102, 104, 106] → sustained = TRUE
+  Feed: [100, 102, 99, 101] → sustained = FALSE
+  Feed: [100, 100, 100, 100] → sustained = FALSE
+
+□ DONE WHEN: Sustained detection matches the examples
+  in the documentation.
+```
+
+---
+
+### Step 3.4: Decision Matrix
+
+```
+WHAT: Look up response level from zone × rate × sustained.
+
+ADD:
+  #define RESP_NORMAL 0
+  #define RESP_WATCH 1
+  #define RESP_WARNING 2
+  #define RESP_FLOOD 3
+  #define RESP_CRITICAL 4
+
+  int currentResponseLevel = RESP_NORMAL;
+
+WRITE:
+  34. lookupDecisionMatrix(zone, rateCategory, sustained) → int
+      
+      static const int matrix[4][3][2] = {
+        // [zone][rate][sustained: 0=no, 1=yes]
+        // Zone NORMAL:
+        {{RESP_NORMAL,RESP_NORMAL}, {RESP_NORMAL,RESP_WATCH}, {RESP_NORMAL,RESP_WATCH}},
+        // Zone ALERT:
+        {{RESP_WATCH,RESP_WATCH}, {RESP_WATCH,RESP_WARNING}, {RESP_WATCH,RESP_WARNING}},
+        // Zone WARNING:
+        {{RESP_WARNING,RESP_FLOOD}, {RESP_WARNING,RESP_FLOOD}, {RESP_FLOOD,RESP_CRITICAL}},
+        // Zone DANGER:
+        {{RESP_FLOOD,RESP_CRITICAL}, {RESP_CRITICAL,RESP_CRITICAL}, {RESP_CRITICAL,RESP_CRITICAL}}
+      };
+      
+      return matrix[zone][rateCategory][sustained ? 1 : 0];
+
+TEST:
+  lookupDecisionMatrix(0, 0, false) → NORMAL
+  lookupDecisionMatrix(1, 1, true) → WARNING
+  lookupDecisionMatrix(3, 2, true) → CRITICAL
+  Test every cell against the table in Section 18.
+
+□ DONE WHEN: All 24 matrix cells return correct values.
+```
+
+---
+
+### Step 3.5: Step-Down (De-escalation) Logic
+
+```
+WHAT: Prevent false all-clears with hysteresis.
+
+ADD:
+  int stepDownConsecutive = 0;
+  unsigned long stateEntryTime = 0;
+  
+  #define STEPDOWN_READINGS_REQUIRED 4
+  #define STEPDOWN_NORMAL_READINGS 8
+  #define MIN_TIME_CRITICAL 900    // seconds
+  #define MIN_TIME_FLOOD 1800
+  #define MIN_TIME_WARNING 1800
+  #define MIN_TIME_WATCH 900
+
+WRITE:
+  35. evaluateStepDown(currentLevel, matrixLevel, waterHeight,
+                       rate, sustained, now) → int (new level)
+
+      → If matrixLevel > currentLevel:
+          ESCALATE immediately, reset stepDownConsecutive = 0,
+          stateEntryTime = now
+          return matrixLevel
+
+      → If matrixLevel == currentLevel:
+          HOLD, reset stepDownConsecutive = 0
+          return currentLevel
+
+      → If matrixLevel < currentLevel:
+          Check step-down conditions for current level:
+          
+          CRITICAL→down: water < dangerLevelCm AND rate ≤ SLOW
+          FLOOD→down: water < warningLevelCm
+          WARNING→down: water < alertLevelCm
+          WATCH→down: water < alertLevelCm AND rate ≤ SLOW AND !sustained
+          
+          If condition MET:
+            stepDownConsecutive++
+            required = (currentLevel == RESP_WATCH) ? 8 : 4
+            minTime = getMinTimeForLevel(currentLevel)
+            timeAtLevel = now - stateEntryTime
+            
+            If stepDownConsecutive >= required AND timeAtLevel >= minTime:
+              DROP ONE LEVEL (not to matrixLevel!)
+              stepDownConsecutive = 0
+              stateEntryTime = now
+              return currentLevel - 1
+            Else:
+              return currentLevel (hold, accumulating)
+          
+          If condition NOT MET:
+            stepDownConsecutive = 0
+            return currentLevel
+
+TEST:
+  Simulate escalation: set currentLevel = NORMAL,
+  call with matrixLevel = FLOOD → should jump to FLOOD instantly
+  
+  Simulate de-escalation: set currentLevel = FLOOD,
+  call with matrixLevel = NORMAL multiple times:
+    Call 1: stepDown = 1, return FLOOD (hold)
+    Call 2: stepDown = 2, return FLOOD (hold)
+    Call 3: stepDown = 3, return FLOOD (hold)
+    Call 4: stepDown = 4, IF time gate met → return WARNING (drop 1)
+    NOT NORMAL — drops to WARNING, then must accumulate again
+
+□ DONE WHEN: Escalation is instant. De-escalation takes 4 readings
+  minimum and drops one level at a time. Time gates work.
+```
+
+---
+
+### Step 3.6: Full Flood Evaluation Function
+
+```
+WHAT: Tie everything together into evaluateFloodStatus().
+
+WRITE:
+  36. evaluateFloodStatus(waterHeight, currentTime)
+  
+      Pseudocode:
+      
+      readingsSinceBoot++
+      
+      // COLD START LOGIC (first reading)
+      if readingsSinceBoot == 1:
+        zone = classifyZone(waterHeight)
+        if zone == DANGER: currentResponseLevel = RESP_CRITICAL
+        elif zone == WARNING: currentResponseLevel = RESP_WARNING
+        else: currentResponseLevel = RESP_NORMAL
+        stateEntryTime = currentTime
+        return
+      
+      // Normal evaluation
+      zone = classifyZone(waterHeight)
+      calculateRateOfChange(waterHeight, currentTime)
+      rateCategory = classifyRate(ratePer15Min)
+      updateSustainedBuffer(waterHeight, currentTime)
+      
+      // Overrides
+      effectiveSustained = sustainedRise
+      if readingsSinceBoot <= 4 AND zone >= WARNING:
+        effectiveSustained = true
+      if ratePer15Min > 30 AND zone >= ALERT:
+        effectiveSustained = true
+      if ratePer15Min > 50:
+        effectiveSustained = true
+      
+      // Matrix lookup
+      matrixLevel = lookupDecisionMatrix(zone, rateCategory,
+                                          effectiveSustained)
+      
+      // Step-down evaluation
+      newLevel = evaluateStepDown(currentResponseLevel, matrixLevel,
+                                   waterHeight, ratePer15Min,
+                                   effectiveSustained, currentTime)
+      
+      // Apply
+      if newLevel != currentResponseLevel:
+        previousResponseLevel = currentResponseLevel
+        currentResponseLevel = newLevel
+        // Level change → will be included in next HTTP POST
+        // Server detects transition and handles notification
+        forceSaveEeprom()
+
+TEST:
+  Create a test sequence that simulates a flood:
+  
+  Time 0:   height = 50   → NORMAL
+  Time 5m:  height = 80   → NORMAL (below alert)
+  Time 10m: height = 130  → WATCH (in alert zone)
+  Time 15m: height = 185  → WARNING (in warning zone)
+  Time 20m: height = 200  → WARNING (still warning zone)
+  Time 25m: height = 220  → FLOOD (approaching danger)
+  Time 30m: height = 260  → CRITICAL (in danger zone + rising)
+  
+  Then simulate receding:
+  Time 35m: height = 250  → CRITICAL (still in danger)
+  Time 40m: height = 230  → CRITICAL (step-down counting)
+  Time 45m: height = 210  → CRITICAL (step-down counting)
+  Time 50m: height = 190  → CRITICAL (step-down counting)
+  Time 55m: height = 170  → FLOOD (dropped one level after 4 readings)
+  ...continue until NORMAL
+
+  Print response level at each step.
+  Verify it matches your expectations from the matrix + step-down rules.
+
+□ DONE WHEN: Full evaluation chain works end to end.
+  Escalation is fast, de-escalation is slow and gradual.
+  Cold start logic works (boot into flood → immediate response).
+```
+
+---
+
+**PHASE 3 CHECKPOINT:**
+```
+You now have the complete flood intelligence:
+  ✓ Zone classification
+  ✓ Rate of change calculation
+  ✓ Sustained rise detection
+  ✓ Decision matrix lookup
+  ✓ Step-down hysteresis
+  ✓ Full evaluation function with overrides and cold start
+
+The state machine can be tested on the bench by feeding
+simulated water heights. No real water needed.
+```
+
+---
+
+## PHASE 4 — Communication Integration
+
+### Step 4.1: JSON Payload Construction
+
+```
+WHAT: Build the server-bound JSON from sensor data.
+
+WRITE:
+  37. buildPayload(buffer, maxLen) → int (bytes written)
+      → Construct JSON like:
+        {"d":"VARUNA_TEST",
+         "lat":12.97,"lon":77.59,
+         "health":85,"mode":1,
+         "originDist":0.0,"draftRate":0.0,
+         "r":[{"t":1706000000,"h":150.3,"r":2.5,
+               "z":1,"l":1,"b":85,"s":0}]}
+      → Use snprintf or manual string building
+      → Do NOT use ArduinoJson library — build manually
+        to avoid memory overhead
+
+  38. floatToStr(value, decimalPlaces, buffer)
+      → Custom float-to-string (see Section 37 of docs)
+      → Handle NaN, Inf, negative numbers
+      → No sprintf %f (pulls in large lib on ESP32)
+
+TEST:
+  Build payload with current sensor values
+  Print to serial
+  Paste into a JSON validator (jsonlint.com)
+  → Must be valid JSON, no trailing commas, proper quoting
+
+□ DONE WHEN: Valid JSON generated from live sensor data.
+```
+
+---
+
+### Step 4.2: Transmit Buffer
+
+```
+WHAT: Buffer readings between transmit intervals.
+
+ADD:
+  #define TX_BUFFER_SIZE 30
+  struct TxReading {
+    uint32_t timestamp;
+    float waterHeight;
+    float rateOfChange;
+    int zone;
+    int responseLevel;
+    float batteryPercent;
+    bool sustained;
+  };
+  TxReading txBuffer[TX_BUFFER_SIZE];
+  int txBufferCount = 0;
+
+WRITE:
+  39. addToTransmitBuffer(reading)
+      → If buffer full: shift oldest out (or overwrite oldest)
+      → Add new reading at txBufferCount
+      → txBufferCount++
+
+  40. transmitBufferedData()
+      → Build JSON with all buffered readings in r[] array
+      → Call gprsPostData()
+      → On success: txBufferCount = 0
+      → On failure: keep buffer, increment fail counter
+      → On 3 failures: archive to SPIFFS
+
+TEST:
+  Add 5 readings manually
+  Transmit → should POST JSON with 5 entries in r[]
+  Verify on webhook.site
+
+□ DONE WHEN: Multiple readings buffered and transmitted
+  in a single POST. Buffer clears on success.
+```
+
+---
+
+### Step 4.3: GPS → RTC Sync
+
+```
+WHAT: Sync accurate GPS time to the RTC.
+
+WRITE:
+  41. syncRTCfromGPS()
+      → Check conditions: GPS fix valid, year ≥ 2024,
+        HDOP ≤ 5.0, satellites ≥ 4, not synced in last 24h
+      → Write GPS date/time to DS1307 via writeRTC()
+      → Read back and validate
+      → Set flag: gpsTimeSynced = true
+
+  42. getBestTimestamp() → uint32_t
+      → If RTC time valid: return currentUnixTime
+      → Else: return millis()/1000
+
+IN LOOP: Check sync conditions periodically.
+
+TEST:
+  Let GPS get a fix
+  Print time from GPS and from RTC
+  After sync: they should match within 1 second
+
+□ DONE WHEN: RTC shows correct time after GPS sync.
+  Time persists across reboot (RTC battery backup).
+```
+
+---
+
+### Step 4.4: SMS Diagnostic Channel
+
+```
+WHAT: Receive and respond to diagnostic SMS from field engineers.
+
+WRITE:
+  43. checkSimURC()
+      → Monitor SIM_Serial for unsolicited result codes
+      → Detect +CMT (incoming SMS)
+      → Parse sender number and message body
+      → If sender is in authorized list:
+        processSMSCommand(sender, command)
+
+  44. processSMSCommand(sender, command)
+      → Match command string (PING, STATUS, BATT, etc.)
+      → Generate response string
+      → Queue SMS reply (max 5 in queue)
+  
+  45. sendSMSReply(phone, message)
+      → AT+CMGS="<phone>"
+      → Wait for ">"
+      → Send message text
+      → Send Ctrl+Z (0x1A)
+      → Wait for "+CMGS" response
+
+  46. contactExists(phone, list) → bool
+      → Compare last 10 digits of phone
+
+FOR NOW: hardcode 1-2 authorized numbers for testing.
+
+TEST:
+  Send SMS "PING" from your phone to the SIM card number
+  Device should reply: "PONG <uptime>"
+  
+  Send "BATT" → should reply with battery voltage
+  Send "STATUS" → should reply with system summary
+
+□ DONE WHEN: SMS commands work for at least PING and BATT.
+  Unauthorized numbers are ignored.
+```
+
+---
+
+## PHASE 5 — Server Side
+
+### Step 5.1: Set Up Server
+
+```
+WHAT: Create a server that receives HTTP POST from the device.
+
+OPTIONS (pick one):
+  A. Node.js + Express (simplest)
+  B. Python + Flask
+  C. Firebase Cloud Functions
+  D. Any language you know — it's just an HTTP endpoint
+
+EXAMPLE WITH NODE.JS:
+
+  mkdir varuna-server && cd varuna-server
+  npm init -y
+  npm install express body-parser
+
+  // server.js
+  const express = require('express');
+  const app = express();
+  app.use(express.json());
+
+  let latestData = {};
+
+  app.post('/api/data', (req, res) => {
+    console.log('Received:', JSON.stringify(req.body, null, 2));
+    latestData = req.body;
+    
+    // Check for level transitions
+    const readings = req.body.r || [];
+    readings.forEach(r => {
+      if (r.l >= 2) {
+        console.log('⚠️ ELEVATED LEVEL:', r.l, 'at height', r.h);
+        // TODO: dispatch notifications
+      }
+    });
+    
+    res.status(200).json({ ok: true });
+  });
+
+  app.get('/api/latest', (req, res) => {
+    res.json(latestData);
+  });
+
+  app.listen(3000, () => console.log('Server on port 3000'));
+
+DEPLOY:
+  For testing: use ngrok to expose localhost
+    npx ngrok http 3000
+    → Get a public URL like https://abc123.ngrok.io
+  
+  Set this as your device's server URL:
+    SERVER:https://abc123.ngrok.io/api/data
+
+  For production: deploy to a VPS (DigitalOcean, AWS, etc.)
+
+TEST:
+  Power up device → let it transmit
+  See data arrive in server console
+  Access /api/latest in browser → see latest reading
+
+□ DONE WHEN: Device data arrives at your server.
+  You can see readings in the console and via API.
+```
+
+---
+
+### Step 5.2: Database Storage
+
+```
+WHAT: Store readings persistently.
+
+ADD TO SERVER:
+  Use SQLite (simplest) or PostgreSQL/MongoDB
+
+  CREATE TABLE readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id TEXT,
+    timestamp INTEGER,
+    water_height REAL,
+    rate REAL,
+    zone INTEGER,
+    response_level INTEGER,
+    battery REAL,
+    sustained BOOLEAN,
+    health INTEGER,
+    mode INTEGER,
+    lat REAL,
+    lon REAL,
+    received_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  On each POST: insert all readings from r[] array
+
+TEST:
+  Let device transmit for 1 hour
+  Query database → verify readings are stored
+  SELECT * FROM readings WHERE station_id = 'VARUNA_TEST' 
+  ORDER BY timestamp DESC LIMIT 10;
+
+□ DONE WHEN: Historical readings are queryable.
+```
+
+---
+
+### Step 5.3: Level Transition Detection
+
+```
+WHAT: Server detects when response level changes and triggers alerts.
+
+ADD TO SERVER:
+
+  // Track previous level per station
+  let stationLevels = {};  // { "VARUNA_TEST": 0 }
+
+  function processReadings(stationId, readings) {
+    const prevLevel = stationLevels[stationId] || 0;
+    
+    readings.forEach(r => {
+      if (r.l > prevLevel) {
+        // ESCALATION
+        console.log(`🚨 ESCALATION: ${stationId} ${prevLevel} → ${r.l}`);
+        dispatchAlerts(stationId, r);
+      } else if (r.l < prevLevel) {
+        // DE-ESCALATION
+        console.log(`✅ DE-ESCALATION: ${stationId} ${prevLevel} → ${r.l}`);
+        sendDeEscalation(stationId, r);
+      }
+      stationLevels[stationId] = r.l;
+    });
+  }
+
+TEST:
+  Simulate escalation by tilting sensor past thresholds
+  Server should log "ESCALATION" messages
+  Let water recede → server logs "DE-ESCALATION"
+
+□ DONE WHEN: Server correctly detects every level transition.
+```
+
+---
+
+### Step 5.4: SMS Notification Dispatch
+
+```
+WHAT: Server sends SMS to officials when level changes.
+
+USE AN SMS API:
+  Twilio (international, reliable, costs money)
+  Fast2SMS (India-specific, cheaper)
+  MSG91 (India-specific)
+  Textlocal (India-specific)
+
+EXAMPLE WITH TWILIO:
+
+  npm install twilio
+
+  const twilio = require('twilio');
+  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
+
+  function sendAlertSMS(phone, message) {
+    client.messages.create({
+      body: message,
+      from: '+1XXXXXXXXXX',
+      to: phone
+    }).then(msg => console.log('SMS sent:', msg.sid));
+  }
+
+  function dispatchAlerts(stationId, reading) {
+    const contacts = getContactsForLevel(stationId, reading.l);
+    const message = formatAlertMessage(stationId, reading);
+    contacts.forEach(c => sendAlertSMS(c.phone, message));
+  }
+
+CONTACTS DATABASE:
+  CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    station_id TEXT,
+    name TEXT,
+    phone TEXT,
+    trigger_level INTEGER,
+    active BOOLEAN DEFAULT TRUE
+  );
+
+  INSERT INTO contacts VALUES
+    (1, 'VARUNA_TEST', 'Test Engineer', '+91XXXXXXXXXX', 1, TRUE);
+
+TEST:
+  Set your own phone number as a contact
+  Trigger a level change on the device
+  → Your phone should receive the alert SMS
+
+□ DONE WHEN: You receive an SMS alert on your phone when
+  the device escalates past a threshold.
+```
+
+---
+
+### Step 5.5: Server Dashboard (Basic)
+
+```
+WHAT: Web page showing current station status.
+
+SIMPLEST APPROACH: Serve a static HTML page from your Express server.
+
+  app.use(express.static('public'));
+
+  // public/index.html
+  // Fetch /api/latest every 10 seconds
+  // Display: water height, zone, level, battery, mode
+  // Use colored backgrounds for zones (green/yellow/orange/red)
+
+THIS IS THE MINIMUM VIABLE DASHBOARD.
+You can make it fancy later with charts and maps.
+
+□ DONE WHEN: You can open a webpage and see live station data.
+```
+
+---
+
+**PHASE 5 CHECKPOINT:**
+```
+End-to-end data flow works:
+  Device reads sensors
+    → Evaluates flood state
+    → POSTs JSON to server
+    → Server stores readings
+    → Server detects level changes
+    → Server sends SMS to contacts
+    → Dashboard shows live data
+
+This is the MINIMUM VIABLE SYSTEM.
+Everything after this is robustness and polish.
+```
+
+---
+
+## PHASE 6 — Power Management & Adaptive Sampling
+
+### Step 6.1: Adaptive Intervals
+
+```
+WHAT: Change sample/transmit rates based on flood level + battery.
+
+WRITE:
+  47. updateAdaptiveIntervals()
+      → Look up intervals from the table in Section 6:
+        
+        Based on currentResponseLevel + batteryPercent:
+        
+        if level == CRITICAL && battery >= 20:
+          sampleInterval = 120000    // 2 min
+          transmitInterval = 120000  // 2 min
+        elif level == NORMAL && battery >= 20 && rate is slow:
+          sampleInterval = 1800000   // 30 min
+          transmitInterval = 3600000 // 60 min
+        // ... etc for all combinations
+      
+      → Call flushSustainedBufferIfIntervalChanged() if interval
+        changed by 4× or more
+
+TEST:
+  Print intervals to serial
+  Manually set response level → verify intervals change
+  Manually set battery percentage low → verify conservation mode
+
+□ DONE WHEN: Intervals match the table in Section 6 for all
+  response level × battery combinations.
+```
+
+---
+
+### Step 6.2: Light Sleep
+
+```
+WHAT: Sleep between samples to save power.
+
+WRITE:
+  48. canLightSleep() → bool
+      → Algorithm enabled
+      → sampleInterval >= 300000 (5 minutes)
+      → currentResponseLevel != RESP_CRITICAL
+      → No active SMS exchange
+      → No pending diagnostic
+
+  49. enterLightSleep(durationMs)
+      → Guard: if < 10000: return
+      → Clamp: if > (WDT_TIMEOUT-10)*1000: clamp
+      → Turn off LEDs
+      → Reset parser indices
+      → Serial.flush()
+      → Remove from watchdog
+      → esp_sleep_enable_timer_wakeup(duration * 1000)
+      → esp_light_sleep_start()
+      → Post-wake: re-add watchdog, reset timers, flush GPS buffer
+
+IN LOOP:
+  If algorithm enabled and time to next event > 30 seconds:
+    enterLightSleep(timeToNext - 5000)  // 5 second safety margin
+
+TEST:
+  Set sampleInterval to 5 minutes
+  Observe: device sleeps between samples
+  Measure current draw with multimeter:
+    Active: ~80-150 mA (with SIM800L)
+    Sleep: ~10-20 mA (peripherals still powered)
+
+□ DONE WHEN: Device sleeps and wakes correctly.
+  No missed samples. Watchdog doesn't trigger during sleep.
+```
+
+---
+
+### Step 6.3: Low Battery Shutdown
+
+```
+WHAT: Protect batteries from deep discharge.
+
+ADD:
+  int lowVoltageCount = 0;
+
+IN LOOP:
+  if batteryVoltage < 3000:  // mV
+    lowVoltageCount++
+    if lowVoltageCount >= 3:  // 3 consecutive readings
+      forceSaveEeprom()
+      // Turn off everything
+      // Enter deep sleep (no timer = sleep forever)
+      esp_deep_sleep_start()
+  else:
+    lowVoltageCount = 0
+
+TEST:
+  Use a bench supply, lower voltage below 3.0V
+  Device should save state and go to deep sleep
+  (Current drops to < 1 mA)
+
+□ DONE WHEN: Device shuts down safely at low voltage.
+  State is preserved in EEPROM.
+```
+
+---
+
+## PHASE 7 — Persistence
+
+### Step 7.1: EEPROM State Save/Restore
+
+```
+WHAT: Survive reboots without losing flood state.
+
+WRITE:
+  50. eepromWriteFloat(addr, value)
+  51. eepromReadFloat(addr) → float
+  52. eepromWriteUint32(addr, value)
+  53. eepromReadUint32(addr) → uint32_t
+
+  54. saveStateToEeprom()
+      → Write magic byte 0xA5 at address 0
+      → Write response level at address 1
+      → Write sustained buffer (4 floats at address 2-17)
+      → Write timestamp at address 18
+      → Write thresholds, OLP length, peak data
+      → Follow the layout in Section 10
+
+  55. restoreStateFromEeprom() → bool
+      → Read magic byte — if not 0xA5: return false
+      → Read saved timestamp
+      → If (now - savedTime) > 1800 seconds: return false (too old)
+      → Restore all values
+      → Validate: level 0-4, heights positive, etc.
+      → Return true
+
+  56. markEepromDirty()
+      → Set flag eepromDirty = true
+
+  57. saveEepromIfNeeded()
+      → If eepromDirty AND (millis() - lastSave > 1800000):
+        → saveStateToEeprom()
+        → eepromDirty = false
+        → lastSave = millis()
+
+  58. forceSaveEeprom()
+      → saveStateToEeprom() immediately
+      → Reset dirty flag and timer
+
+IN SETUP:
+  EEPROM.begin(512);
+  if (restoreStateFromEeprom()):
+    Serial.println("WARM BOOT — state restored")
+  else:
+    Serial.println("COLD BOOT — defaults loaded")
+
+TEST:
+  1. Let system run and reach WARNING level
+  2. Reboot (REBOOT command or power cycle)
+  3. After reboot: system should resume at WARNING level
+     (not start from NORMAL)
+
+□ DONE WHEN: State persists across reboots.
+  Old state (> 30 min) is rejected.
+  Validation catches corrupt data.
+```
+
+---
+
+### Step 7.2: SPIFFS Data Archival
+
+```
+WHAT: Archive readings to flash filesystem.
+
+WRITE:
+  59. initSPIFFS()
+      → SPIFFS.begin(true)  // format on first use
+
+  60. archiveReading(timestamp, height, rate, zone, response, battery)
+      → Filename: /log_YYYYMMDD.csv
+      → Open file in append mode
+      → Write: timestamp,height,rate,zone,response,battery\n
+      → Close file
+
+  61. checkSPIFFSSpace()
+      → If SPIFFS.totalBytes() - SPIFFS.usedBytes() < 1024:
+        → Delete oldest file
+        → Log deletion
+
+TEST:
+  Write 100 readings
+  Open serial → DUMP command → see readings come back
+  Reboot → readings still there (SPIFFS survives reboot)
+  Fill storage → verify oldest file is deleted
+
+□ DONE WHEN: Readings are archived. Space management works.
+  Data survives reboot.
+```
+
+---
+
+## PHASE 8 — Failure Detection
+
+### Step 8.1: Sensor Health Checks
+
+```
+WHAT: Detect sensor failures automatically.
+
+WRITE:
+  62. checkSensorHealth()   (call every 60 seconds)
+      → Probe MPU6050 (I2C Bus 0, address 0x68)
+        → 5 consecutive failures → mpuHealthy = false
+      → Probe BMP280 (I2C Bus 1, address 0x76)
+        → Failure → bmpAvailable = false
+      → If was offline, re-probe → recovery
+
+  63. i2cBusRecovery(sdaPin, sclPin)
+      → Set SDA as INPUT_PULLUP
+      → Clock 9 SCL pulses
+      → Generate STOP condition
+      → Re-init I2C bus
+
+  64. checkAccelVariance()   (every 50 readings)
+      → If variance < 0.0001 → MPU6050_FROZEN
+
+  65. checkGravityMagnitude()  (every reading)
+      → g = sqrt(ax² + ay² + az²)
+      → If |g - 9.81| > 1.0 for 20 consecutive → ACCEL_DRIFT
+
+TEST:
+  Disconnect MPU6050 wire → within 60 seconds:
+    → Serial: "MPU6050 OFFLINE"
+  Reconnect → within 60 seconds:
+    → Serial: "MPU6050 RECOVERED"
+
+□ DONE WHEN: Sensor disconnection is detected and reported.
+  Recovery works when sensor is reconnected.
+```
+
+---
+
+### Step 8.2: Watchdog Timer
+
+```
+WHAT: Recover from MCU crashes.
+
+IN SETUP:
+  esp_task_wdt_init(180, true);  // 180s for init
+  esp_task_wdt_add(NULL);
+
+AFTER SETUP:
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);  // 120s operational
+
+IN LOOP:
+  esp_task_wdt_reset();  // Every iteration
+
+IN LONG OPERATIONS (AT command waits):
+  esp_task_wdt_reset();  // Inside wait loops
+
+TEST:
+  Add a while(1){} in loop temporarily
+  → After 120 seconds: ESP32 resets automatically
+  → On reboot: esp_reset_reason() shows watchdog reset
+
+□ DONE WHEN: Watchdog triggers on intentional hang.
+  Normal operation doesn't trigger it.
+```
+
+---
+
+### Step 8.3: Geofence & Tether Monitoring
+
+```
+WHAT: Detect if buoy has drifted from anchor.
+
+WRITE:
+  66. checkGeofence()
+      → distance = distanceFromOrigin(gpsLat, gpsLon,
+                                       originLat, originLon)
+      → If distance > geofenceRadiusM:
+        geofenceBreachCount++
+        if count >= 3: FLAG TETHER_DETACHMENT
+
+  67. distanceFromOrigin(lat1, lon1, lat2, lon2) → float meters
+      → dLat = (lat1 - lat2) * 111320.0
+      → dLon = (lon1 - lon2) * 111320.0 * cos(lat2 * PI / 180.0)
+      → return sqrt(dLat*dLat + dLon*dLon)
+
+TEST:
+  Set origin to your current GPS position
+  Set geofence to 10 meters
+  Walk 15 meters away with the device
+  → Should detect breach after 3 GPS fixes
+
+□ DONE WHEN: Geofence breach detected when moving beyond radius.
+```
+
+---
+
+### Step 8.4: Health Score
+
+```
+WHAT: Composite 0-100 health score.
+
+WRITE:
+  68. computeHealthScore() → int
+      → MPU status:     20 if healthy, 10 if recovering, 0 if offline
+      → BMP status:     15 if healthy, 0 if offline
+      → Battery:        15 if >70%, 10 if 20-70%, 5 if 5-20%, 0 if <5%
+      → GPS:            10 if fix+HDOP<3, 5 if fix, 0 if no fix
+      → SIM:            10 if registered+strong, 5 if weak, 0 if none
+      → Tether:         15 if intact, 10 if unchecked, 0 if breach
+      → Buoy integrity: 10 if no leak, 5 if slow draft, 0 if leak
+      → Sensor agreement: 5 if cross-checks pass, 0 if disagree
+      → Sum all → clamp 0-100
+
+TEST:
+  Normal operation → score 80-100
+  Disconnect MPU → score drops by ~20
+  Low battery → score drops by ~10
+
+□ DONE WHEN: Health score reflects actual system condition.
+```
+
+---
+
+## PHASE 9 — Console Commands
+
+### Step 9.1: Command Parser
+
+```
+WHAT: Parse serial commands and route to handlers.
+
+WRITE:
+  69. processCommand(String cmd)
+      → cmd.trim()
+      → cmd.toUpperCase() for matching
+      
+      → if cmd == "PING": handlePing()
+      → if cmd == "FLOODSTATUS": handleFloodStatus()
+      → if cmd == "SENSORTEST": handleSensorTest()
+      → if cmd == "GPSFIX": handleGPSFix()
+      → if cmd == "BATT": handleBatt()
+      → if cmd == "SIMSTATUS": handleSimStatus()
+      → if cmd == "SIMSIGNAL": handleSimSignal()
+      → if cmd == "NETTEST": handleNetTest()
+      → if cmd == "GETTHRESH": handleGetThresh()
+      → if cmd == "GETCONFIG": handleGetConfig()
+      → if cmd == "DUMP": handleDump()
+      → if cmd == "SIMREINIT": handleSimReinit()
+      → if cmd == "SIMRESET": handleSimReset()
+      → if cmd == "REBOOT": handleReboot()
+      → if cmd == "SAVEEEPROM": handleSaveEeprom()
+      → if cmd.startsWith("SETALERT:"): handleSetAlert(value)
+      → if cmd.startsWith("SETWARN:"): handleSetWarn(value)
+      → if cmd.startsWith("SETDANGER:"): handleSetDanger(value)
+      → if cmd.startsWith("APN:"): handleSetAPN(value)
+      → if cmd.startsWith("SERVER:"): handleSetServer(value)
+      → // ... obstruction light commands
+      → else: Serial.println("UNKNOWN_COMMAND")
+
+IN LOOP:
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    processCommand(cmd);
+  }
+
+IMPLEMENT IN ORDER:
+  First: PING, BATT, SENSORTEST (quick wins, immediately useful)
+  Then: FLOODSTATUS, GETCONFIG, GETTHRESH
+  Then: SIMSTATUS, NETTEST
+  Then: maintenance commands (SIMREINIT, SIMRESET, REBOOT)
+  Then: config commands (SETALERT, etc.)
+  Last: DUMP, obstruction light commands
+
+□ DONE WHEN: Each command produces the correct output.
+  Test every command at least once.
+```
+
+---
+
+### Step 9.2: CSV Output
+
+```
+WHAT: Output 39-field CSV at 1Hz on serial.
+
+WRITE:
+  70. outputCSV()
+      → Build comma-separated string of all 39 fields
+        (per Section 32 of documentation)
+      → Serial.println(csvLine)
+      → Also: c3FeedByte() each character on GPIO 14
+
+THIS RUNS EVERY 1 SECOND regardless of algorithm state.
+
+TEST:
+  Open serial monitor at 115200 baud
+  See CSV lines flowing at 1Hz
+  Count fields — should be exactly 39
+
+□ DONE WHEN: 39-field CSV outputs every second.
+  Fields match Section 32 specification.
+```
+
+---
+
+## PHASE 10 — Web Console
+
+### Step 10.1: Web Serial Connection
+
+```
+WHAT: Browser-based terminal that connects to the device via USB.
+
+CREATE: public/console.html (served by your Node.js server,
+        or a standalone file opened in Chrome)
+
+TECHNOLOGY: Web Serial API (Chrome only — that's fine)
+
+WRITE JAVASCRIPT:
+
+  let port, reader, writer;
+  
+  async function connect() {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    
+    // Read loop
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = new TextDecoder().decode(value);
+      appendToTerminal(text);
+      parseCSVLine(text);  // Extract and display data
+    }
+  }
+  
+  async function sendCommand(cmd) {
+    const encoded = new TextEncoder().encode(cmd + '\n');
+    await writer.write(encoded);
+  }
+
+HTML STRUCTURE:
+  - Connect/Disconnect buttons
+  - Terminal output area (scrolling, monospaced font)
+  - Command input field
+  - Quick-access buttons for common commands:
+    [PING] [BATT] [FLOODSTATUS] [SENSORTEST]
+  - Live data display panel (parsed from CSV):
+    Water Level: ___ cm
+    Mode: ___
+    Zone: ___
+    Response: ___
+    Battery: ___%
+
+TEST:
+  Open in Chrome
+  Click Connect → select ESP32 serial port
+  CSV data should flow into terminal
+  Type PING → see PONG response
+  Click BATT button → see battery status
+
+□ DONE WHEN: Can connect, see live data, send commands,
+  and see responses in the browser.
+```
+
+---
+
+### Step 10.2: Local Commands
+
+```
+WHAT: Browser-only commands that never reach the device.
+
+IMPLEMENT IN JAVASCRIPT:
+
+  function processLocalCommand(cmd) {
+    switch(cmd.toLowerCase()) {
+      case 'help':     showHelp(); return true;
+      case 'clear':    clearTerminal(); return true;
+      case 'history':  showHistory(); return true;
+      case 'connect':  connect(); return true;
+      case 'disconnect': disconnect(); return true;
+      case 'status':   showConnectionStatus(); return true;
+      case 'about':    showAbout(); return true;
+      default:
+        if (cmd.startsWith('filter ')) {
+          setFilter(cmd.split(' ')[1]); return true;
+        }
+        if (cmd === 'upload') {
+          openFilePicker(); return true;
+        }
+        return false;  // Not a local command → send to device
+    }
+  }
+
+  // In command handler:
+  function handleCommand(cmd) {
+    if (processLocalCommand(cmd)) return;
+    sendCommand(cmd);  // Forward to device
+  }
+
+□ DONE WHEN: help, clear, history, connect, disconnect,
+  status, filter, about all work without touching the device.
+```
+
+---
+
+## PHASE 11 — XIAO C3 Companion
+
+### Step 11.1: C3 CSV Receiver
+
+```
+WHAT: C3 receives CSV from S3 on GPIO and forwards to Firebase.
+
+SEPARATE FIRMWARE — new Arduino project for XIAO C3.
+
+WIRE:
+  S3 GPIO 14 (TX) → C3 RX pin (e.g., GPIO 20)
+  S3 GND → C3 GND
+
+C3 FIRMWARE:
+  - Serial input at 9600 baud on receiving pin
+  - Parse incoming CSV lines
+  - Extract key fields (height, mode, zone, level, battery)
+  - Forward to Firebase RTDB via C3's own SIM800L
+
+C3 has its own SIM800L wired to its own UART pins.
+
+START SIMPLE:
+  1. Just receive and print CSV lines (echo test)
+  2. Then parse fields
+  3. Then add SIM800L + GPRS
+  4. Then send to Firebase
+
+TEST:
+  Upload C3 firmware
+  Connect S3 GPIO 14 → C3 RX
+  C3 serial monitor should show CSV lines from S3
+
+□ DONE WHEN: C3 receives and parses CSV from S3.
+```
+
+---
+
+### Step 11.2: C3 Firebase Integration
+
+```
+WHAT: C3 sends parsed data to Firebase Realtime Database.
+
+FIREBASE SETUP:
+  1. Create Firebase project at console.firebase.google.com
+  2. Create Realtime Database
+  3. Set rules to allow authenticated writes
+  4. Get database URL
+
+C3 FIRMWARE:
+  Use SIM800L GPRS to PATCH Firebase RTDB:
+  
+  AT+HTTPPARA="URL","https://your-project.firebaseio.com/
+    varuna/STATION_ID/latest.json?auth=YOUR_SECRET"
+  
+  Payload: {"h":150.3,"m":1,"z":1,"l":1,"b":85,"t":1706000000}
+  Method: PATCH (updates specific fields without overwriting)
+
+TEST:
+  Open Firebase console → Realtime Database
+  See data updating in real-time as C3 sends
+
+□ DONE WHEN: Firebase shows live sensor data from C3.
+```
+
+---
+
+### Step 11.3: C3 OTA Agent
+
+```
+WHAT: C3 can reprogram the S3 over-the-air.
+
+THIS IS THE MOST COMPLEX PART. Implement LAST.
+
+STEPS:
+  1. C3 monitors Firebase ota/command node
+  2. On CHECK_READY: C3 checks conditions, reports readiness
+  3. On BEGIN_DOWNLOAD: C3 downloads firmware chunks
+  4. After checksum verified: C3 enters S3 into bootloader:
+     - Pull S3 GPIO 0 LOW
+     - Toggle S3 EN (reset)
+     - S3 enters ROM bootloader
+  5. C3 sends firmware via UART (ESP bootloader protocol)
+  6. C3 resets S3 (toggle EN again)
+  7. C3 monitors CSV feed for boot confirmation
+
+THE ESP32 BOOTLOADER PROTOCOL:
+  SLIP framing, specific command packets for:
+  - SYNC
+  - Read register
+  - Write register (flash)
+  - Flash begin
+  - Flash data
+  - Flash end
+  
+  Reference: esptool.py source code (Python)
+  You'll need to reimplement the essential parts in C++
+  
+  This is significant work. Consider:
+  - Option A: Implement a simplified version based on esptool protocol
+  - Option B: Use the ESP32 OTA library directly on the S3 side
+    (but this requires the S3 to download its own firmware)
+  - Option C: Skip OTA for initial deployment — use physical USB
+
+FOR NOW:
+  Wire GPIO 0 and EN connections
+  Test that you CAN put S3 into bootloader mode from C3
+  Flash with a test binary
+  The full 3-gate process can be refined later
+
+□ DONE WHEN: C3 can put S3 into bootloader mode and flash
+  a test firmware. CSV feed resumes after flash.
+```
+
+---
+
+## PHASE 12 — Integration Testing
+
+### Step 12.1: Bench Integration Test
+
+```
+WHAT: All systems running together on the bench.
+
+SETUP:
+  All sensors connected
+  Both SIM cards active
+  Server running
+  Web console open
+  C3 connected
+
+RUN THROUGH THESE SCENARIOS:
+
+  1. NORMAL OPERATION
+     □ CSV output flowing at 1Hz
+     □ C3 receiving and forwarding to Firebase
+     □ GPRS POST succeeding to server
+     □ Server receiving data
+     □ Dashboard showing live data
+     □ Health score > 80
+     □ All console commands responding
+
+  2. SIMULATED FLOOD (tilt sensor through thresholds)
+     □ Tilt past alert → zone changes to ALERT
+     □ Continue tilting → WARNING → DANGER
+     □ Response level escalates (WATCH → WARNING → FLOOD → CRITICAL)
+     □ Server detects transitions
+     □ Server sends SMS alerts (to your test phone)
+     □ Adaptive intervals shorten
+     □ Status LED blinks faster
+
+  3. SIMULATED RECESSION (return sensor to flat)
+     □ Step-down kicks in (4 consecutive readings)
+     □ Response level drops one at a time
+     □ Server sends de-escalation messages
+     □ Eventually: ALL CLEAR
+     □ Intervals return to normal
+
+  4. SENSOR FAILURE
+     □ Disconnect MPU6050 → health score drops
+     □ System reports sensor offline
+     □ BMP280 still works for mode 3
+     □ Reconnect → recovery detected
+
+  5. COMMUNICATION FAILURE
+     □ Remove SIM card antenna → signal lost
+     □ GPRS fails → SPIFFS archival starts
+     □ Readings buffered locally
+     □ Reconnect antenna → GPRS recovers → buffered data sent
+
+  6. POWER CYCLE
+     □ Let system reach WARNING level
+     □ Power off for 10 seconds
+     □ Power on → warm boot restores WARNING level
+     □ No false NORMAL → server doesn't get false all-clear
+
+  7. SMS DIAGNOSTIC
+     □ Send PING via SMS from your phone → get PONG reply
+     □ Send BATT → get battery status
+     □ Send FLOODSTATUS → get flood state
+
+□ DONE WHEN: All 7 scenarios pass.
+  This is your pre-deployment validation.
+```
+
+---
+
+### Step 12.2: Duration Test
+
+```
+WHAT: Run continuously for 48+ hours.
+
+LEAVE RUNNING:
+  All systems active
+  Server collecting data
+  Monitor for:
+    □ Memory leaks (free heap should stay stable)
+    □ Watchdog resets (should be zero)
+    □ GPRS connection drops and recoveries
+    □ GPS time sync (once per 24 hours)
+    □ EEPROM save cycles
+    □ Battery drain rate
+
+CHECK AFTER 48 HOURS:
+  □ Free heap within 10% of startup value
+  □ Zero watchdog resets
+  □ All GPRS uploads successful (or recovered)
+  □ GPS sync occurred at least once
+  □ EEPROM saves throttled correctly (not every loop)
+  □ Battery percentage trend matches expected drain
+
+□ DONE WHEN: 48 hours stable operation with no crashes,
+  no memory leaks, no data loss.
+```
+
+---
+
+## PHASE 13 — Enclosure & Waterproofing
+
+### Step 13.1: Mechanical Design
+
+```
+WHAT: Sealed, buoyant capsule for river deployment.
+
+REQUIREMENTS:
+  □ Waterproof (IP67 minimum, IP68 preferred)
+  □ Buoyant (floats with all electronics + batteries inside)
+  □ Bottom-heavy (self-righting — batteries at bottom)
+  □ Tether attachment point at very bottom
+  □ GPS antenna must have sky view (top of capsule)
+  □ GSM antenna must be above waterline (or waterproof external)
+  □ LED obstruction lights visible from all sides
+  □ USB access port (sealed, for maintenance)
+  □ Pressure port for BMP280 (sealed but pressure-conducting)
+
+OPTIONS:
+  A. PVC pipe with end caps (cheapest, easiest)
+     - 4" or 6" PVC pipe
+     - Glued end caps with O-ring seals
+     - Epoxy cable glands for antenna/tether
+  
+  B. Pelican-style case (more professional)
+     - Pre-made waterproof cases
+     - More expensive but proven sealing
+  
+  C. Custom 3D-printed with silicone gaskets
+     - Most design freedom
+     - Requires careful sealing design
+
+FOR FIRST PROTOTYPE: Use PVC pipe.
+  4" PVC pipe × 12" long
+  Bottom cap: permanent (glued)
+  Top cap: removable with O-ring for maintenance
+  Cable glands: waterproof PG7 or PG9
+
+LAYOUT INSIDE:
+  TOP:    GPS antenna, GSM antenna (cable through sealed gland)
+  MIDDLE: ESP32-S3, XIAO C3, SIM800L, sensors
+  BOTTOM: 8× 18650 batteries (ballast + power)
+  
+  Tether attaches to bottom cap through sealed eye-bolt
+```
+
+---
+
+### Step 13.2: BMP280 Pressure Port
+
+```
+WHAT: Allow BMP280 to sense external pressure while keeping
+water out of the electronics compartment.
+
+OPTIONS:
+  A. Silicone membrane (water blocks, pressure passes)
+  B. Sealed air tube running from sensor to above waterline
+  C. Waterproof pressure sensor housing (most reliable)
+
+SIMPLEST: Option A
+  Cover BMP280 port hole with medical-grade silicone membrane
+  Thin enough to transmit pressure
+  Thick enough to block water
+
+FOR PROTOTYPE: Mount BMP280 near the top of the capsule.
+When submerged, it will still sense pressure through the
+capsule walls (PVC transmits pressure somewhat).
+Not perfectly accurate but functional for prototype.
+```
+
+---
+
+### Step 13.3: Tether System
+
+```
+WHAT: Fixed-length cable connecting buoy to anchor.
+
+MATERIALS:
+  □ Braided stainless steel cable (2-3mm diameter)
+  □ Crimped end fittings (swage sleeves)
+  □ Bottom: heavy weight anchor (concrete block, steel plate,
+    or earth anchor — depends on riverbed type)
+  □ Top: sealed eye-bolt through bottom of PVC capsule
+
+MEASURE PRECISELY:
+  L = desired flood threshold height in centimeters
+  Measure under ~5N tension (slight pull, not stretched)
+  Record to nearest centimeter
+
+STORE IN FIRMWARE:
+  Use handheld debugger command: OLP:<length_in_cm>
+  e.g., OLP:200 for 2-meter tether
+```
+
+---
+
+## PHASE 14 — Field Calibration & Deployment
+
+### Step 14.1: Pre-Deployment Checks
+
+```
+□ All bench integration tests passed (Phase 12)
+□ 48-hour duration test passed
+□ Enclosure sealed and buoyancy tested (float in bathtub/pool)
+□ Tether measured and recorded
+□ Batteries fully charged
+□ Both SIM cards active with data plans
+□ Server running and accessible
+□ Contacts configured in server database
+□ Firmware version recorded
+```
+
+---
+
+### Step 14.2: Field Deployment Procedure
+
+```
+AT THE SITE:
+
+  1. INSTALL ANCHOR
+     □ Select location: stable riverbed, accessible
+     □ Install anchor (concrete/steel weight or driven stake)
+     □ Ensure anchor cannot move in high current
+     □ Record GPS coordinates of anchor point
+
+  2. POWER ON DEVICE
+     □ Connect batteries
+     □ Wait for boot (8-15 seconds)
+     □ Verify via handheld debugger:
+       - LED solid ON
+       - Serial output flowing
+       - GPS acquiring fix
+
+  3. CALIBRATE (via handheld debugger)
+     □ Place buoy in water, floating freely
+     □ Issue CAL command
+     □ Wait for calibration (LED blinks during process)
+     □ Verify: theta ≈ 0° when floating freely
+
+  4. SET PARAMETERS (via handheld debugger)
+     □ OLP:<tether_length_cm>
+     □ SETORIGIN (capture GPS position)
+     □ Verify: GETCONFIG shows correct values
+     □ Set thresholds if different from defaults:
+       SETALERT:<cm>  SETWARN:<cm>  SETDANGER:<cm>
+
+  5. ATTACH TETHER
+     □ Connect tether to buoy bottom
+     □ Connect tether to anchor
+     □ Deploy buoy into water
+
+  6. ENABLE ALGORITHM
+     □ Press algorithm toggle button (GPIO 12)
+     □ Algorithm LED (GPIO 13) turns OFF = algorithm ENABLED
+     □ Verify: FLOODSTATUS shows adaptive intervals active
+
+  7. VERIFY READINGS
+     □ Read water level manually (staff gauge or tape measure)
+     □ Compare to system reading (FLOODSTATUS command)
+     □ Error < 5cm: PASS ✅
+     □ Error 5-15cm: adjust, recalibrate
+     □ Error > 15cm: investigate
+
+  8. VERIFY COMMUNICATION
+     □ NETTEST → HTTP POST succeeds to server
+     □ Check server dashboard → data appearing
+     □ SIMSTATUS → registered, signal adequate
+     □ Send test SMS from your phone → device replies
+
+  9. VERIFY LIGHTS
+     □ OBLIGHTON → LEDs flashing
+     □ Correct pattern (IALA standard)
+     □ Visible from water
+
+  10. FINAL CHECKS
+      □ BATT → battery level > 95%
+      □ GPSFIX → fix valid, satellites > 4
+      □ Health score > 85
+      □ Close enclosure, seal
+
+  11. DOCUMENT
+      □ Record: date, time, GPS, water level, firmware version
+      □ Photograph: buoy in water, staff gauge, anchor location
+      □ Record: all calibration values, offsets, thresholds
+
+  12. MONITOR REMOTELY
+      □ Watch server dashboard for 1 hour after leaving
+      □ Confirm regular data uploads arriving
+      □ Confirm GPRS heartbeat is stable
+```
 
 # VARUNA FLOOD MONITORING SYSTEM — COMPLETE TECHNICAL DOCUMENTATION
 
