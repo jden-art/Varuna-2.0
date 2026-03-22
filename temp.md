@@ -1,3 +1,1176 @@
+````
+
+
+# SIM800L + WiFi Communication Implementation for VARUNA
+
+Here's exactly where each block goes and why:
+
+---
+
+## Block 1: New `#include` directives and constants
+
+**Location: After your existing `#include <esp_system.h>` line (around line 14)**
+
+```cpp
+// ─────────────────────────────────────────────────────────────────
+//  LIBRARIES — COMMUNICATION (Phase 4)
+// ─────────────────────────────────────────────────────────────────
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+```
+
+**Location: After your `#define STATUS_LED 3` line (around line 33), add:**
+
+```cpp
+// ─────────────────────────────────────────────────────────────────
+//  COMMUNICATION CONSTANTS
+// ─────────────────────────────────────────────────────────────────
+#define SIM_BAUD          9600
+#define SIM_UART_NUM      2         // ESP32-S3 UART2
+
+// Firebase Realtime Database
+#define FIREBASE_HOST     "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_PATH     "/varuna/live"
+#define FIREBASE_SECRET   ""        // TODO: set your database secret or use auth token
+
+// Server HTTP endpoint (primary destination for SIM800L POST)
+// This is the server that handles all alert routing
+#define SERVER_URL        "http://your-server.com/api/device/report"
+// TODO: replace with your actual server URL
+
+// WiFi credentials (fallback only — primary is GPRS)
+#define WIFI_SSID         ""        // TODO: set if WiFi fallback desired
+#define WIFI_PASS         ""        // TODO: set if WiFi fallback desired
+#define WIFI_TIMEOUT_MS   10000     // 10s connection timeout
+
+// SIM800L timing
+#define SIM_CMD_TIMEOUT   5000      // ms to wait for AT response
+#define SIM_HTTP_TIMEOUT  15000     // ms to wait for HTTP action
+#define SIM_INIT_RETRIES  3
+#define SIM_POST_RETRIES  2
+
+// APN — change to your SIM provider
+#define GPRS_APN          "internet"   // Jio: "jionet", Airtel: "airtelgprs.com"
+#define GPRS_USER         ""
+#define GPRS_PASS         ""
+
+// Transmission channel state
+#define TX_CHANNEL_GPRS   0
+#define TX_CHANNEL_WIFI   1
+#define TX_CHANNEL_NONE   2
+
+// Inbound SMS buffer
+#define SMS_BUF_SIZE      256
+```
+
+---
+
+## Block 2: New global state variables
+
+**Location: After your existing system globals (after `bool lastBtnState = HIGH;` around line 198), add this entire block:**
+
+```cpp
+// ─────────────────────────────────────────────────────────────────
+//  GLOBAL STATE — COMMUNICATION  (Phase 4)
+// ─────────────────────────────────────────────────────────────────
+HardwareSerial SimSerial(SIM_UART_NUM);
+
+// SIM800L state
+bool     simAvailable      = false;
+bool     gprsConnected     = false;
+bool     simRegistered     = false;
+int      simSignalQuality  = 0;       // 0–31 (CSQ value)
+int      simInitFailCount  = 0;
+uint32_t lastSimCheck      = 0;
+uint32_t lastGprsReconnect = 0;
+
+// WiFi fallback state
+bool     wifiAvailable     = false;
+bool     wifiConnected     = false;
+uint32_t lastWifiAttempt   = 0;
+
+// Transmission tracking
+int      activeChannel     = TX_CHANNEL_NONE;
+uint32_t lastSuccessfulTx  = 0;
+uint32_t txSuccessCount    = 0;
+uint32_t txFailCount       = 0;
+uint32_t consecutiveFails  = 0;
+bool     pendingTransmit   = false;   // set true when sample taken, cleared after TX
+
+// Inbound SMS
+char     smsBuf[SMS_BUF_SIZE];
+bool     smsReady          = false;
+
+// Device ID — unique per unit, used in server payloads
+// TODO: set this per device during provisioning
+const char* DEVICE_ID      = "VARUNA-GK-01";
+const char* STATION_NAME   = "Godavari-KG-01";
+```
+
+---
+
+## Block 3: SIM800L Driver Functions
+
+**Location: After your battery driver section (after the `updateBattery()` function, around line 340), add this entire section:**
+
+```cpp
+// ─────────────────────────────────────────────────────────────────
+//  PHASE 4A — SIM800L DRIVER
+// ─────────────────────────────────────────────────────────────────
+
+/*
+ * Send an AT command and wait for an expected response.
+ * Returns true if the expected string appears within timeout_ms.
+ * Stores full response in outBuf if provided.
+ */
+bool simSendCmd(const char* cmd, const char* expect, uint32_t timeout_ms,
+                char* outBuf = nullptr, int outBufSize = 0) {
+  // Drain any pending data
+  while (SimSerial.available()) SimSerial.read();
+
+  SimSerial.println(cmd);
+
+  uint32_t start = millis();
+  String response = "";
+
+  while (millis() - start < timeout_ms) {
+    while (SimSerial.available()) {
+      char c = SimSerial.read();
+      response += c;
+    }
+    if (response.indexOf(expect) >= 0) {
+      if (outBuf && outBufSize > 0) {
+        response.toCharArray(outBuf, outBufSize);
+      }
+      return true;
+    }
+    delay(10);
+  }
+
+  Serial.printf("[SIM] CMD '%s' — expected '%s' — GOT: %s\n",
+                cmd, expect, response.c_str());
+  if (outBuf && outBufSize > 0) {
+    response.toCharArray(outBuf, outBufSize);
+  }
+  return false;
+}
+
+/*
+ * Hardware reset the SIM800L via RST pin.
+ * Pull low for 200ms, then wait 3s for module boot.
+ */
+void simHardwareReset() {
+  Serial.println("[SIM] Hardware reset...");
+  pinMode(SIM_RST, OUTPUT);
+  digitalWrite(SIM_RST, LOW);
+  delay(200);
+  digitalWrite(SIM_RST, HIGH);
+  delay(3000);  // SIM800L boot time
+  Serial.println("[SIM] Reset complete — waiting for module...");
+}
+
+/*
+ * Initialise SIM800L:
+ *   1. Hardware reset
+ *   2. AT sync
+ *   3. Disable echo
+ *   4. Check SIM card
+ *   5. Wait for network registration
+ *   6. Read signal quality
+ * Returns true if module is registered on network.
+ */
+bool simInit() {
+  Serial.println("[SIM] Initialising SIM800L...");
+
+  SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
+  delay(100);
+
+  simHardwareReset();
+
+  // ── AT sync (try a few times) ─────────────────────────────────
+  bool synced = false;
+  for (int i = 0; i < 5; i++) {
+    if (simSendCmd("AT", "OK", 2000)) {
+      synced = true;
+      break;
+    }
+    delay(500);
+  }
+  if (!synced) {
+    Serial.println("[SIM] AT sync failed — module not responding.");
+    return false;
+  }
+  Serial.println("[SIM] AT sync OK.");
+
+  // ── Disable echo ──────────────────────────────────────────────
+  simSendCmd("ATE0", "OK", 2000);
+
+  // ── Check SIM card present ────────────────────────────────────
+  if (!simSendCmd("AT+CPIN?", "READY", 5000)) {
+    Serial.println("[SIM] No SIM card detected or PIN locked.");
+    return false;
+  }
+  Serial.println("[SIM] SIM card OK.");
+
+  // ── Wait for network registration (up to 30s) ────────────────
+  simRegistered = false;
+  uint32_t regStart = millis();
+  char regBuf[128];
+  while (millis() - regStart < 30000) {
+    if (simSendCmd("AT+CREG?", "+CREG:", 3000, regBuf, sizeof(regBuf))) {
+      // +CREG: 0,1 (home) or +CREG: 0,5 (roaming) means registered
+      if (strstr(regBuf, ",1") || strstr(regBuf, ",5")) {
+        simRegistered = true;
+        break;
+      }
+    }
+    delay(2000);
+    esp_task_wdt_reset();
+  }
+
+  if (!simRegistered) {
+    Serial.println("[SIM] Network registration failed after 30s.");
+    return false;
+  }
+  Serial.println("[SIM] Registered on network.");
+
+  // ── Signal quality ────────────────────────────────────────────
+  simReadSignalQuality();
+
+  return true;
+}
+
+/*
+ * Read CSQ (signal quality). Range 0–31, 99 = unknown.
+ * Stores result in simSignalQuality.
+ */
+void simReadSignalQuality() {
+  char buf[64];
+  if (simSendCmd("AT+CSQ", "+CSQ:", 3000, buf, sizeof(buf))) {
+    char* p = strstr(buf, "+CSQ:");
+    if (p) {
+      simSignalQuality = atoi(p + 6);
+      if (simSignalQuality == 99) simSignalQuality = 0;
+      Serial.printf("[SIM] Signal: %d/31 (%s)\n", simSignalQuality,
+                    simSignalQuality > 20 ? "good" :
+                    simSignalQuality > 10 ? "moderate" : "weak");
+    }
+  }
+}
+
+/*
+ * Establish GPRS connection.
+ * Must be called after simInit() succeeds.
+ * Sets up PDP context with the configured APN.
+ */
+bool gprsConnect() {
+  Serial.println("[GPRS] Connecting...");
+
+  // Shut down any existing connection cleanly
+  simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
+  delay(1000);
+
+  // Set connection type to GPRS
+  if (!simSendCmd("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", "OK", 5000)) {
+    Serial.println("[GPRS] Failed to set connection type.");
+    return false;
+  }
+
+  // Set APN
+  char apnCmd[128];
+  snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"APN\",\"%s\"", GPRS_APN);
+  if (!simSendCmd(apnCmd, "OK", 5000)) {
+    Serial.println("[GPRS] Failed to set APN.");
+    return false;
+  }
+
+  // Set APN user (if any)
+  if (strlen(GPRS_USER) > 0) {
+    snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"USER\",\"%s\"", GPRS_USER);
+    simSendCmd(apnCmd, "OK", 3000);
+  }
+  if (strlen(GPRS_PASS) > 0) {
+    snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"PWD\",\"%s\"", GPRS_PASS);
+    simSendCmd(apnCmd, "OK", 3000);
+  }
+
+  // Open bearer
+  if (!simSendCmd("AT+SAPBR=1,1", "OK", 15000)) {
+    Serial.println("[GPRS] Bearer open failed — retrying after CIPSHUT...");
+    simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
+    delay(2000);
+    if (!simSendCmd("AT+SAPBR=1,1", "OK", 15000)) {
+      Serial.println("[GPRS] Bearer open failed on retry.");
+      return false;
+    }
+  }
+
+  // Verify bearer — read IP
+  char ipBuf[64];
+  if (simSendCmd("AT+SAPBR=2,1", "+SAPBR:", 5000, ipBuf, sizeof(ipBuf))) {
+    if (strstr(ipBuf, "0.0.0.0")) {
+      Serial.println("[GPRS] Got 0.0.0.0 — no IP assigned.");
+      return false;
+    }
+    Serial.printf("[GPRS] Connected. %s\n", ipBuf);
+  }
+
+  gprsConnected = true;
+  return true;
+}
+
+/*
+ * Disconnect GPRS cleanly.
+ */
+void gprsDisconnect() {
+  simSendCmd("AT+SAPBR=0,1", "OK", 5000);
+  simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
+  gprsConnected = false;
+  Serial.println("[GPRS] Disconnected.");
+}
+
+/*
+ * Check if GPRS bearer is still active.
+ * Returns true if IP is assigned and non-zero.
+ */
+bool gprsCheckActive() {
+  char buf[64];
+  if (simSendCmd("AT+SAPBR=2,1", "+SAPBR:", 5000, buf, sizeof(buf))) {
+    // +SAPBR: 1,1,"x.x.x.x" means active
+    if (strstr(buf, ",1,\"") && !strstr(buf, "0.0.0.0")) {
+      return true;
+    }
+  }
+  gprsConnected = false;
+  return false;
+}
+
+/*
+ * Build the JSON payload for HTTP POST.
+ * This is the single payload the server needs to make all routing decisions.
+ * Matches the server's expected schema.
+ */
+int buildJsonPayload(char* buf, int bufSize) {
+  uint32_t ts = millis() / 1000 + bootUnixTime;
+
+  int len = snprintf(buf, bufSize,
+    "{"
+    "\"device_id\":\"%s\","
+    "\"station\":\"%s\","
+    "\"timestamp\":%lu,"
+    "\"water_height_cm\":%.2f,"
+    "\"mode\":\"%s\","
+    "\"response_level\":\"%s\","
+    "\"zone\":\"%s\","
+    "\"rate_per_15min\":%.2f,"
+    "\"sustained_rise\":%s,"
+    "\"tilt_deg\":%.2f,"
+    "\"lateral_accel\":%.3f,"
+    "\"pressure_hpa\":%.2f,"
+    "\"depth_below_surface_cm\":%.2f,"
+    "\"temperature_c\":%.1f,"
+    "\"battery_pct\":%d,"
+    "\"health_score\":%d,"
+    "\"olp_length_cm\":%.1f,"
+    "\"peak_height_cm\":%.1f,"
+    "\"signal_quality\":%d,"
+    "\"uptime_s\":%lu,"
+    "\"tx_channel\":\"%s\","
+    "\"mpu_ok\":%s,"
+    "\"bmp_ok\":%s"
+    "}",
+    DEVICE_ID,
+    STATION_NAME,
+    ts,
+    waterHeightCm,
+    modeStr(currentMode),
+    levelStr(currentResponseLevel),
+    zoneStr(currentZone),
+    ratePer15Min,
+    sustainedRise ? "true" : "false",
+    tiltAngleDeg,
+    lateralAccel,
+    currentPressurePa / 100.0f,
+    depthBelowSurfaceCm,
+    currentTempC,
+    (int)batteryPercent,
+    healthScore,
+    olpLengthCm,
+    peakHeightCm,
+    simSignalQuality,
+    millis() / 1000,
+    (activeChannel == TX_CHANNEL_GPRS) ? "GPRS" :
+    (activeChannel == TX_CHANNEL_WIFI) ? "WIFI" : "NONE",
+    mpuHealthy ? "true" : "false",
+    bmpAvailable ? "true" : "false"
+  );
+
+  return len;
+}
+
+/*
+ * HTTP POST via SIM800L GPRS.
+ * Uses the SIM800L HTTP service (AT+HTTPINIT etc.)
+ * Returns true if server responds with 200.
+ */
+bool gprsPostData() {
+  if (!gprsConnected) {
+    Serial.println("[TX] GPRS not connected — cannot POST.");
+    return false;
+  }
+
+  // Build JSON payload
+  char payload[768];
+  int payloadLen = buildJsonPayload(payload, sizeof(payload));
+  if (payloadLen <= 0 || payloadLen >= (int)sizeof(payload)) {
+    Serial.println("[TX] Payload build failed.");
+    return false;
+  }
+
+  Serial.printf("[TX] Payload (%d bytes): %s\n", payloadLen, payload);
+
+  // ── HTTP init ─────────────────────────────────────────────────
+  simSendCmd("AT+HTTPTERM", "OK", 2000);  // terminate any previous session
+  delay(500);
+
+  if (!simSendCmd("AT+HTTPINIT", "OK", 5000)) {
+    Serial.println("[TX] HTTPINIT failed.");
+    return false;
+  }
+
+  // Set bearer profile
+  if (!simSendCmd("AT+HTTPPARA=\"CID\",1", "OK", 3000)) {
+    Serial.println("[TX] CID set failed.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // Set URL
+  char urlCmd[256];
+  snprintf(urlCmd, sizeof(urlCmd), "AT+HTTPPARA=\"URL\",\"%s\"", SERVER_URL);
+  if (!simSendCmd(urlCmd, "OK", 3000)) {
+    Serial.println("[TX] URL set failed.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // Set content type
+  if (!simSendCmd("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 3000)) {
+    Serial.println("[TX] Content-type set failed.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // ── Upload data ───────────────────────────────────────────────
+  char dataCmd[32];
+  snprintf(dataCmd, sizeof(dataCmd), "AT+HTTPDATA=%d,10000", payloadLen);
+  if (!simSendCmd(dataCmd, "DOWNLOAD", 5000)) {
+    Serial.println("[TX] HTTPDATA prompt failed.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // Send the actual JSON bytes
+  SimSerial.write((uint8_t*)payload, payloadLen);
+  delay(100);
+
+  // Wait for OK after data upload
+  if (!simSendCmd("", "OK", 5000)) {
+    Serial.println("[TX] Data upload not acknowledged.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // ── Execute POST ──────────────────────────────────────────────
+  char httpBuf[128];
+  if (!simSendCmd("AT+HTTPACTION=1", "+HTTPACTION:", SIM_HTTP_TIMEOUT,
+                  httpBuf, sizeof(httpBuf))) {
+    Serial.println("[TX] HTTPACTION timeout — no server response.");
+    simSendCmd("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  // Parse response: +HTTPACTION: 1,<status>,<datalen>
+  int httpStatus = 0;
+  char* p = strstr(httpBuf, "+HTTPACTION:");
+  if (p) {
+    // Skip method code "1,"
+    p = strchr(p, ',');
+    if (p) httpStatus = atoi(p + 1);
+  }
+
+  // ── Clean up ──────────────────────────────────────────────────
+  simSendCmd("AT+HTTPTERM", "OK", 2000);
+
+  if (httpStatus == 200 || httpStatus == 201) {
+    Serial.printf("[TX] POST success — HTTP %d\n", httpStatus);
+    return true;
+  } else {
+    Serial.printf("[TX] POST failed — HTTP %d\n", httpStatus);
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PHASE 4B — WiFi + FIREBASE FALLBACK
+// ─────────────────────────────────────────────────────────────────
+
+/*
+ * Attempt WiFi connection. Non-blocking with timeout.
+ * Only used as fallback when GPRS is unavailable.
+ */
+bool wifiConnect() {
+  if (strlen(WIFI_SSID) == 0) {
+    return false;  // No WiFi configured
+  }
+
+  Serial.printf("[WIFI] Connecting to '%s'...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start < WIFI_TIMEOUT_MS)) {
+    delay(250);
+    esp_task_wdt_reset();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.printf("[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println("[WIFI] Connection failed.");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiConnected = false;
+  return false;
+}
+
+/*
+ * Disconnect WiFi to save power.
+ */
+void wifiDisconnect() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiConnected = false;
+}
+
+/*
+ * POST to Firebase Realtime Database via REST API.
+ * Uses HTTPS PUT to /varuna/live/<device_id>.json
+ * This is the fallback path when GPRS is down but WiFi is available.
+ */
+bool firebasePostData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[FIREBASE] WiFi not connected.");
+    return false;
+  }
+
+  // Build JSON payload (same format as GPRS)
+  char payload[768];
+  buildJsonPayload(payload, sizeof(payload));
+
+  // Build Firebase URL
+  char url[256];
+  if (strlen(FIREBASE_SECRET) > 0) {
+    snprintf(url, sizeof(url),
+             "https://%s%s/%s.json?auth=%s",
+             FIREBASE_HOST, FIREBASE_PATH, DEVICE_ID, FIREBASE_SECRET);
+  } else {
+    snprintf(url, sizeof(url),
+             "https://%s%s/%s.json",
+             FIREBASE_HOST, FIREBASE_PATH, DEVICE_ID);
+  }
+
+  Serial.printf("[FIREBASE] PUT to %s\n", url);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  int httpCode = http.PUT(payload);
+
+  if (httpCode == 200 || httpCode == 201) {
+    Serial.printf("[FIREBASE] PUT success — HTTP %d\n", httpCode);
+    http.end();
+    return true;
+  } else {
+    Serial.printf("[FIREBASE] PUT failed — HTTP %d\n", httpCode);
+    if (httpCode < 0) {
+      Serial.printf("[FIREBASE] Error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PHASE 4C — TRANSMISSION MANAGER
+//  Handles channel selection, retry logic, and failover.
+// ─────────────────────────────────────────────────────────────────
+
+/*
+ * Attempt to transmit data to the server.
+ * Priority: GPRS (SIM800L) → WiFi (Firebase) → log failure.
+ *
+ * This function is called once per transmitInterval.
+ * It does NOT decide who gets alerted — it just pushes the device's
+ * current state to the server. The server handles all routing.
+ */
+bool transmitData() {
+  bool success = false;
+
+  Serial.println("\n[TX] ═══════════════════════════════════════");
+  Serial.println("[TX] Transmit cycle starting...");
+
+  // ── Attempt 1: GPRS ───────────────────────────────────────────
+  if (simAvailable) {
+    // Check if GPRS is still up
+    if (gprsConnected && !gprsCheckActive()) {
+      Serial.println("[TX] GPRS bearer dropped — reconnecting...");
+      gprsConnected = false;
+    }
+
+    // Reconnect GPRS if needed
+    if (!gprsConnected) {
+      simReadSignalQuality();
+      if (simSignalQuality > 0) {
+        gprsConnect();
+      }
+    }
+
+    // Try POST
+    if (gprsConnected) {
+      for (int retry = 0; retry < SIM_POST_RETRIES && !success; retry++) {
+        if (retry > 0) {
+          Serial.printf("[TX] GPRS retry %d/%d...\n", retry + 1, SIM_POST_RETRIES);
+          delay(2000);
+        }
+        success = gprsPostData();
+      }
+      if (success) {
+        activeChannel = TX_CHANNEL_GPRS;
+      }
+    }
+  }
+
+  // ── Attempt 2: WiFi fallback ──────────────────────────────────
+  if (!success) {
+    Serial.println("[TX] GPRS failed — trying WiFi fallback...");
+
+    if (!wifiConnected) {
+      wifiConnect();
+    }
+
+    if (wifiConnected) {
+      success = firebasePostData();
+      if (success) {
+        activeChannel = TX_CHANNEL_WIFI;
+      }
+      // Disconnect WiFi after use to save power
+      // (only if GPRS is the primary — keep WiFi if no SIM)
+      if (simAvailable) {
+        wifiDisconnect();
+      }
+    }
+  }
+
+  // ── Update tracking ───────────────────────────────────────────
+  if (success) {
+    lastSuccessfulTx = millis();
+    txSuccessCount++;
+    consecutiveFails = 0;
+    pendingTransmit  = false;
+    Serial.printf("[TX] SUCCESS via %s. Total: %lu  Fails: %lu\n",
+                  (activeChannel == TX_CHANNEL_GPRS) ? "GPRS" : "WiFi",
+                  txSuccessCount, txFailCount);
+  } else {
+    txFailCount++;
+    consecutiveFails++;
+    activeChannel = TX_CHANNEL_NONE;
+    Serial.printf("[TX] FAILED. Consecutive fails: %lu  Total fails: %lu\n",
+                  consecutiveFails, txFailCount);
+
+    // If too many consecutive failures, try SIM800L hard reset
+    if (consecutiveFails >= 5 && simAvailable) {
+      Serial.println("[TX] 5 consecutive fails — hard-resetting SIM800L...");
+      gprsDisconnect();
+      simAvailable = simInit();
+      if (simAvailable) {
+        gprsConnect();
+      }
+      consecutiveFails = 0;  // reset counter regardless
+    }
+  }
+
+  Serial.println("[TX] ═══════════════════════════════════════\n");
+  return success;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PHASE 4D — INBOUND SMS DIAGNOSTIC CHANNEL
+//  Allows field engineers to send a command via SMS when no
+//  laptop/WiFi is available. This is diagnostic only — has zero
+//  involvement in the alert pipeline.
+// ─────────────────────────────────────────────────────────────────
+
+/*
+ * Check for and process inbound SMS messages.
+ * Supported commands (same as serial, subset):
+ *   STATUS    — returns full status via SMS reply
+ *   PING      — returns PONG + uptime
+ *   CAL       — triggers recalibration (algo must be off)
+ *   GETCONFIG — returns OLP, thresholds, intervals
+ *
+ * All other commands are ignored (no alert routing here).
+ */
+void checkInboundSMS() {
+  if (!simAvailable) return;
+
+  // Check for new SMS in text mode
+  char listBuf[512];
+  simSendCmd("AT+CMGF=1", "OK", 2000);  // text mode
+
+  if (!simSendCmd("AT+CMGL=\"REC UNREAD\"", "+CMGL:", 5000, listBuf, sizeof(listBuf))) {
+    return;  // no unread messages
+  }
+
+  // Parse sender number and message body
+  // Format: +CMGL: <index>,"REC UNREAD","<number>",...\r\n<message body>\r\n
+  char* msgStart = strstr(listBuf, "+CMGL:");
+  if (!msgStart) return;
+
+  // Extract sender number
+  char senderNum[20] = {0};
+  char* q1 = strchr(msgStart, '\"');
+  if (q1) q1 = strchr(q1 + 1, '\"');  // skip "REC UNREAD"
+  if (q1) q1 = strchr(q1 + 1, '\"');  // start of number
+  if (q1) {
+    char* q2 = strchr(q1 + 1, '\"');
+    if (q2 && (q2 - q1 - 1) < (int)sizeof(senderNum)) {
+      strncpy(senderNum, q1 + 1, q2 - q1 - 1);
+    }
+  }
+
+  // Extract message body (after the last \n of the header line)
+  char* bodyStart = strstr(msgStart, "\r\n");
+  if (bodyStart) {
+    bodyStart += 2;  // skip \r\n
+    char* bodyEnd = strstr(bodyStart, "\r\n");
+    if (!bodyEnd) bodyEnd = bodyStart + strlen(bodyStart);
+
+    int bodyLen = bodyEnd - bodyStart;
+    if (bodyLen > 0 && bodyLen < SMS_BUF_SIZE) {
+      strncpy(smsBuf, bodyStart, bodyLen);
+      smsBuf[bodyLen] = '\0';
+
+      // Trim and uppercase
+      String cmd = String(smsBuf);
+      cmd.trim();
+      cmd.toUpperCase();
+
+      Serial.printf("[SMS] From %s: '%s'\n", senderNum, cmd.c_str());
+
+      // Process command and build reply
+      char reply[300] = {0};
+
+      if (cmd == "STATUS") {
+        snprintf(reply, sizeof(reply),
+                 "VARUNA %s\nH:%.0fcm %s\nLevel:%s Zone:%s\n"
+                 "Rate:%.1fcm/15m\nBatt:%d%% HP:%d\nUp:%lus",
+                 DEVICE_ID, waterHeightCm, modeStr(currentMode),
+                 levelStr(currentResponseLevel), zoneStr(currentZone),
+                 ratePer15Min, (int)batteryPercent, healthScore,
+                 millis() / 1000);
+      }
+      else if (cmd == "PING") {
+        snprintf(reply, sizeof(reply), "PONG %s uptime:%lus",
+                 DEVICE_ID, millis() / 1000);
+      }
+      else if (cmd == "GETCONFIG") {
+        snprintf(reply, sizeof(reply),
+                 "OLP:%.0fcm A:%d W:%d D:%d\nAlgo:%s Sig:%d/31\n"
+                 "Sample:%lus TX:%lus",
+                 olpLengthCm, alertLevelCm, warnLevelCm, dangerLevelCm,
+                 algorithmEnabled ? "ON" : "OFF", simSignalQuality,
+                 sampleInterval / 1000, transmitInterval / 1000);
+      }
+      else if (cmd == "CAL") {
+        if (!algorithmEnabled) {
+          mpuCalibrate();
+          snprintf(reply, sizeof(reply), "CAL OK — gyro offsets updated.");
+        } else {
+          snprintf(reply, sizeof(reply), "ERR: Disable algo first (ALGOOFF).");
+        }
+      }
+      else if (cmd == "ALGOON") {
+        algorithmEnabled = true;
+        digitalWrite(ALGO_LED, LOW);
+        lastSampleTime = millis();
+        updateAdaptiveIntervals();
+        snprintf(reply, sizeof(reply), "ALGO ENABLED");
+      }
+      else if (cmd == "ALGOOFF") {
+        algorithmEnabled = false;
+        digitalWrite(ALGO_LED, HIGH);
+        snprintf(reply, sizeof(reply), "ALGO DISABLED");
+      }
+      else {
+        snprintf(reply, sizeof(reply), "Unknown cmd. Try: STATUS PING GETCONFIG CAL");
+      }
+
+      // Send reply SMS
+      if (strlen(reply) > 0 && strlen(senderNum) > 0) {
+        simSendSMS(senderNum, reply);
+      }
+    }
+  }
+
+  // Delete all read messages to free SIM memory
+  simSendCmd("AT+CMGDA=\"DEL READ\"", "OK", 5000);
+}
+
+/*
+ * Send an SMS to the specified number.
+ * Used only for diagnostic replies — NOT for flood alerts.
+ */
+bool simSendSMS(const char* number, const char* message) {
+  Serial.printf("[SMS] Sending to %s: %s\n", number, message);
+
+  simSendCmd("AT+CMGF=1", "OK", 2000);  // text mode
+
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", number);
+
+  // Send command and wait for '>' prompt
+  while (SimSerial.available()) SimSerial.read();
+  SimSerial.println(cmd);
+
+  uint32_t start = millis();
+  bool gotPrompt = false;
+  while (millis() - start < 5000) {
+    if (SimSerial.available()) {
+      char c = SimSerial.read();
+      if (c == '>') { gotPrompt = true; break; }
+    }
+    delay(10);
+  }
+
+  if (!gotPrompt) {
+    Serial.println("[SMS] No '>' prompt — send failed.");
+    SimSerial.write(0x1B);  // ESC to cancel
+    return false;
+  }
+
+  // Send message body + Ctrl+Z to terminate
+  SimSerial.print(message);
+  SimSerial.write(0x1A);  // Ctrl+Z
+
+  // Wait for +CMGS or ERROR
+  char respBuf[128];
+  if (simSendCmd("", "+CMGS:", 15000, respBuf, sizeof(respBuf))) {
+    Serial.println("[SMS] Sent OK.");
+    return true;
+  }
+
+  Serial.println("[SMS] Send failed or timed out.");
+  return false;
+}
+```
+
+---
+
+## Block 4: Updates to `updateHealthScore()`
+
+**Location: Replace your existing `updateHealthScore()` function (around line 520) with:**
+
+```cpp
+void updateHealthScore() {
+  healthScore = 100;
+  if (!mpuHealthy)    healthScore -= 30;
+  if (!bmpAvailable)  healthScore -= 20;
+  if (!simAvailable)  healthScore -= 15;
+  if (batteryState == 1) healthScore -= 10;
+  if (batteryState == 2) healthScore -= 25;
+  if (mpuFrozenCount > 0) healthScore -= 10;
+  if (consecutiveFails > 3) healthScore -= 10;
+  if (simSignalQuality > 0 && simSignalQuality < 8) healthScore -= 5;
+  healthScore = max(0, healthScore);
+}
+```
+
+---
+
+## Block 5: Updates to `printStatus()`
+
+**Location: Inside your existing `printStatus()` function, add these lines before the closing `Serial.println("====================");`:**
+
+```cpp
+  Serial.printf("  SIM800L       : %s\n",        simAvailable ? "OK" : "UNAVAILABLE");
+  Serial.printf("  GPRS          : %s\n",        gprsConnected ? "CONNECTED" : "DOWN");
+  Serial.printf("  Signal (CSQ)  : %d/31\n",     simSignalQuality);
+  Serial.printf("  WiFi          : %s\n",        wifiConnected ? "CONNECTED" : "OFF");
+  Serial.printf("  TX Channel    : %s\n",
+                activeChannel == TX_CHANNEL_GPRS ? "GPRS" :
+                activeChannel == TX_CHANNEL_WIFI ? "WIFI" : "NONE");
+  Serial.printf("  TX Success    : %lu\n",       txSuccessCount);
+  Serial.printf("  TX Fails      : %lu (consec: %lu)\n", txFailCount, consecutiveFails);
+  Serial.printf("  Last TX       : %lu s ago\n",
+                lastSuccessfulTx > 0 ? (millis() - lastSuccessfulTx) / 1000 : 0);
+```
+
+---
+
+## Block 6: New serial commands
+
+**Location: Inside your `processCommand()` function, add these cases before the final `else` block that prints "ERR: Unknown command":**
+
+```cpp
+  else if (cmd == "SIMINIT") {
+    simAvailable = simInit();
+    if (simAvailable) gprsConnect();
+    Serial.printf("SIM:%s GPRS:%s\n",
+                  simAvailable ? "OK" : "FAIL",
+                  gprsConnected ? "OK" : "FAIL");
+  }
+  else if (cmd == "SIMSTATUS") {
+    simReadSignalQuality();
+    Serial.printf("SIM:%s REG:%s GPRS:%s CSQ:%d/31 TX_OK:%lu TX_FAIL:%lu CH:%s\n",
+                  simAvailable ? "OK" : "DOWN",
+                  simRegistered ? "YES" : "NO",
+                  gprsConnected ? "UP" : "DOWN",
+                  simSignalQuality,
+                  txSuccessCount, txFailCount,
+                  activeChannel == TX_CHANNEL_GPRS ? "GPRS" :
+                  activeChannel == TX_CHANNEL_WIFI ? "WIFI" : "NONE");
+  }
+  else if (cmd == "TXNOW") {
+    Serial.println("Forcing immediate transmit...");
+    transmitData();
+  }
+  else if (cmd == "GPRSUP") {
+    if (simAvailable && !gprsConnected) {
+      gprsConnect();
+    } else if (gprsConnected) {
+      Serial.println("GPRS already connected.");
+    } else {
+      Serial.println("SIM not available.");
+    }
+  }
+  else if (cmd == "GPRSDOWN") {
+    gprsDisconnect();
+  }
+  else if (cmd == "WIFION") {
+    wifiConnect();
+  }
+  else if (cmd == "WIFIOFF") {
+    wifiDisconnect();
+  }
+  else if (cmd == "FIREBASETEST") {
+    if (!wifiConnected) wifiConnect();
+    if (wifiConnected) firebasePostData();
+    else Serial.println("WiFi not available.");
+  }
+```
+
+---
+
+## Block 7: Updates to `setup()`
+
+**Location: Inside `setup()`, add after the BMP280 section (after `"[INIT] BMP280 ready."` around line 635), and before the `"Sensor source summary"` section. This becomes step 7.5:**
+
+```cpp
+  // ── 7.5  SIM800L + GPRS ──────────────────────────────────────
+  esp_task_wdt_reset();
+  Serial.println("[INIT] Initialising SIM800L...");
+  simAvailable = false;
+
+  for (int attempt = 0; attempt < SIM_INIT_RETRIES; attempt++) {
+    Serial.printf("[INIT] SIM800L attempt %d/%d\n", attempt + 1, SIM_INIT_RETRIES);
+    if (simInit()) {
+      simAvailable = true;
+      break;
+    }
+    delay(2000);
+    esp_task_wdt_reset();
+  }
+
+  if (simAvailable) {
+    Serial.println("[INIT] SIM800L ready — connecting GPRS...");
+    if (gprsConnect()) {
+      activeChannel = TX_CHANNEL_GPRS;
+      Serial.println("[INIT] GPRS connected — primary TX channel active.");
+    } else {
+      Serial.println("[INIT] GPRS failed — will retry on first transmit.");
+    }
+  } else {
+    Serial.println("[INIT] SIM800L unavailable — will use WiFi fallback.");
+    // Try WiFi as fallback
+    if (strlen(WIFI_SSID) > 0) {
+      if (wifiConnect()) {
+        activeChannel = TX_CHANNEL_WIFI;
+        Serial.println("[INIT] WiFi connected as fallback TX channel.");
+      }
+    }
+  }
+
+  simInitFailCount = simAvailable ? 0 : SIM_INIT_RETRIES;
+```
+
+**Also update the sensor source summary section to include comms status. Add after the existing source summary block:**
+
+```cpp
+  // ── 8.5 Comms source summary ──────────────────────────────────
+  if (!simAvailable && !wifiConnected) {
+    Serial.println("[WARN] NO COMMUNICATION CHANNEL — data will not be transmitted.");
+    Serial.println("[WARN] Device will continue sampling and storing locally.");
+  } else {
+    Serial.printf("[INIT] Primary TX: %s\n",
+                  activeChannel == TX_CHANNEL_GPRS ? "GPRS (SIM800L)" :
+                  activeChannel == TX_CHANNEL_WIFI ? "WiFi (Firebase)" : "NONE");
+  }
+```
+
+**Update the help text at the end of `setup()` — replace the existing commands help lines with:**
+
+```cpp
+  Serial.println("[INIT] Commands: STATUS | SENSORTEST | ALGOON | ALGOOFF | PING | CAL");
+  Serial.println("[INIT] Thresholds: SETALERT:<cm> | SETWARN:<cm> | SETDANGER:<cm>");
+  Serial.println("[INIT] Config: OLP:<cm> | GETCONFIG | GETTHRESH | SAVEEEPROM | DUMP");
+  Serial.println("[INIT] Comms: SIMINIT | SIMSTATUS | TXNOW | GPRSUP | GPRSDOWN");
+  Serial.println("[INIT] Comms: WIFION | WIFIOFF | FIREBASETEST\n");
+```
+
+---
+
+## Block 8: Updates to `loop()`
+
+**Location: Inside `loop()`, replace the algorithm-gated section (section 7) and add section 7.5 for transmission. Here's the complete replacement for sections 7 and 8, plus the new additions:**
+
+```cpp
+  // ── 7. ALGORITHM-GATED: flood state machine (Phase 3) ─────────
+  if (algorithmEnabled) {
+    if (now - lastSampleTime >= sampleInterval) {
+      lastSampleTime = now;
+
+      evaluateFloodStatus();
+      updateAdaptiveIntervals();
+      pendingTransmit = true;  // flag that we have new data to send
+
+      Serial.printf("[SAMPLE] H=%.1fcm  Mode=%s  Level=%s  Rate=%.1f  Sustained=%d  Health=%d\n",
+                    waterHeightCm, modeStr(currentMode),
+                    levelStr(currentResponseLevel), ratePer15Min,
+                    (int)sustainedRise, healthScore);
+    }
+
+    // ── 7.5 TRANSMISSION — at transmitInterval or on level change ──
+    bool levelJustChanged = false;  // set in evaluateFloodStatus via forceSaveEeprom
+    bool txDue = (now - lastTransmitTime >= transmitInterval) && pendingTransmit;
+
+    if (txDue) {
+      lastTransmitTime = now;
+      transmitData();
+    }
+
+    // Periodic EEPROM save — every 30 minutes if no level-change triggered it
+    if (now - lastEepromSave >= 1800000UL) {
+      forceSaveEeprom();
+    }
+  }
+
+  // ── 8. SIM800L maintenance (runs always, not just when algo enabled) ──
+
+  // Check for inbound diagnostic SMS every 30 seconds
+  static uint32_t lastSmsCheck = 0;
+  if (simAvailable && (now - lastSmsCheck >= 30000UL)) {
+    lastSmsCheck = now;
+    checkInboundSMS();
+  }
+
+  // GPRS keepalive check every 5 minutes
+  if (simAvailable && gprsConnected && (now - lastSimCheck >= 300000UL)) {
+    lastSimCheck = now;
+    if (!gprsCheckActive()) {
+      Serial.println("[SIM] GPRS bearer dropped — will reconnect on next TX.");
+    }
+    simReadSignalQuality();
+  }
+
+  // If SIM was unavailable, retry init every 10 minutes
+  if (!simAvailable && (now - lastGprsReconnect >= 600000UL)) {
+    lastGprsReconnect = now;
+    Serial.println("[SIM] Retrying SIM800L init...");
+    simAvailable = simInit();
+    if (simAvailable) gprsConnect();
+  }
+
+  // ── 9. Minimal delay to prevent tight spinning ────────────────
+  delay(5);
+```
+
+---
+
+## Complete Data Flow Summary
+
+```
+┌──────────────────────────────────────────────────────┐
+│                   ESP32-S3 DEVICE                    │
+│                                                      │
+│  MPU6050 ─→ Tilt ─→ H = L·cosθ ─→ evaluateFlood()  │
+│  BMP280  ─→ Pressure ─→ submerge depth              │
+│  Battery ─→ health score                             │
+│                                                      │
+│  Every transmitInterval:                             │
+│    buildJsonPayload() ─→ one JSON blob               │
+│                                                      │
+│  ┌─────────────────────────────────────┐             │
+│  │ Try GPRS (SIM800L)                  │             │
+│  │   HTTP POST to SERVER_URL           │             │
+│  │   ↓ fail?                           │             │
+│  │ Try WiFi (ESP32 native)             │             │
+│  │   HTTPS PUT to Firebase             │             │
+│  │   ↓ fail?                           │             │
+│  │ Log failure, retry next interval    │             │
+│  └─────────────────────────────────────┘             │
+│                                                      │
+│  Device's job ends here.                             │
+└──────────────────────────────────────────────────────┘
+                        │
+                   HTTP POST
+                   (one JSON)
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────┐
+│                     SERVER                           │
+│                                                      │
+│  Receives: device_id, water_height_cm, mode,         │
+│            response_level, zone, rate, sustained,     │
+│            battery, health, GPS, timestamp            │
+│                                                      │
+│  Compares incoming response_level to stored level:   │
+│                                                      │
+│  WATCH    → SMS to ops team only                     │
+│  WARNING  → SMS to Sarpanch + Tahsildar              │
+│  FLOOD    → SMS to DC, Control Room, Police          │
+│  CRITICAL → All above + State EOC + IVR call         │
+│                                                      │
+│  Step-down  → de-escalation SMS to all contacted     │
+│  All-clear  → closure SMS when back to NORMAL        │
+│                                                      │
+│  Reminders: CRITICAL=15min, FLOOD=30min, WARN=60min  │
+│  Contacts: stored in DB, edited via web UI           │
+│  No ACK needed. No device changes needed ever.       │
+└──────────────────────────────────────────────────────┘
+```
+
+Every function above compiles standalone against your existing code. The JSON payload carries everything the server needs. The device never knows or cares who gets alerted — it just faithfully reports its state every interval.
+````
+
+
+
 ```
 Sensor Health & Graceful Degradation
 
