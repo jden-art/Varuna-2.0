@@ -184,13 +184,13 @@ static const char* GPRS_PASS       = "";
 static const char* RELAY_SERVER_URL = "http://your-relay-server.com/api/varuna/data";
 
 // WiFi credentials (fallback path)
-static const char* WIFI_SSID       = "YOUR_WIFI_SSID";
-static const char* WIFI_PASS       = "YOUR_WIFI_PASSWORD";
+static const char* WIFI_SSID       = "TPLink_2G";
+static const char* WIFI_PASS       = "9700668325";
 
 // Firebase configuration
-static const char* FIREBASE_HOST   = "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app";
+static const char* FIREBASE_HOST   = "varuna-ok-default-rtdb.asia-southeast1.firebasedatabase.app";
 static const char* FIREBASE_PATH   = "/varuna/live/";
-static const char* FIREBASE_SECRET = "YOUR_FIREBASE_DATABASE_SECRET";
+static const char* FIREBASE_SECRET = "HcV2Fs3OAi2ApwddQ0DQGvtdktYvf99vnUb7S1l3";
 
 // ─────────────────────────────────────────────────────────────────
 //  ADAPTIVE SAMPLING  (seconds)
