@@ -1,4 +1,267 @@
 
+# VARUNA Debugger — Full Phase & Step Plan (Corrected)
+
+---
+
+## Planned Final File Structure
+
+```
+📁 varuna-debugger/
+├── 📁 qml/
+│   ├── 📄 Main.qml
+│   ├── 📁 screens/
+│   │   ├── 📄 BootScreen.qml
+│   │   ├── 📄 LiveScreen.qml
+│   │   ├── 📄 CalibrationScreen.qml
+│   │   ├── 📄 ConnectivityScreen.qml
+│   │   ├── 📄 ThresholdScreen.qml
+│   │   ├── 📄 VerdictScreen.qml
+│   │   └── 📄 ExportScreen.qml
+│   └── 📁 components/
+│       ├── 📄 Theme.qml
+│       ├── 📄 qmldir
+│       ├── 📄 ActionButton.qml
+│       ├── 📄 StatusBadge.qml
+│       ├── 📄 ValueCard.qml
+│       ├── 📄 CheckRow.qml
+│       ├── 📄 MiniChart.qml
+│       ├── 📄 NumericKeypad.qml
+│       ├── 📄 TextKeypad.qml
+│       ├── 📄 SettingsPanel.qml
+│       ├── 📄 ToastNotification.qml
+│       ├── 📄 StatusStrip.qml
+│       ├── 📄 BottomNav.qml
+│       └── 📄 SerialLogStrip.qml
+├── 📁 backend/
+│   ├── 📄 __init__.py
+│   ├── 📄 serial_worker.py
+│   ├── 📄 device_model.py
+│   ├── 📄 serial_commander.py
+│   ├── 📄 report_exporter.py
+│   └── 📄 settings_manager.py
+├── 📄 main.py
+├── 📄 requirements.txt
+├── 📄 varuna-debugger.service
+└── 📄 README.md
+```
+
+---
+
+## Phase & Step Plan
+
+---
+
+### **PHASE 1: Project Foundation & Basic Window** (3 steps)
+**Major Feature:** A PySide6 application launches, loads QML, and renders a styled window with dp/sp scaling and settings persistence.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create project directory structure, `requirements.txt`, and `main.py` entry point with `QGuiApplication` + `QQmlApplicationEngine` loading a minimal `Main.qml` that shows a colored rectangle | Terminal: "VARUNA Debugger v1.0.0 starting…" printed. Window: A dark `#0f1318` window appears on screen. |
+| 2 | Add `ApplicationWindow` to `Main.qml` with `dp`/`sp` scaling properties, dark background, and centered "VARUNA Debugger" text in Noto Sans to verify font rendering and scaling | Window: "VARUNA Debugger" in light text (`#e8eaed`) centered on `#0f1318` background. Resizing the window causes the text to scale. |
+| 3 | Create `settings_manager.py` with full `SettingsManager` class (all 7 settings, JSON read/write persistence), register as `"Settings"` context property, display current settings values in QML | Terminal: prints all 7 setting defaults on launch. Window: settings values displayed as text. File: `~/.config/varuna-debugger/settings.json` created on disk. |
+
+---
+
+### **PHASE 2: Theme System** (2 steps)
+**Major Feature:** Complete dual-theme (dark/light) color system as a QML singleton with all Material palette colors and runtime switching with 200ms animated transitions.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `Theme.qml` as a QML singleton (with `qmldir`) exposing the full dark/light color palettes as properties, bound to `Settings.darkMode`, with `Behavior on color` animations. Wire `Main.qml` background to `Theme.background` | Window background color is `#0f1318` (dark mode default). |
+| 2 | Add test palette display in `Main.qml`: 8+ colored rectangles with labels showing all theme colors, plus a temporary toggle button that calls `Settings.setDarkMode()` to switch themes | Window: grid of labeled color swatches visible. Tapping the toggle button smoothly transitions all swatch colors between dark and light palettes over 200ms. |
+
+---
+
+### **PHASE 3: Settings Panel** (3 steps)
+**Major Feature:** Fully functional Android-style swipe-down settings overlay with all 8 settings controls, live theme switching, and disk persistence.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `SettingsPanel.qml` with swipe-down gesture detection from top 40dp, overlay with scrim, slide animation, drag handle, header with "Settings" title and "Close" text button | Swiping down from the top 40dp of the window reveals the panel sliding down with scrim behind it. Tapping scrim or "Close" hides it with slide-up animation. |
+| 2 | Add dark mode toggle (Material-style switch) and animations toggle (Material-style switch, self-exempt from global disable) inside the settings panel | Toggling dark mode inside the panel switches all theme colors live. Toggling animations off makes panel close/open instant. |
+| 3 | Add remaining 6 settings items: font scale segmented buttons (Small/Default/Large), brightness slider, serial port chips (Auto/ttyUSB0/ttyACM0/ttyS0), data logging toggle, chart history segmented buttons (1/3/5 min), about accordion section | All 8 settings items visible and interactive inside the panel. Values persist to `settings.json` — close and relaunch the app to verify persistence. About section expands inline showing version and platform info. |
+
+---
+
+### **PHASE 4: Navigation Shell** (4 steps)
+**Major Feature:** Complete navigation framework — top status strip, bottom nav bar with 7 QML-shape icon items, StackView with animated slide transitions between 7 placeholder screens, and collapsible serial log strip.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `StatusStrip.qml` — 36dp top bar with "VARUNA / Screen Title" text, a red 6dp connection dot with "NO DATA" label, session timer counting up in MM:SS format, and 7 small progress dots (all outlined) | Top bar renders across full width. "VARUNA / Boot check" text on the left. Red dot with "NO DATA" on the right. Timer counting up. 7 outlined dots visible. |
+| 2 | Create `BottomNav.qml` — 56dp bottom bar with 7 evenly spaced items, each with a QML-shape icon (built from Rectangles/Canvas) and 9sp label. Active item has `Theme.primary` coloring with a filled pill indicator behind the icon | Bottom bar renders across full width with 7 labeled icons. The first item ("Boot") is highlighted with the primary-colored pill. Tapping other items changes which one is highlighted. |
+| 3 | Create 7 placeholder screen QML files. Set up `StackView` in `Main.qml` between status strip and bottom nav. Wire `BottomNav` taps to replace screens with slide transitions. Wire screen title in `StatusStrip` to update on navigation | Tapping each nav item replaces the center content with the corresponding placeholder screen (showing the screen name in large text). Screen slides in from right, old screen slides left. Status strip title updates (e.g., "VARUNA / Live sensors"). |
+| 4 | Create `SerialLogStrip.qml` — 28dp collapsed strip above bottom nav showing one scrolling line of hardcoded sample log text in 10sp Noto Sans Mono, expandable to 120dp on tap showing 10 sample entries color-coded by prefix, chevron icon toggles | Log strip visible above the bottom nav bar showing one line. Tapping expands to 120dp with 10 color-coded entries (STATUS grey, ERROR red, WARNING amber, FLOOD orange). Tapping again collapses. Chevron rotates. |
+
+---
+
+### **PHASE 5: Serial Backend & Device Model** (4 steps)
+**Major Feature:** Serial port auto-detection, background-threaded reading, CSV parsing (38 fields), status message classification, command queue, and a `DeviceModel` exposing all data to QML with simulated data fallback for development.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `serial_worker.py` — `SerialWorker` in a `QThread` with port scanning (`/dev/ttyUSB0`, `/dev/ttyACM0`, `/dev/ttyS0`), line reading loop, and a **simulated data mode** that generates realistic 38-field CSV lines + status messages every second when no device is connected | Terminal: "Scanning serial ports…", lists attempted ports, prints "No serial device found — starting simulated data mode", then prints simulated CSV lines every second. |
+| 2 | Add CSV line parsing (split 38 fields by comma, map to named dict) and status message classification (`STATUS:`/`ERROR:`/`WARNING:`/`FLOOD:`) with Qt signal emission for each type | Terminal: each simulated line is parsed and printed as a named dict (e.g., `{'theta': 12.5, 'waterHeight': 45.2, ...}`). Status messages printed with their classification. |
+| 3 | Create `serial_commander.py` — `SerialCommander` with command queue, one-at-a-time send with 5-second timeout, `commandConfirmed`/`commandFailed` signals. In simulated mode, auto-confirm commands after 500ms | Terminal: "Command queued: PING" → "Command sent: PING" → "Command confirmed: PING" (after 500ms in sim mode). |
+| 4 | Create `device_model.py` — `DeviceModel` with all 38 CSV fields as `@Property`, `connected` bool, chart deques, boot check list, screen completion tracking. Register as `"Device"` context property. Wire to `SerialWorker` signals. Update status strip connection indicator to reflect `Device.connected` | Terminal: property update logs every second. Window: status strip connection dot turns **green** with "LIVE" label and pulse animation. Session timer keeps counting. |
+
+---
+
+### **PHASE 6: Boot Summary Screen** (3 steps)
+**Major Feature:** Screen 1 fully functional — 2×3 grid of sensor check cards with animated WAITING → PASS/FAIL transitions, conditional continue button. Delivers `ActionButton.qml` and `StatusBadge.qml` reusable components.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `ActionButton.qml` (filled/outlined pill, ripple effect from touch point, pressed opacity 0.85, disabled greyed-out state). Create `StatusBadge.qml` (PASS/WARN/FAIL/WAITING pill with color and text). Display both on the Boot placeholder screen as a test | Boot screen shows a test filled button with ripple on press, an outlined button, and 4 status badges (one per state) in a row. |
+| 2 | Replace Boot placeholder with full `BootScreen.qml` — 2×3 `GridLayout` of 6 sensor check cards (MPU6050, BMP280, DS1307, HC-SR04, SIM800L, GPS), each with icon area, sensor name, description, and `StatusBadge`. All start in WAITING state. Wire to `Device.bootChecks` | Boot screen shows 6 cards in a 2×3 grid. Each card shows a spinning indicator, sensor name, description text, and a grey "WAITING" badge. |
+| 3 | Animate card transitions from WAITING → PASS/FAIL (icon scale overshoot, border flash). Add conditional `ActionButton` at bottom — green "All systems nominal — Continue" if all pass, or amber warning + "Continue to live readout" if any fail. Tapping navigates to Screen 2 | Cards animate to green ✓ or red ✗ as simulated boot status messages arrive over ~5 seconds. Button text and color update based on results. Tapping button navigates to Live screen with slide transition. |
+
+---
+
+### **PHASE 7: Live Sensor Readout Screen** (3 steps)
+**Major Feature:** Screen 2 fully functional — 7 live-updating value cards with trend indicators, battery bar, GPS status, RSSI quality label, and 3 rolling Canvas-based charts. Delivers `ValueCard.qml` and `MiniChart.qml` reusable components.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `ValueCard.qml` (card with label, large value, unit, sub-label, optional status tint). Replace Live placeholder with `LiveScreen.qml` — responsive grid layout with 7 `ValueCard` instances bound to `Device` properties (water height, tilt angle, battery, RSSI, pressure, temperature, GPS) | Live screen shows 7 cards in a responsive grid. Values update every second from simulated data. |
+| 2 | Add water height trend arrow (up red / down blue / stable dash), battery bar (color coded by level: green >80%, amber 20–80%, red <20%), GPS "FIX — N sats" / "NO FIX" display with coordinate sub-label, RSSI plain-language quality label ("Excellent"/"Good"/"Fair"/"Poor"/"No signal") | Cards show animated trend triangles on water height, a colored fill bar under battery, GPS status text with coordinates, and RSSI quality text — all updating live. |
+| 3 | Create `MiniChart.qml` (QML `Canvas`-based, properties for data model, line color, dual-line support, auto-scale Y, threshold line, axis labels, title). Add 3 charts below the cards: water height (single line, primary color), tilt X+Y (dual line, cyan + orange), RSSI (per-segment color by value) | Three charts render in the bottom section. Lines draw and scroll left smoothly as new data points arrive each second. Water height chart shows threshold dashed line. Tilt chart shows a small legend. RSSI chart has fixed 0–31 Y axis. |
+
+---
+
+### **PHASE 8: Calibration Verification Screen** (3 steps)
+**Major Feature:** Screen 3 fully functional — calibration result checklist with thresholded PASS/WARN/FAIL rows and a 30-second animated static stability progress test. Delivers `CheckRow.qml` reusable component.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `CheckRow.qml` (left color bar, metric name, measured value in mono font, `StatusBadge` on right). Replace Calibration placeholder with `CalibrationScreen.qml` — two-panel layout (side-by-side on wide, stacked on narrow). Left panel: 7 `CheckRow` items in WAITING state. Right panel: stability test header + placeholder area | Two panels render. Left has 7 rows with grey left bars and WAITING badges. Right shows "Static stability test" header. |
+| 2 | Wire calibration data from `Device`. Send `GETCONFIG` command on screen activation. Populate rows with values and evaluate PASS/WARN/FAIL per the defined thresholds (WHO_AM_I, total G, gyro offsets X/Y/Z, gyro samples, accel samples) | Rows populate with measured values (e.g., "WHO_AM_I: 0x68", "totalG: 0.99") and badges change to colored PASS/WARN/FAIL states. |
+| 3 | Implement 30-second stability test in right panel: animated progress bar (fills left to right over 30s), live standard deviation readout in mono font updating every second, final result in 28sp colored text, interpretation line, "Rerun test" outlined `ActionButton` | Progress bar animates over 30 seconds. Deviation value updates each second. After 30s, final value appears large and colored. "Rerun test" button resets and restarts the test. |
+
+---
+
+### **PHASE 9: Connectivity & TX/RX Screen** (3 steps)
+**Major Feature:** Screen 4 fully functional — serial PING test with byte display, GPRS test with result chips, APN configuration with selectable chips, and SIM reinitialisation. Delivers `ToastNotification.qml` component.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `ToastNotification.qml` (slides up 60dp from bottom, holds 3s, slides down, auto-dismiss, message + color properties). Replace Connectivity placeholder with `ConnectivityScreen.qml` — three vertically stacked cards: TX/RX, GPRS, APN. Show a test toast on screen load | Three cards render with titles ("Serial TX/RX", "GPRS / Server", "APN Configuration"). A test toast slides up from bottom, holds 3s, slides back down. |
+| 2 | Wire TX/RX card: "Send PING" `ActionButton`, TX/RX byte display in mono font, 5-line scrollable message area color-coded by prefix, card border flash green on success / red on timeout. Wire GPRS card: "Test connection" button, three inline result chips (Status, HTTP code, RTT), RSSI cross-reference line on failure | Pressing "Send PING" sends command and shows TX/RX bytes with green border flash (simulated success). GPRS test shows result chips. If GPRS fails, RSSI line appears. |
+| 3 | Wire APN card: display current APN in 18sp mono, 3 common APN chips (airtelgprs.com, internet, bsnlnet) selectable, note text. "Reinitialise SIM" outlined button (disabled until GPRS tested, then enabled). Toast notifications on actions | APN chips are tappable and highlight when selected. Reinit button enables after GPRS test. Toast "SIM reinitialised" appears on button press. |
+
+---
+
+### **PHASE 10: Threshold Configuration Screen** (3 steps)
+**Major Feature:** Screen 5 fully functional — current device thresholds, numeric input via modal keypad overlay, live cross-field validation, and apply/reset with per-row animated progress. Delivers `NumericKeypad.qml` component.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `NumericKeypad.qml` (half-sheet overlay from bottom, 220dp tall, scrim, 0–9 grid + backspace + decimal + confirm button, display row with blinking cursor, open/close animation). Replace Threshold placeholder with `ThresholdScreen.qml` — header row with column labels, 3 config row cards showing "Reading…" initially | Three threshold row cards render with "Current on device" showing "Reading…" and empty input fields on the right. |
+| 2 | Wire `GETTHRESH` command on screen activation to populate current values. Wire `NumericKeypad` to input fields — tapping a field opens the keypad, entering digits updates the field, confirm closes keypad. Implement live validation: alert < warning < danger, all positive. Invalid fields get red border + inline error message | Tapping an input field opens the numeric keypad overlay. Entering values updates the field. If alert ≥ warning, both fields turn red with error text "Alert must be less than warning." |
+| 3 | "Apply to device" filled `ActionButton` (disabled if validation errors), sends threshold commands with per-row spinning indicator → checkmark/X on response. "Reset to defaults" outlined button. Toast on success ("Thresholds applied") or failure ("Configuration incomplete — retry") | Apply button greyed out with errors, enabled when valid. Pressing Apply shows spinners resolving to ✓ per row. Toast slides up confirming. Reset fills fields with defaults. |
+
+---
+
+### **PHASE 11: Verdict Screen** (2 steps)
+**Major Feature:** Screen 6 fully functional — 10-item diagnostic checklist with measured values, overall verdict banner (DEPLOY/CAUTION/DO NOT DEPLOY) with animated entrance, and configuration summary table.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Replace Verdict placeholder with `VerdictScreen.qml` — two-panel layout. Left panel: 10 `CheckRow` items (MPU6050, BMP280, HC-SR04, GPS, DS1307, SIM/GPRS, Battery, Calibration, Signal, TX/RX) with measured value subtitles. Right panel: configuration summary with alternating row backgrounds, label-value pairs in 11sp | Left panel shows 10 check rows with colored badges. Right panel shows config values (thresholds, OLP length, APN, GPS coords, battery, timestamp) in alternating shaded rows. |
+| 2 | Wire `Device.generateVerdict()` to evaluate all 10 checks. Verdict banner at bottom of left panel: full-width 48dp rounded pill — green "DEPLOY" / amber "DEPLOY WITH CAUTION" / red "DO NOT DEPLOY" — with scale+fade entrance animation. "Generate deployment report" `ActionButton` at bottom of right panel → navigates to Export screen | Verdict banner appears with overshoot scale animation. Color and text reflect actual check results. Tapping "Generate deployment report" navigates to Export screen. |
+
+---
+
+### **PHASE 12: Export Screen & Report Generation** (4 steps)
+**Major Feature:** Screen 7 fully functional — engineer info form with QWERTY keypad, PDF/JSON report generation, QR code display, and upload button. Delivers `TextKeypad.qml` component and `report_exporter.py` backend.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Create `TextKeypad.qml` (full-width QWERTY half-sheet overlay, 240dp tall, shift toggle, backspace, space, enter, display row with blinking cursor). Replace Export placeholder with `ExportScreen.qml` — incomplete-session warning card (if screens 2–5 not all visited) and engineer name/ID form fields | If screens incomplete: warning card lists which screens are missing. If complete: two form fields ("Engineer name", "Engineer ID / Badge number") with labels. |
+| 2 | Wire `TextKeypad` to form fields — tapping opens QWERTY keypad, typing updates field, enter/confirm closes. Export `ActionButton` full-width at bottom — disabled and greyed until both fields have ≥1 character, then enabled in `Theme.primary` | Tapping a form field opens QWERTY keypad overlay. Typing fills the field. Export button enables only when both fields are non-empty. |
+| 3 | Create `report_exporter.py` — `ReportExporter` class with PDF generation (ReportLab) and JSON generation per the defined report schema. Wire to export button: circular spinner during export, then two result rows with green ✓ showing PDF and JSON file paths | Pressing Export shows spinner, then "PDF saved — /home/varuna/reports/…pdf ✓" and "JSON saved — /home/varuna/reports/…json ✓" with green checkmarks. Files exist on disk. |
+| 4 | Add QR code generation (`qrcode` + `Pillow` libraries) — encode report JSON path, display as 140×140dp `Image` in QML. "Upload now" outlined `ActionButton` — success toast or "No network — transfer via USB" warning | QR code image renders below the file paths. "Scan to store record offline" label beneath it. Upload button shows toast or warning text. |
+
+---
+
+### **PHASE 13: Final Integration & Deployment** (3 steps)
+**Major Feature:** All systems connected end-to-end. Status strip fully live. Serial log wired to real data. All animations globally toggleable. Responsive at all target resolutions. Systemd service file and deployment README ready.
+
+| Step | Description | Expected Visible Output |
+|------|-------------|------------------------|
+| 1 | Wire `SerialLogStrip` to real serial data from `DeviceModel`. Wire status strip: connection dot pulse animation, RSSI mini-bars animated by signal level, screen progress dots fill as screens are visited | Status strip: green pulsing dot, RSSI bars reflect signal level, dots fill green as you visit each screen. Serial log strip shows live parsed messages color-coded by type. |
+| 2 | Verify global animation toggle: all durations → 0 when `Settings.animationsEnabled` is false. Verify theme switch on every screen. Verify settings persist across app restart (kill and relaunch). Fix any visual inconsistencies | With animations off: all transitions are instant (screen slides, card fades, badge scales). Theme toggles cleanly on all 7 screens. Kill app, relaunch: all settings restored from JSON. |
+| 3 | Create `varuna-debugger.service` (systemd unit file). Create `README.md` with full deployment instructions (dependencies, venv setup, service installation, user groups). Verify responsive layout at 800×480, 1024×600, 1280×720, 1920×1080 — no overflow, no overlap, no illegible text | Service file and README created. Resizing window to each target resolution shows no layout breakage — all cards fit, text is readable, charts render, nav bar is usable. |
+
+---
+
+## Summary Table
+
+| Phase | Major Feature | Steps |
+|-------|--------------|-------|
+| 1 | Project foundation & basic window | 3 |
+| 2 | Theme system (dark/light) | 2 |
+| 3 | Settings panel | 3 |
+| 4 | Navigation shell | 4 |
+| 5 | Serial backend & device model | 4 |
+| 6 | Boot screen + ActionButton + StatusBadge | 3 |
+| 7 | Live screen + ValueCard + MiniChart | 3 |
+| 8 | Calibration screen + CheckRow | 3 |
+| 9 | Connectivity screen + ToastNotification | 3 |
+| 10 | Threshold screen + NumericKeypad | 3 |
+| 11 | Verdict screen | 2 |
+| 12 | Export screen + TextKeypad + ReportExporter | 4 |
+| 13 | Final integration & deployment | 3 |
+| **Total** | | **40 steps** |
+
+---
+
+## Planned Final File Structure
+
+```
+📁 varuna-debugger/
+├── 📁 qml/
+│   ├── 📄 Main.qml
+│   ├── 📁 screens/
+│   │   ├── 📄 BootScreen.qml
+│   │   ├── 📄 LiveScreen.qml
+│   │   ├── 📄 CalibrationScreen.qml
+│   │   ├── 📄 ConnectivityScreen.qml
+│   │   ├── 📄 ThresholdScreen.qml
+│   │   ├── 📄 VerdictScreen.qml
+│   │   └── 📄 ExportScreen.qml
+│   └── 📁 components/
+│       ├── 📄 qmldir
+│       ├── 📄 Theme.qml
+│       ├── 📄 ActionButton.qml
+│       ├── 📄 StatusBadge.qml
+│       ├── 📄 ValueCard.qml
+│       ├── 📄 CheckRow.qml
+│       ├── 📄 MiniChart.qml
+│       ├── 📄 NumericKeypad.qml
+│       ├── 📄 TextKeypad.qml
+│       ├── 📄 SettingsPanel.qml
+│       ├── 📄 ToastNotification.qml
+│       ├── 📄 StatusStrip.qml
+│       ├── 📄 BottomNav.qml
+│       └── 📄 SerialLogStrip.qml
+├── 📁 backend/
+│   ├── 📄 __init__.py
+│   ├── 📄 serial_worker.py
+│   ├── 📄 device_model.py
+│   ├── 📄 serial_commander.py
+│   ├── 📄 report_exporter.py
+│   └── 📄 settings_manager.py
+├── 📄 main.py
+├── 📄 requirements.txt
+├── 📄 varuna-debugger.service
+└── 📄 README.md
+```
+
+**Total planned files: 27**
+
+---
+
 
 # VARUNA Debugger — Full Phase & Step Plan
 
