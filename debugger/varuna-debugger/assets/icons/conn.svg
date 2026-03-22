@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- conn.svg — Signal bars (Connectivity screen) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Bar 1 (shortest, leftmost) -->
+  <rect x="2" y="17" width="4" height="5" rx="1" fill="#000000"/>
+  <!-- Bar 2 -->
+  <rect x="8" y="13" width="4" height="9" rx="1" fill="#000000"/>
+  <!-- Bar 3 -->
+  <rect x="14" y="8" width="4" height="14" rx="1" fill="#000000"/>
+  <!-- Bar 4 (tallest, rightmost) -->
+  <rect x="20" y="2" width="0" height="0" rx="1" fill="#000000"/>
+  <!-- Wifi arc style — alternative: 4 arcs -->
+  <!-- Using bars is cleaner at small sizes -->
+  <!-- Dot in corner for "active" feel -->
+  <rect x="19" y="2" width="3" height="20" rx="1" fill="#000000"/>
+</svg>

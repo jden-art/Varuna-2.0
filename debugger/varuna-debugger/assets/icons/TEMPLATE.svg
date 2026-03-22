@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  VARUNA DEBUGGER — CUSTOM ICON TEMPLATE                             ║
+  ║  Copy this file, rename it, draw your icon, drop it in              ║
+  ║  assets/icons/ and use it with SvgIcon { name: "yourname" }         ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+
+  RULES FOR MASK-COLORABLE ICONS (useColorMask: true — the default):
+
+  1. viewBox MUST be square — "0 0 24 24" is the standard.
+     The icon is always rendered into a square Item so non-square
+     viewBoxes will be letterboxed.
+
+  2. Fill ALL paths with solid BLACK (#000000).
+     The SvgIcon component uses your SVG as an alpha mask and overlays
+     the color on top. Any path filled black becomes fully colored.
+     Any path left transparent stays transparent (invisible).
+
+  3. Stroke-only paths (lines, polylines, arcs):
+     Set stroke="#000000" and fill="none".
+     The stroke is rendered into the mask — it works perfectly.
+
+  4. DO NOT use:
+     - Gradients       → they will render as a gradient of the tint color
+     - Multiple fills  → everything will become the same tint color
+     - Embedded images → they will not recolor
+     - External fonts  → they will not load on the Pi
+
+  5. Leave 1–2 px of padding inside the 24×24 viewBox.
+     The icon is displayed at ~20dp which at 1280×720 is ~20px.
+     Keep strokes at 1.5–2px at 24px viewBox scale.
+
+  6. For MULTI-COLOR icons (logos, flags, etc):
+     Use <SvgIcon useColorMask: false /> — the SVG renders as-is.
+     In this case you can use any fill colors you want.
+
+  HOW TO SWAP AN ICON:
+    Simply replace the .svg file in assets/icons/ with the same filename.
+    No code changes needed. The app picks it up on next launch.
+
+  HOW TO ADD A NEW ICON (not in the nav bar):
+    1. Put your SVG in assets/icons/myicon.svg
+    2. In any QML file:
+
+         SvgIcon {
+             name:  "myicon"
+             size:  Math.round(24 * rootWindow.dp)
+             color: Theme.secondary
+         }
+
+    That's it.
+
+  RECOMMENDED TOOLS:
+    - Inkscape (free): File → Document Properties → set W=H=24 px
+      Draw your icon → File → Save As → Plain SVG
+    - Figma: set frame to 24×24, export as SVG
+    - Any vector editor that exports clean SVG without proprietary tags
+
+  EXAMPLE ICON BELOW — a simple water drop:
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+
+  <!--
+    This is a water drop. Replace the path below with your own shape.
+    All fills and strokes use #000000 so the mask coloring works.
+  -->
+
+  <!-- Drop body -->
+  <path d="M12 3 C12 3 5 11 5 15.5 a7 7 0 0 0 14 0 C19 11 12 3 12 3Z"
+        fill="#000000"/>
+
+  <!--
+    Highlight — a small lighter shape inside.
+    Since we're masking, both fill="#000000" shapes get the same tint color.
+    To make a "highlight" effect, use a slightly transparent fill:
+    fill="#000000" opacity="0.3" will give 30% of the tint color.
+  -->
+  <ellipse cx="9.5" cy="14" rx="1.5" ry="2.5"
+           fill="#000000" opacity="0.3"
+           transform="rotate(-20 9.5 14)"/>
+
+</svg>

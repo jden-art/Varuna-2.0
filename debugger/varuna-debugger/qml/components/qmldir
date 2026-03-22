@@ -1,0 +1,15 @@
+module components
+
+ActionButton      1.0 ActionButton.qml
+BottomNav         1.0 BottomNav.qml
+CheckRow          1.0 CheckRow.qml
+MiniChart         1.0 MiniChart.qml
+NumericKeypad     1.0 NumericKeypad.qml
+SerialLogStrip    1.0 SerialLogStrip.qml
+SettingsPanel     1.0 SettingsPanel.qml
+StatusBadge       1.0 StatusBadge.qml
+StatusStrip       1.0 StatusStrip.qml
+SvgIcon           1.0 SvgIcon.qml
+TextKeypad        1.0 TextKeypad.qml
+ToastNotification 1.0 ToastNotification.qml
+ValueCard         1.0 ValueCard.qml

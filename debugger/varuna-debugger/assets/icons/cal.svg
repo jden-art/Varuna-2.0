@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- cal.svg — Crosshair / target (Calibration screen) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Outer ring -->
+  <circle cx="12" cy="12" r="9"
+          stroke="#000000" stroke-width="2" fill="none"/>
+  <!-- Inner dot -->
+  <circle cx="12" cy="12" r="2.5"
+          fill="#000000"/>
+  <!-- Top tick -->
+  <line x1="12" y1="2" x2="12" y2="5"
+        stroke="#000000" stroke-width="2" stroke-linecap="round"/>
+  <!-- Bottom tick -->
+  <line x1="12" y1="19" x2="12" y2="22"
+        stroke="#000000" stroke-width="2" stroke-linecap="round"/>
+  <!-- Left tick -->
+  <line x1="2" y1="12" x2="5" y2="12"
+        stroke="#000000" stroke-width="2" stroke-linecap="round"/>
+  <!-- Right tick -->
+  <line x1="19" y1="12" x2="22" y2="12"
+        stroke="#000000" stroke-width="2" stroke-linecap="round"/>
+</svg>
