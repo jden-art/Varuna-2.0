@@ -1,7 +1,7 @@
 // ============================================================
 // VARUNA FLOOD MONITORING SYSTEM — ESP32-C3 COMMS CONTROLLER
 // Complete rewrite aligned to system specification
-// All 7 gaps fixed per review
+// All 7 original gaps fixed + all 6 new issues fixed
 // ============================================================
 
 #include <SPI.h>
@@ -76,6 +76,7 @@
 #define S3_RX_BUFFER_SIZE         128       // $DATA frames are short
 #define SIM_RESP_BUFFER_SIZE      256
 #define HTTP_BODY_BUFFER_SIZE     512
+#define HTTP_ENVELOPE_BUFFER_SIZE 600       // Issue 4 fix: batch body + device_id wrapper
 
 // AT command timeouts
 #define AT_SHORT_TIMEOUT          2000
@@ -162,7 +163,7 @@ struct DeviceConfig {
 };
 
 // ============================================================
-// FORWARD DECLARATIONS (Gap 2 + Gap 5 fix)
+// FORWARD DECLARATIONS
 // ============================================================
 void httpFinish(bool success, int code);
 void handleRealtimeCommand(bool enable);
@@ -180,11 +181,16 @@ OpState opState = OP_NORMAL;
 OpState opPrevState = OP_NORMAL;
 
 // --- S3 UART reception ---
-volatile char    s3RxBuffer[S3_RX_BUFFER_SIZE];
-volatile uint8_t s3RxIndex = 0;
-volatile bool    s3RxReady = false;
+// Issue 6 note: volatile removed — receiveFromS3() runs in main
+// loop, not an ISR. HardwareSerial handles its own internal
+// interrupt-driven FIFO. These buffers are only accessed from
+// main loop context sequentially, so volatile is unnecessary
+// and misleading.
+char     s3RxBuffer[S3_RX_BUFFER_SIZE];
+uint8_t  s3RxIndex = 0;
+bool     s3RxReady = false;
 
-char             s3FrameBuffer[S3_RX_BUFFER_SIZE];   // Copied from ISR buffer
+char             s3FrameBuffer[S3_RX_BUFFER_SIZE];   // Copied from rx buffer
 DataReading      lastReading;
 bool             newReadingAvailable = false;
 unsigned long    lastS3DataTime = 0;
@@ -198,11 +204,12 @@ bool     gprsConnected = false;
 
 AsyncAT  asyncAT;
 
-// --- SIM sub-step globals (Gap 7 fix — promoted from static) ---
+// --- SIM sub-step globals (promoted from static locals) ---
 uint8_t  attachPhase = 0;
 uint8_t  bearerStep = 0;
 uint8_t  actionPhase = 0;
 uint8_t  httpReadPhase = 0;
+uint8_t  httpInitRetried = 0;       // Issue 2 fix: dedicated variable for HTTP_INIT retry
 
 // --- HTTP transaction ---
 char     httpBody[HTTP_BODY_BUFFER_SIZE];
@@ -246,6 +253,9 @@ bool     recoveryFlushActive = false;
 uint32_t recoveryLinesRead = 0;
 char     recoveryBatch[HTTP_BODY_BUFFER_SIZE];
 uint32_t recoveryBytesConsumed = 0;
+
+// --- Health check state (Issue 3 fix) ---
+bool     healthCheckPending = false;
 
 
 // ############################################################
@@ -353,8 +363,9 @@ bool atIsBusy() {
 //                    S3 UART RECEPTION
 // ############################################################
 
-// Called from main loop (not ISR on ESP32 — HardwareSerial
-// uses internal FIFO with interrupt, we just drain it here)
+// Called from main loop — HardwareSerial uses internal
+// interrupt-driven FIFO, we just drain it here sequentially.
+// No volatile needed — single execution context.
 void receiveFromS3() {
     while (Serial1.available()) {
         char c = Serial1.read();
@@ -427,8 +438,8 @@ bool parseDataFrame(const char *frame, DataReading *out) {
 void processS3Frame() {
     if (!s3RxReady) return;
 
-    // Copy ISR buffer to working buffer
-    memcpy(s3FrameBuffer, (const char *)s3RxBuffer, s3RxIndex + 1);
+    // Copy rx buffer to working buffer
+    memcpy(s3FrameBuffer, s3RxBuffer, s3RxIndex + 1);
     s3RxReady = false;
     s3RxIndex = 0;
 
@@ -667,24 +678,17 @@ void sdTrimFront(uint32_t bytesToRemove) {
 //            SIM800L STATE MACHINE (non-blocking)
 // ############################################################
 
-// Gap 7 fix: reset sub-step globals when entering states
+// Issue 2 + Issue 7 fix: reset ALL sub-step globals on state entry
 void simSetState(SimState ns) {
     simState = ns;
     simStateEntry = millis();
 
     // Reset sub-step counters for states that use them
-    if (ns == SIM_GPRS_ATTACH) {
-        attachPhase = 0;
-    }
-    if (ns == SIM_GPRS_BEARER) {
-        bearerStep = 0;
-    }
-    if (ns == SIM_HTTP_ACTION) {
-        actionPhase = 0;
-    }
-    if (ns == SIM_HTTP_READ_RESPONSE) {
-        httpReadPhase = 0;
-    }
+    if (ns == SIM_GPRS_ATTACH)        attachPhase = 0;
+    if (ns == SIM_GPRS_BEARER)        bearerStep = 0;
+    if (ns == SIM_HTTP_INIT)          httpInitRetried = 0;
+    if (ns == SIM_HTTP_ACTION)        actionPhase = 0;
+    if (ns == SIM_HTTP_READ_RESPONSE) httpReadPhase = 0;
 }
 
 void simHardReset() {
@@ -778,7 +782,7 @@ void simStateMachine() {
         }
         break;
 
-    // ---- Gap 6 fix: SIM_GPRS_ATTACH rewritten with phased approach ----
+    // ---- Issue 6 fix from prior round: phased GPRS attach ----
     case SIM_GPRS_ATTACH:
         if (!atIsBusy()) {
             if (attachPhase == 0) {
@@ -805,7 +809,7 @@ void simStateMachine() {
         }
         break;
 
-    // ---- Gap 7 fix: bearerStep is now a global, reset by simSetState() ----
+    // ---- bearerStep is now a global, reset by simSetState() ----
     case SIM_GPRS_BEARER:
         if (!atIsBusy()) {
             if (asyncAT.complete && !asyncAT.success && bearerStep > 0) {
@@ -868,6 +872,7 @@ void simStateMachine() {
         break;
 
     // ---- HTTP POST sequence ----
+    // Issue 2 fix: uses dedicated httpInitRetried variable, reset by simSetState()
     case SIM_HTTP_INIT:
         if (!atIsBusy()) {
             if (asyncAT.complete) {
@@ -877,15 +882,14 @@ void simStateMachine() {
                     simSetState(SIM_HTTP_SET_URL);
                 } else {
                     // HTTPINIT failed — maybe prior session still open
-                    // Terminate and retry once
-                    atSendAsync("AT+HTTPTERM", "OK", AT_SHORT_TIMEOUT);
-                    // On next entry we'll try HTTPINIT again
-                    // Use actionPhase temporarily to track retry
-                    if (actionPhase == 0) {
-                        actionPhase = 1;
-                        // Stay in SIM_HTTP_INIT — will re-enter
+                    if (httpInitRetried == 0) {
+                        // First failure: terminate any prior session, then retry
+                        httpInitRetried = 1;
+                        atSendAsync("AT+HTTPTERM", "OK", AT_SHORT_TIMEOUT);
+                        // Stay in SIM_HTTP_INIT — after HTTPTERM completes,
+                        // asyncAT.complete will be true and we'll try HTTPINIT again
                     } else {
-                        actionPhase = 0;
+                        // Already retried once — give up
                         httpFinish(false, 0);
                         simSetState(SIM_IDLE);
                     }
@@ -949,48 +953,45 @@ void simStateMachine() {
         }
         break;
 
-    // ---- Gap 1 fix: SIM_HTTP_ACTION completely rewritten ----
+    // ---- Issue 1 fix: no manual atPoll() call, uses !atIsBusy() + asyncAT.complete ----
     case SIM_HTTP_ACTION:
         if (actionPhase == 0) {
-            // Body was accepted (OK received from SEND_BODY)
-            // Now fire the actual POST
+            // Body was accepted (OK from SEND_BODY), fire POST
             atSendAsync("AT+HTTPACTION=1", "+HTTPACTION:", AT_HTTP_TIMEOUT);
             actionPhase = 1;
-        } else if (actionPhase == 1) {
-            // Waiting for +HTTPACTION: response
-            if (atPoll()) {
+        } else if (actionPhase == 1 && !atIsBusy()) {
+            // atPoll() in loop() has already completed this command
+            if (asyncAT.complete) {
+                int code = 0;
                 if (asyncAT.success) {
                     // Parse HTTP response code from "+HTTPACTION: 1,200,len"
-                    int code = 0;
                     char *p = strstr(asyncAT.response, "+HTTPACTION:");
                     if (p) {
-                        p = strchr(p, ',');         // skip past method
+                        p = strchr(p, ',');         // skip past method field
                         if (p) code = atoi(p + 1);  // status code
                     }
-                    httpResponseCode = code;
+                }
+                httpResponseCode = code;
 
-                    // If success, try to read response body (Gap 5 fix)
-                    if (code == 200 || code == 201) {
-                        simSetState(SIM_HTTP_READ_RESPONSE);
-                    } else {
-                        simSetState(SIM_HTTP_TERM);
-                    }
+                // If success, try to read response body for config updates
+                if (code == 200 || code == 201) {
+                    simSetState(SIM_HTTP_READ_RESPONSE);
                 } else {
-                    httpResponseCode = 0;
                     simSetState(SIM_HTTP_TERM);
                 }
             }
         }
         break;
 
-    // ---- Gap 5 fix: New state to read server response body ----
+    // ---- Issue 1 fix applied here too: no manual atPoll() ----
     case SIM_HTTP_READ_RESPONSE:
         if (httpReadPhase == 0) {
             // Request to read the response body
             atSendAsync("AT+HTTPREAD", "+HTTPREAD:", AT_MEDIUM_TIMEOUT);
             httpReadPhase = 1;
-        } else if (httpReadPhase == 1) {
-            if (atPoll()) {
+        } else if (httpReadPhase == 1 && !atIsBusy()) {
+            // atPoll() in loop() has already completed this command
+            if (asyncAT.complete) {
                 if (asyncAT.success) {
                     // Response is in asyncAT.response
                     // Format: +HTTPREAD: <len>\r\n<body>\r\nOK
@@ -1000,11 +1001,11 @@ void simStateMachine() {
                         bodyStart = strchr(bodyStart, '\n');
                         if (bodyStart) {
                             bodyStart++;    // skip \n
-                            // Copy body to httpResponseBody, stopping at \r\nOK
+                            // Copy body to httpResponseBody, stopping at trailing OK
                             uint16_t bi = 0;
                             while (*bodyStart != '\0' &&
                                    bi < HTTP_BODY_BUFFER_SIZE - 1) {
-                                // Stop if we hit the trailing OK
+                                // Stop if we hit the trailing \r\nOK
                                 if (bodyStart[0] == '\r' && bodyStart[1] == '\n' &&
                                     bodyStart[2] == 'O' && bodyStart[3] == 'K') {
                                     break;
@@ -1130,22 +1131,33 @@ void buildSinglePostBody(const DataReading *r, char *buf,
 //             GPRS HEALTH CHECK (non-blocking)
 // ############################################################
 
-// Simple bearer check — only runs when SIM is idle
+// Issue 3 fix: properly reads the result of the bearer query
+// and detects bearer loss. Uses healthCheckPending global flag.
 void simHealthCheck() {
     if (simState != SIM_IDLE) return;
     if (atIsBusy()) return;
 
-    // Query bearer status
-    atSendAsync("AT+SAPBR=2,1", "+SAPBR:", AT_MEDIUM_TIMEOUT);
+    // If a health probe was sent last time, check the result now
+    if (healthCheckPending && asyncAT.complete) {
+        healthCheckPending = false;
 
-    // We'll check the result next time this function is called
-    // For now, just note: if +SAPBR: 1,3 (closed) shows up,
-    // the SIM state machine error handling will catch it when
-    // an HTTP POST fails.
-    //
-    // A more robust implementation would use a dedicated health
-    // check state, but for now the 3-consecutive-fail logic in
-    // the operational state machine handles GPRS loss detection.
+        // +SAPBR: 1,3 means bearer closed
+        // +SAPBR: 1,0 means bearer connecting (shouldn't be)
+        if (strstr(asyncAT.response, "+SAPBR: 1,3") != NULL ||
+            strstr(asyncAT.response, "+SAPBR: 1,0") != NULL) {
+            Serial.println("[SIM] Bearer lost, reconnecting...");
+            gprsConnected = false;
+            simReady = false;
+            simSetState(SIM_GPRS_BEARER);
+        }
+        return;
+    }
+
+    // Send a new health probe
+    if (!healthCheckPending) {
+        atSendAsync("AT+SAPBR=2,1", "+SAPBR:", AT_MEDIUM_TIMEOUT);
+        healthCheckPending = true;
+    }
 }
 
 
@@ -1181,7 +1193,7 @@ void onRecoveryTestDone(bool success, int code) {
     }
 }
 
-// Gap 3 fix: removed unnecessary extern, recoveryBytesConsumed is already global
+// Issue 3 fix from prior round: no extern, recoveryBytesConsumed is already global
 void onRecoveryFlushDone(bool success, int code) {
     if (success) {
         // Trim the successfully-sent lines from the file
@@ -1297,8 +1309,9 @@ void opStateMachine() {
                 return;
             }
 
-            // Wrap in device envelope
-            char envelope[HTTP_BODY_BUFFER_SIZE];
+            // Issue 4 fix: envelope buffer is larger than batch body
+            // to accommodate the device_id wrapper without truncation
+            char envelope[HTTP_ENVELOPE_BUFFER_SIZE];
             snprintf(envelope, sizeof(envelope),
                 "{\"device_id\":\"%s\",\"batch\":%s}",
                 DEVICE_ID, batchBody);
@@ -1330,7 +1343,7 @@ void opStateMachine() {
 
 
 // ############################################################
-//        SERVER CONFIG RESPONSE PARSER (Gap 5 fix)
+//        SERVER CONFIG RESPONSE PARSER
 // ############################################################
 //
 // NOTE ON ARCHITECTURE:
@@ -1354,8 +1367,7 @@ void opStateMachine() {
 // and set config.dirty = true.
 
 // Path B: Parse server response for config commands
-// Called after every successful HTTP POST response
-// (called from SIM_HTTP_READ_RESPONSE state)
+// Called from SIM_HTTP_READ_RESPONSE after every successful HTTP POST
 void checkServerConfigResponse(const char *responseBody) {
     // Expected format (returned by server in HTTP response):
     // {"cfg":{"normal_sec":300,"high_sec":60,"h_max_cm":200}}
@@ -1633,6 +1645,12 @@ void processSerialCommand(const char *cmd) {
         Serial.println(attachPhase);
         Serial.print("actionPhase: ");
         Serial.println(actionPhase);
+        Serial.print("httpInitRetried: ");
+        Serial.println(httpInitRetried);
+        Serial.print("httpReadPhase: ");
+        Serial.println(httpReadPhase);
+        Serial.print("healthPending: ");
+        Serial.println(healthCheckPending ? "YES" : "NO");
 
     } else if (strcmp(cmd, "HELP") == 0) {
         Serial.println("Commands:");
@@ -1723,6 +1741,7 @@ void setup() {
     lastReading.valid = false;
     newReadingAvailable = false;
     consecutiveFails = 0;
+    healthCheckPending = false;
 
     Serial.println("[INIT] Ready");
     Serial.println("========================================");
