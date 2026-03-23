@@ -1,6 +1,4 @@
-Let me read the full consolidated file carefully.Now I have a complete picture. Let me read the commands section.Now I have the complete picture. Here is the full analysis.
 
----
 
 ## What the handheld debugger is
 
