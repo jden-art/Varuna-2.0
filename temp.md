@@ -1,6 +1,4 @@
-Good. Let me do a precise diff of what the C3 file needs changed, section by section.
 
----
 
 ## Section 1 — Includes: REMOVE and ADD
 
