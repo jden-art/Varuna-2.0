@@ -1,2544 +1,1548 @@
-````
-
-
-# SIM800L + WiFi Communication Implementation for VARUNA
-
-Here's exactly where each block goes and why:
+Good. Let me do a precise diff of what the C3 file needs changed, section by section.
 
 ---
 
-## Block 1: New `#include` directives and constants
+## Section 1 — Includes: REMOVE and ADD
 
-**Location: After your existing `#include <esp_system.h>` line (around line 14)**
-
+**Remove these:**
 ```cpp
-// ─────────────────────────────────────────────────────────────────
-//  LIBRARIES — COMMUNICATION (Phase 4)
-// ─────────────────────────────────────────────────────────────────
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+```
+
+**Add these:**
+```cpp
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <HardwareSerial.h>
 ```
 
-**Location: After your `#define STATUS_LED 3` line (around line 33), add:**
+**Reason:** Firebase library is not needed — C3 never talks to Firebase directly. Server handles that. WiFi and HTTPClient handle both WiFi POST path and config polling.
 
+---
+
+## Section 2 — Pin defines: COMPLETE REPLACEMENT
+
+The entire pin block is wrong. Current file has:
 ```cpp
-// ─────────────────────────────────────────────────────────────────
-//  COMMUNICATION CONSTANTS
-// ─────────────────────────────────────────────────────────────────
-#define SIM_BAUD          9600
-#define SIM_UART_NUM      2         // ESP32-S3 UART2
+#define S3_UART_RX_PIN    2   // receives $DATA frames — WRONG
+#define S3_UART_TX_PIN    3   // sends $CFG — correct
+#define SIM_TX_PIN        21
+#define SIM_RX_PIN        20
+#define SIM_RST_PIN       8
+// missing: OTA_BOOT_PIN, OTA_RESET_PIN, CSV_RX_PIN
+```
 
-// Firebase Realtime Database
-#define FIREBASE_HOST     "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_PATH     "/varuna/live"
-#define FIREBASE_SECRET   ""        // TODO: set your database secret or use auth token
+**Replace the entire pin block with:**
+```cpp
+// CSV feed from S3 (9600 baud, SW-UART — S3 GPIO14 → C3 GPIO2)
+#define CSV_RX_PIN         2
 
-// Server HTTP endpoint (primary destination for SIM800L POST)
-// This is the server that handles all alert routing
-#define SERVER_URL        "http://your-server.com/api/device/report"
-// TODO: replace with your actual server URL
+// $CFG frames to S3 (115200 baud HW-UART — C3 GPIO3 → S3 GPIO44)
+#define CFG_TX_PIN         3
 
-// WiFi credentials (fallback only — primary is GPRS)
-#define WIFI_SSID         ""        // TODO: set if WiFi fallback desired
-#define WIFI_PASS         ""        // TODO: set if WiFi fallback desired
-#define WIFI_TIMEOUT_MS   10000     // 10s connection timeout
+// SD card
+#define SD_SCK_PIN         4
+#define SD_MISO_PIN        5
+#define SD_MOSI_PIN        6
+#define SD_CS_PIN          7
 
-// SIM800L timing
-#define SIM_CMD_TIMEOUT   5000      // ms to wait for AT response
-#define SIM_HTTP_TIMEOUT  15000     // ms to wait for HTTP action
-#define SIM_INIT_RETRIES  3
-#define SIM_POST_RETRIES  2
+// SIM800L
+#define SIM_RST_PIN        8
+#define SIM_TX_PIN         21   // C3 TX → SIM800L RXD
+#define SIM_RX_PIN         20   // C3 RX ← SIM800L TXD
+                                // ALSO: bootloader ACKs from S3 during OTA
 
-// APN — change to your SIM provider
-#define GPRS_APN          "internet"   // Jio: "jionet", Airtel: "airtelgprs.com"
-#define GPRS_USER         ""
-#define GPRS_PASS         ""
-
-// Transmission channel state
-#define TX_CHANNEL_GPRS   0
-#define TX_CHANNEL_WIFI   1
-#define TX_CHANNEL_NONE   2
-
-// Inbound SMS buffer
-#define SMS_BUF_SIZE      256
+// OTA control pins
+#define OTA_BOOT_PIN       9    // C3 GPIO9 → S3 GPIO0 (LOW = bootloader)
+#define OTA_RESET_PIN      10   // C3 GPIO10 → S3 EN (LOW pulse = reset)
 ```
 
 ---
 
-## Block 2: New global state variables
+## Section 3 — Config constants: COMPLETE REPLACEMENT
 
-**Location: After your existing system globals (after `bool lastBtnState = HIGH;` around line 198), add this entire block:**
+Current file has placeholder URLs, empty WiFi, wrong Firebase defines. Replace entire config block:
 
 ```cpp
-// ─────────────────────────────────────────────────────────────────
-//  GLOBAL STATE — COMMUNICATION  (Phase 4)
-// ─────────────────────────────────────────────────────────────────
-HardwareSerial SimSerial(SIM_UART_NUM);
+#define DEVICE_ID             "VARUNA_001"
 
-// SIM800L state
-bool     simAvailable      = false;
-bool     gprsConnected     = false;
-bool     simRegistered     = false;
-int      simSignalQuality  = 0;       // 0–31 (CSQ value)
-int      simInitFailCount  = 0;
-uint32_t lastSimCheck      = 0;
-uint32_t lastGprsReconnect = 0;
+// WiFi credentials
+#define WIFI_SSID             "TPLink_2G"
+#define WIFI_PASSWORD         "9700668325"
 
-// WiFi fallback state
-bool     wifiAvailable     = false;
-bool     wifiConnected     = false;
-uint32_t lastWifiAttempt   = 0;
+// GPRS
+#define SIM_APN               "internet"
+#define SIM_BAUD              9600
 
-// Transmission tracking
-int      activeChannel     = TX_CHANNEL_NONE;
-uint32_t lastSuccessfulTx  = 0;
-uint32_t txSuccessCount    = 0;
-uint32_t txFailCount       = 0;
-uint32_t consecutiveFails  = 0;
-bool     pendingTransmit   = false;   // set true when sample taken, cleared after TX
+// Railway server — update after deployment
+#define SERVER_BASE           "https://varuna-server-production.up.railway.app"
+#define SERVER_DATA_URL       SERVER_BASE "/api/data"
+#define SERVER_BATCH_URL      SERVER_BASE "/api/batch"
+#define SERVER_TEST_URL       SERVER_BASE "/api/ping"
+#define SERVER_DIAG_URL       SERVER_BASE "/api/diagnostic"
+#define SERVER_CONFIG_URL     SERVER_BASE "/api/config/" DEVICE_ID
+#define SERVER_OTA_CMD_URL    SERVER_BASE "/api/ota/command/" DEVICE_ID
+#define SERVER_OTA_STAT_URL   SERVER_BASE "/api/ota/status"
+#define SERVER_FW_BASE_URL    SERVER_BASE "/api/firmware/download/"
 
-// Inbound SMS
-char     smsBuf[SMS_BUF_SIZE];
-bool     smsReady          = false;
+// Timing
+#define POST_INTERVAL_MS          3000
+#define CONFIG_POLL_INTERVAL_MS   5000
+#define OTA_POLL_INTERVAL_MS      10000
+#define GPRS_RECOVERY_TEST_MS     60000
+#define RECOVERY_FLUSH_BATCH_SIZE 50
+#define SIM_HEALTH_CHECK_MS       60000
+#define S3_WATCHDOG_TIMEOUT_MS    120000
+#define WIFI_RECONNECT_MS         30000
+#define CONSECUTIVE_FAIL_LIMIT    3
 
-// Device ID — unique per unit, used in server payloads
-// TODO: set this per device during provisioning
-const char* DEVICE_ID      = "VARUNA-GK-01";
-const char* STATION_NAME   = "Godavari-KG-01";
+// SD
+#define SD_BUFFER_FILENAME        "/varuna_buffer.csv"
+#define SD_MAX_FILE_SIZE          10485760
+
+// Buffers
+#define CSV_LINE_BUFFER_SIZE      640    // 39 fields is ~500-600 chars
+#define SIM_RESP_BUFFER_SIZE      256
+#define HTTP_BODY_BUFFER_SIZE     768    // larger to hold 39-field JSON
+#define HTTP_ENVELOPE_BUFFER_SIZE 820
+#define HTTP_RESP_BUFFER_SIZE     512
+
+// AT timeouts
+#define AT_SHORT_TIMEOUT          2000
+#define AT_MEDIUM_TIMEOUT         5000
+#define AT_LONG_TIMEOUT           15000
+#define AT_HTTP_TIMEOUT           30000
+#define SIM_INIT_MAX_RETRIES      5
+
+// OTA bootloader
+#define OTA_FLASH_BLOCK_SIZE      4096
+#define OTA_BOOT_CONFIRM_MS       60000
+#define OTA_MAX_RETRIES           2
+#define OTA_SYNC_ATTEMPTS         10
 ```
 
 ---
 
-## Block 3: SIM800L Driver Functions
+## Section 4 — Add new enumerations
 
-**Location: After your battery driver section (after the `updateBattery()` function, around line 340), add this entire section:**
+After the existing `OpState` and `SimState` enums, add:
 
 ```cpp
-// ─────────────────────────────────────────────────────────────────
-//  PHASE 4A — SIM800L DRIVER
-// ─────────────────────────────────────────────────────────────────
-
-/*
- * Send an AT command and wait for an expected response.
- * Returns true if the expected string appears within timeout_ms.
- * Stores full response in outBuf if provided.
- */
-bool simSendCmd(const char* cmd, const char* expect, uint32_t timeout_ms,
-                char* outBuf = nullptr, int outBufSize = 0) {
-  // Drain any pending data
-  while (SimSerial.available()) SimSerial.read();
-
-  SimSerial.println(cmd);
-
-  uint32_t start = millis();
-  String response = "";
-
-  while (millis() - start < timeout_ms) {
-    while (SimSerial.available()) {
-      char c = SimSerial.read();
-      response += c;
-    }
-    if (response.indexOf(expect) >= 0) {
-      if (outBuf && outBufSize > 0) {
-        response.toCharArray(outBuf, outBufSize);
-      }
-      return true;
-    }
-    delay(10);
-  }
-
-  Serial.printf("[SIM] CMD '%s' — expected '%s' — GOT: %s\n",
-                cmd, expect, response.c_str());
-  if (outBuf && outBufSize > 0) {
-    response.toCharArray(outBuf, outBufSize);
-  }
-  return false;
-}
-
-/*
- * Hardware reset the SIM800L via RST pin.
- * Pull low for 200ms, then wait 3s for module boot.
- */
-void simHardwareReset() {
-  Serial.println("[SIM] Hardware reset...");
-  pinMode(SIM_RST, OUTPUT);
-  digitalWrite(SIM_RST, LOW);
-  delay(200);
-  digitalWrite(SIM_RST, HIGH);
-  delay(3000);  // SIM800L boot time
-  Serial.println("[SIM] Reset complete — waiting for module...");
-}
-
-/*
- * Initialise SIM800L:
- *   1. Hardware reset
- *   2. AT sync
- *   3. Disable echo
- *   4. Check SIM card
- *   5. Wait for network registration
- *   6. Read signal quality
- * Returns true if module is registered on network.
- */
-bool simInit() {
-  Serial.println("[SIM] Initialising SIM800L...");
-
-  SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
-  delay(100);
-
-  simHardwareReset();
-
-  // ── AT sync (try a few times) ─────────────────────────────────
-  bool synced = false;
-  for (int i = 0; i < 5; i++) {
-    if (simSendCmd("AT", "OK", 2000)) {
-      synced = true;
-      break;
-    }
-    delay(500);
-  }
-  if (!synced) {
-    Serial.println("[SIM] AT sync failed — module not responding.");
-    return false;
-  }
-  Serial.println("[SIM] AT sync OK.");
-
-  // ── Disable echo ──────────────────────────────────────────────
-  simSendCmd("ATE0", "OK", 2000);
-
-  // ── Check SIM card present ────────────────────────────────────
-  if (!simSendCmd("AT+CPIN?", "READY", 5000)) {
-    Serial.println("[SIM] No SIM card detected or PIN locked.");
-    return false;
-  }
-  Serial.println("[SIM] SIM card OK.");
-
-  // ── Wait for network registration (up to 30s) ────────────────
-  simRegistered = false;
-  uint32_t regStart = millis();
-  char regBuf[128];
-  while (millis() - regStart < 30000) {
-    if (simSendCmd("AT+CREG?", "+CREG:", 3000, regBuf, sizeof(regBuf))) {
-      // +CREG: 0,1 (home) or +CREG: 0,5 (roaming) means registered
-      if (strstr(regBuf, ",1") || strstr(regBuf, ",5")) {
-        simRegistered = true;
-        break;
-      }
-    }
-    delay(2000);
-    esp_task_wdt_reset();
-  }
-
-  if (!simRegistered) {
-    Serial.println("[SIM] Network registration failed after 30s.");
-    return false;
-  }
-  Serial.println("[SIM] Registered on network.");
-
-  // ── Signal quality ────────────────────────────────────────────
-  simReadSignalQuality();
-
-  return true;
-}
-
-/*
- * Read CSQ (signal quality). Range 0–31, 99 = unknown.
- * Stores result in simSignalQuality.
- */
-void simReadSignalQuality() {
-  char buf[64];
-  if (simSendCmd("AT+CSQ", "+CSQ:", 3000, buf, sizeof(buf))) {
-    char* p = strstr(buf, "+CSQ:");
-    if (p) {
-      simSignalQuality = atoi(p + 6);
-      if (simSignalQuality == 99) simSignalQuality = 0;
-      Serial.printf("[SIM] Signal: %d/31 (%s)\n", simSignalQuality,
-                    simSignalQuality > 20 ? "good" :
-                    simSignalQuality > 10 ? "moderate" : "weak");
-    }
-  }
-}
-
-/*
- * Establish GPRS connection.
- * Must be called after simInit() succeeds.
- * Sets up PDP context with the configured APN.
- */
-bool gprsConnect() {
-  Serial.println("[GPRS] Connecting...");
-
-  // Shut down any existing connection cleanly
-  simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
-  delay(1000);
-
-  // Set connection type to GPRS
-  if (!simSendCmd("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", "OK", 5000)) {
-    Serial.println("[GPRS] Failed to set connection type.");
-    return false;
-  }
-
-  // Set APN
-  char apnCmd[128];
-  snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"APN\",\"%s\"", GPRS_APN);
-  if (!simSendCmd(apnCmd, "OK", 5000)) {
-    Serial.println("[GPRS] Failed to set APN.");
-    return false;
-  }
-
-  // Set APN user (if any)
-  if (strlen(GPRS_USER) > 0) {
-    snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"USER\",\"%s\"", GPRS_USER);
-    simSendCmd(apnCmd, "OK", 3000);
-  }
-  if (strlen(GPRS_PASS) > 0) {
-    snprintf(apnCmd, sizeof(apnCmd), "AT+SAPBR=3,1,\"PWD\",\"%s\"", GPRS_PASS);
-    simSendCmd(apnCmd, "OK", 3000);
-  }
-
-  // Open bearer
-  if (!simSendCmd("AT+SAPBR=1,1", "OK", 15000)) {
-    Serial.println("[GPRS] Bearer open failed — retrying after CIPSHUT...");
-    simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
-    delay(2000);
-    if (!simSendCmd("AT+SAPBR=1,1", "OK", 15000)) {
-      Serial.println("[GPRS] Bearer open failed on retry.");
-      return false;
-    }
-  }
-
-  // Verify bearer — read IP
-  char ipBuf[64];
-  if (simSendCmd("AT+SAPBR=2,1", "+SAPBR:", 5000, ipBuf, sizeof(ipBuf))) {
-    if (strstr(ipBuf, "0.0.0.0")) {
-      Serial.println("[GPRS] Got 0.0.0.0 — no IP assigned.");
-      return false;
-    }
-    Serial.printf("[GPRS] Connected. %s\n", ipBuf);
-  }
-
-  gprsConnected = true;
-  return true;
-}
-
-/*
- * Disconnect GPRS cleanly.
- */
-void gprsDisconnect() {
-  simSendCmd("AT+SAPBR=0,1", "OK", 5000);
-  simSendCmd("AT+CIPSHUT", "SHUT OK", 5000);
-  gprsConnected = false;
-  Serial.println("[GPRS] Disconnected.");
-}
-
-/*
- * Check if GPRS bearer is still active.
- * Returns true if IP is assigned and non-zero.
- */
-bool gprsCheckActive() {
-  char buf[64];
-  if (simSendCmd("AT+SAPBR=2,1", "+SAPBR:", 5000, buf, sizeof(buf))) {
-    // +SAPBR: 1,1,"x.x.x.x" means active
-    if (strstr(buf, ",1,\"") && !strstr(buf, "0.0.0.0")) {
-      return true;
-    }
-  }
-  gprsConnected = false;
-  return false;
-}
-
-/*
- * Build the JSON payload for HTTP POST.
- * This is the single payload the server needs to make all routing decisions.
- * Matches the server's expected schema.
- */
-int buildJsonPayload(char* buf, int bufSize) {
-  uint32_t ts = millis() / 1000 + bootUnixTime;
-
-  int len = snprintf(buf, bufSize,
-    "{"
-    "\"device_id\":\"%s\","
-    "\"station\":\"%s\","
-    "\"timestamp\":%lu,"
-    "\"water_height_cm\":%.2f,"
-    "\"mode\":\"%s\","
-    "\"response_level\":\"%s\","
-    "\"zone\":\"%s\","
-    "\"rate_per_15min\":%.2f,"
-    "\"sustained_rise\":%s,"
-    "\"tilt_deg\":%.2f,"
-    "\"lateral_accel\":%.3f,"
-    "\"pressure_hpa\":%.2f,"
-    "\"depth_below_surface_cm\":%.2f,"
-    "\"temperature_c\":%.1f,"
-    "\"battery_pct\":%d,"
-    "\"health_score\":%d,"
-    "\"olp_length_cm\":%.1f,"
-    "\"peak_height_cm\":%.1f,"
-    "\"signal_quality\":%d,"
-    "\"uptime_s\":%lu,"
-    "\"tx_channel\":\"%s\","
-    "\"mpu_ok\":%s,"
-    "\"bmp_ok\":%s"
-    "}",
-    DEVICE_ID,
-    STATION_NAME,
-    ts,
-    waterHeightCm,
-    modeStr(currentMode),
-    levelStr(currentResponseLevel),
-    zoneStr(currentZone),
-    ratePer15Min,
-    sustainedRise ? "true" : "false",
-    tiltAngleDeg,
-    lateralAccel,
-    currentPressurePa / 100.0f,
-    depthBelowSurfaceCm,
-    currentTempC,
-    (int)batteryPercent,
-    healthScore,
-    olpLengthCm,
-    peakHeightCm,
-    simSignalQuality,
-    millis() / 1000,
-    (activeChannel == TX_CHANNEL_GPRS) ? "GPRS" :
-    (activeChannel == TX_CHANNEL_WIFI) ? "WIFI" : "NONE",
-    mpuHealthy ? "true" : "false",
-    bmpAvailable ? "true" : "false"
-  );
-
-  return len;
-}
-
-/*
- * HTTP POST via SIM800L GPRS.
- * Uses the SIM800L HTTP service (AT+HTTPINIT etc.)
- * Returns true if server responds with 200.
- */
-bool gprsPostData() {
-  if (!gprsConnected) {
-    Serial.println("[TX] GPRS not connected — cannot POST.");
-    return false;
-  }
-
-  // Build JSON payload
-  char payload[768];
-  int payloadLen = buildJsonPayload(payload, sizeof(payload));
-  if (payloadLen <= 0 || payloadLen >= (int)sizeof(payload)) {
-    Serial.println("[TX] Payload build failed.");
-    return false;
-  }
-
-  Serial.printf("[TX] Payload (%d bytes): %s\n", payloadLen, payload);
-
-  // ── HTTP init ─────────────────────────────────────────────────
-  simSendCmd("AT+HTTPTERM", "OK", 2000);  // terminate any previous session
-  delay(500);
-
-  if (!simSendCmd("AT+HTTPINIT", "OK", 5000)) {
-    Serial.println("[TX] HTTPINIT failed.");
-    return false;
-  }
-
-  // Set bearer profile
-  if (!simSendCmd("AT+HTTPPARA=\"CID\",1", "OK", 3000)) {
-    Serial.println("[TX] CID set failed.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // Set URL
-  char urlCmd[256];
-  snprintf(urlCmd, sizeof(urlCmd), "AT+HTTPPARA=\"URL\",\"%s\"", SERVER_URL);
-  if (!simSendCmd(urlCmd, "OK", 3000)) {
-    Serial.println("[TX] URL set failed.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // Set content type
-  if (!simSendCmd("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 3000)) {
-    Serial.println("[TX] Content-type set failed.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // ── Upload data ───────────────────────────────────────────────
-  char dataCmd[32];
-  snprintf(dataCmd, sizeof(dataCmd), "AT+HTTPDATA=%d,10000", payloadLen);
-  if (!simSendCmd(dataCmd, "DOWNLOAD", 5000)) {
-    Serial.println("[TX] HTTPDATA prompt failed.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // Send the actual JSON bytes
-  SimSerial.write((uint8_t*)payload, payloadLen);
-  delay(100);
-
-  // Wait for OK after data upload
-  if (!simSendCmd("", "OK", 5000)) {
-    Serial.println("[TX] Data upload not acknowledged.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // ── Execute POST ──────────────────────────────────────────────
-  char httpBuf[128];
-  if (!simSendCmd("AT+HTTPACTION=1", "+HTTPACTION:", SIM_HTTP_TIMEOUT,
-                  httpBuf, sizeof(httpBuf))) {
-    Serial.println("[TX] HTTPACTION timeout — no server response.");
-    simSendCmd("AT+HTTPTERM", "OK", 2000);
-    return false;
-  }
-
-  // Parse response: +HTTPACTION: 1,<status>,<datalen>
-  int httpStatus = 0;
-  char* p = strstr(httpBuf, "+HTTPACTION:");
-  if (p) {
-    // Skip method code "1,"
-    p = strchr(p, ',');
-    if (p) httpStatus = atoi(p + 1);
-  }
-
-  // ── Clean up ──────────────────────────────────────────────────
-  simSendCmd("AT+HTTPTERM", "OK", 2000);
-
-  if (httpStatus == 200 || httpStatus == 201) {
-    Serial.printf("[TX] POST success — HTTP %d\n", httpStatus);
-    return true;
-  } else {
-    Serial.printf("[TX] POST failed — HTTP %d\n", httpStatus);
-    return false;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  PHASE 4B — WiFi + FIREBASE FALLBACK
-// ─────────────────────────────────────────────────────────────────
-
-/*
- * Attempt WiFi connection. Non-blocking with timeout.
- * Only used as fallback when GPRS is unavailable.
- */
-bool wifiConnect() {
-  if (strlen(WIFI_SSID) == 0) {
-    return false;  // No WiFi configured
-  }
-
-  Serial.printf("[WIFI] Connecting to '%s'...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start < WIFI_TIMEOUT_MS)) {
-    delay(250);
-    esp_task_wdt_reset();
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.printf("[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
-    return true;
-  }
-
-  Serial.println("[WIFI] Connection failed.");
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  wifiConnected = false;
-  return false;
-}
-
-/*
- * Disconnect WiFi to save power.
- */
-void wifiDisconnect() {
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  wifiConnected = false;
-}
-
-/*
- * POST to Firebase Realtime Database via REST API.
- * Uses HTTPS PUT to /varuna/live/<device_id>.json
- * This is the fallback path when GPRS is down but WiFi is available.
- */
-bool firebasePostData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[FIREBASE] WiFi not connected.");
-    return false;
-  }
-
-  // Build JSON payload (same format as GPRS)
-  char payload[768];
-  buildJsonPayload(payload, sizeof(payload));
-
-  // Build Firebase URL
-  char url[256];
-  if (strlen(FIREBASE_SECRET) > 0) {
-    snprintf(url, sizeof(url),
-             "https://%s%s/%s.json?auth=%s",
-             FIREBASE_HOST, FIREBASE_PATH, DEVICE_ID, FIREBASE_SECRET);
-  } else {
-    snprintf(url, sizeof(url),
-             "https://%s%s/%s.json",
-             FIREBASE_HOST, FIREBASE_PATH, DEVICE_ID);
-  }
-
-  Serial.printf("[FIREBASE] PUT to %s\n", url);
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
-
-  int httpCode = http.PUT(payload);
-
-  if (httpCode == 200 || httpCode == 201) {
-    Serial.printf("[FIREBASE] PUT success — HTTP %d\n", httpCode);
-    http.end();
-    return true;
-  } else {
-    Serial.printf("[FIREBASE] PUT failed — HTTP %d\n", httpCode);
-    if (httpCode < 0) {
-      Serial.printf("[FIREBASE] Error: %s\n", http.errorToString(httpCode).c_str());
-    }
-    http.end();
-    return false;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  PHASE 4C — TRANSMISSION MANAGER
-//  Handles channel selection, retry logic, and failover.
-// ─────────────────────────────────────────────────────────────────
-
-/*
- * Attempt to transmit data to the server.
- * Priority: GPRS (SIM800L) → WiFi (Firebase) → log failure.
- *
- * This function is called once per transmitInterval.
- * It does NOT decide who gets alerted — it just pushes the device's
- * current state to the server. The server handles all routing.
- */
-bool transmitData() {
-  bool success = false;
-
-  Serial.println("\n[TX] ═══════════════════════════════════════");
-  Serial.println("[TX] Transmit cycle starting...");
-
-  // ── Attempt 1: GPRS ───────────────────────────────────────────
-  if (simAvailable) {
-    // Check if GPRS is still up
-    if (gprsConnected && !gprsCheckActive()) {
-      Serial.println("[TX] GPRS bearer dropped — reconnecting...");
-      gprsConnected = false;
-    }
-
-    // Reconnect GPRS if needed
-    if (!gprsConnected) {
-      simReadSignalQuality();
-      if (simSignalQuality > 0) {
-        gprsConnect();
-      }
-    }
-
-    // Try POST
-    if (gprsConnected) {
-      for (int retry = 0; retry < SIM_POST_RETRIES && !success; retry++) {
-        if (retry > 0) {
-          Serial.printf("[TX] GPRS retry %d/%d...\n", retry + 1, SIM_POST_RETRIES);
-          delay(2000);
+// Connectivity state — which path is active
+enum ConnState {
+    CONN_NONE,
+    CONN_WIFI,
+    CONN_GPRS
+};
+
+// OTA state machine
+enum OtaState {
+    OTA_IDLE,
+    OTA_CHECKING,       // Gate 1: readiness check
+    OTA_READY_WAIT,     // Waiting for engineer CONFIRM
+    OTA_DOWNLOADING,    // Downloading .bin from server
+    OTA_VERIFYING,      // Gate 2: checksum verification
+    OTA_FLASHING,       // Programming S3 via bootloader
+    OTA_CONFIRMING,     // Gate 3: waiting for CSV to resume
+    OTA_COMPLETE,
+    OTA_FAILED
+};
+```
+
+---
+
+## Section 5 — Replace DataReading struct with FullReading struct
+
+Current `DataReading` has 4 fields. Replace entirely:
+
+```cpp
+// All 39 CSV fields parsed from S3 GPIO14 output
+struct FullReading {
+    // Fields 1-10
+    float    waterHeight;
+    float    tiltX;
+    float    tiltY;
+    float    tiltAngle;
+    float    lateralAccel;
+    float    temperature;
+    float    pressure;
+    float    bmpTemp;
+    float    atmosphericRef;
+    float    gaugePressure;
+    // Fields 11-19
+    int      mode;
+    float    depth;
+    float    floodRatio;
+    uint32_t timestamp;
+    char     rtcString[24];
+    int      gpsFix;
+    float    tetherLength;
+    int      alertLevel;
+    uint32_t sampleSec;
+    // Fields 20-27
+    float    battery;
+    float    battVoltage;
+    float    latitude;
+    float    longitude;
+    float    altitude;
+    int      satellites;
+    int      gpsFix2;
+    int      satellites2;
+    // Fields 28-39
+    int      mpuOnline;
+    int      bmpOnline;
+    int      rtcOnline;
+    int      gpsOnline;
+    int      algoEnabled;
+    uint32_t normalRate;
+    uint32_t highRate;
+    float    hMaxCm;
+    int      floodZone;
+    int      realtimeMode;
+    uint32_t uptime;
+    int      healthScore;
+    // Meta
+    bool     valid;
+};
+```
+
+---
+
+## Section 6 — Add new global state variables
+
+After the existing globals block, add these entirely new globals:
+
+```cpp
+// ── Connectivity ─────────────────────────────────────────────
+ConnState connState         = CONN_NONE;
+bool      wifiConnected     = false;
+bool      simAvailable      = false;
+unsigned long lastWifiReconnectMs = 0;
+unsigned long lastPostMs    = 0;
+unsigned long lastConfigPollMs = 0;
+unsigned long lastOtaPollMs = 0;
+
+// ── Full reading (replaces DataReading) ──────────────────────
+FullReading lastReading;
+// (remove the old DataReading lastReading declaration)
+
+// ── CSV receive (GPIO2, 9600 baud via HardwareSerial) ────────
+// Serial1 configured at 9600 on GPIO2 RX, GPIO3 TX
+// GPIO3 TX also used for $CFG frames to S3 at 115200
+// NOTE: We use two different baud rates on the same UART1:
+//   RX at 9600 (CSV from S3 GPIO14)
+//   TX at 115200 ($CFG to S3 GPIO44)
+// ESP32 UART supports different TX/RX baud? No — same baud.
+// SOLUTION: Use separate UARTs.
+//   UART1 RX GPIO2 at 9600 for CSV receive
+//   UART1 TX GPIO3 at 9600 — but $CFG needs 115200
+//
+// ACTUAL SOLUTION:
+//   Serial1 = UART1, RX=GPIO2, TX=GPIO3, baud=9600 — CSV only
+//   $CFG frames sent via Serial2 = UART2, TX=GPIO3, baud=115200
+//   BUT XIAO C3 only has UART0 and UART1 in hardware
+//
+// FINAL CORRECT SOLUTION:
+//   Serial1 RX=GPIO2 baud=9600 — receives CSV from S3
+//   $CFG frames sent via direct byte writes to GPIO3
+//   using a second software UART TX at 115200
+//   OR: since $CFG frames are rare and short, buffer them
+//   and send at 9600 — S3 processC3Command() handles 9600
+//   because it uses Serial2.available() not baud-specific
+//
+// PRAGMATIC DECISION FOR HACKATHON:
+//   Use Serial1 at 9600 for BOTH directions.
+//   S3 already reads GPIO44 via Serial2 which accepts any baud
+//   that matches. Change S3 Serial2 to 9600 to match.
+//   $CFG frames are 20 chars — trivial at 9600.
+//   This avoids all UART conflict.
+
+// CSV line buffer
+#define CSV_LINE_BUFFER_SIZE 640
+char     csvRxBuffer[CSV_LINE_BUFFER_SIZE];
+uint16_t csvRxIndex    = 0;
+bool     csvRxReady    = false;
+char     csvFrameBuffer[CSV_LINE_BUFFER_SIZE];
+
+// ── WiFi HTTP ────────────────────────────────────────────────
+bool     wifiHttpBusy  = false;
+char     wifiRespBody[HTTP_RESP_BUFFER_SIZE];
+int      wifiRespCode  = 0;
+
+// ── OTA ─────────────────────────────────────────────────────
+OtaState otaState      = OTA_IDLE;
+char     otaFwUrl[192];
+char     otaFwFilename[64];
+uint32_t otaFwSize     = 0;
+uint32_t otaFwChecksum = 0;
+uint8_t  otaRetryCount = 0;
+char     otaLocalPath[32] = "/ota_fw.bin";
+uint32_t otaFlashedBytes  = 0;
+uint32_t otaDownloadedBytes = 0;
+unsigned long otaStateEntry = 0;
+bool     otaConfirmWaiting  = false;
+unsigned long otaBootWaitStart = 0;
+```
+
+---
+
+## Section 7 — Replace receiveFromS3() and parseDataFrame()
+
+The current `receiveFromS3()` looks for `$` start marker, which is correct for `$DATA` frames but wrong for 39-field CSV which has no `$` prefix. Replace both functions:
+
+```cpp
+// ============================================================
+// CSV RECEIVE FROM S3 — GPIO2, 9600 baud
+// S3 sends raw 39-field CSV lines terminated with \n
+// No $ prefix — just comma-separated values
+// ============================================================
+
+void receiveCSVFromS3() {
+    while (Serial1.available()) {
+        char c = (char)Serial1.read();
+
+        if (c == '\n') {
+            csvRxBuffer[csvRxIndex] = '\0';
+            if (csvRxIndex > 10) {  // minimum sane line length
+                csvRxReady = true;
+            }
+            csvRxIndex = 0;
+            return;
         }
-        success = gprsPostData();
-      }
-      if (success) {
-        activeChannel = TX_CHANNEL_GPRS;
-      }
-    }
-  }
 
-  // ── Attempt 2: WiFi fallback ──────────────────────────────────
-  if (!success) {
-    Serial.println("[TX] GPRS failed — trying WiFi fallback...");
+        if (c == '\r') continue;   // skip carriage return
 
-    if (!wifiConnected) {
-      wifiConnect();
+        if (csvRxIndex < CSV_LINE_BUFFER_SIZE - 1) {
+            csvRxBuffer[csvRxIndex++] = c;
+        } else {
+            // Line too long — discard and reset
+            csvRxIndex = 0;
+        }
     }
+}
+
+// Also receive $PING and $DIAG frames on the same UART
+// These start with $ — detect and route them
+void receiveCtrlFromS3() {
+    // Called only when csvRxReady is true
+    // If the line starts with $, it's a control frame not CSV
+}
+
+// Parse all 39 fields from a CSV line
+bool parseCSVLine(const char *line, FullReading *out) {
+    out->valid = false;
+
+    // Work on a copy
+    char copy[CSV_LINE_BUFFER_SIZE];
+    strncpy(copy, line, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+
+    // Count commas to verify field count
+    int commas = 0;
+    for (int i = 0; copy[i]; i++) if (copy[i] == ',') commas++;
+    if (commas < 38) return false;  // need at least 39 fields (38 commas)
+
+    char *tok;
+    char *rest = copy;
+
+    // Helper lambda equivalent using inline macro
+    #define NEXT_TOK() (tok = strtok_r(rest, ",", &rest))
+
+    // Fields 1-10
+    if (!NEXT_TOK()) return false; out->waterHeight   = atof(tok);
+    if (!NEXT_TOK()) return false; out->tiltX         = atof(tok);
+    if (!NEXT_TOK()) return false; out->tiltY         = atof(tok);
+    if (!NEXT_TOK()) return false; out->tiltAngle     = atof(tok);
+    if (!NEXT_TOK()) return false; out->lateralAccel  = atof(tok);
+    if (!NEXT_TOK()) return false; out->temperature   = atof(tok);
+    if (!NEXT_TOK()) return false; out->pressure      = atof(tok);
+    if (!NEXT_TOK()) return false; out->bmpTemp       = atof(tok);
+    if (!NEXT_TOK()) return false; out->atmosphericRef= atof(tok);
+    if (!NEXT_TOK()) return false; out->gaugePressure = atof(tok);
+
+    // Fields 11-19
+    if (!NEXT_TOK()) return false; out->mode          = atoi(tok);
+    if (!NEXT_TOK()) return false; out->depth         = atof(tok);
+    if (!NEXT_TOK()) return false; out->floodRatio    = atof(tok);
+    if (!NEXT_TOK()) return false; out->timestamp     = (uint32_t)strtoul(tok, NULL, 10);
+    if (!NEXT_TOK()) return false; strncpy(out->rtcString, tok, sizeof(out->rtcString)-1);
+    if (!NEXT_TOK()) return false; out->gpsFix        = atoi(tok);
+    if (!NEXT_TOK()) return false; out->tetherLength  = atof(tok);
+    if (!NEXT_TOK()) return false; out->alertLevel    = atoi(tok);
+    if (!NEXT_TOK()) return false; out->sampleSec     = (uint32_t)strtoul(tok, NULL, 10);
+
+    // Fields 20-27
+    if (!NEXT_TOK()) return false; out->battery       = atof(tok);
+    if (!NEXT_TOK()) return false; out->battVoltage   = atof(tok);
+    if (!NEXT_TOK()) return false; out->latitude      = atof(tok);
+    if (!NEXT_TOK()) return false; out->longitude     = atof(tok);
+    if (!NEXT_TOK()) return false; out->altitude      = atof(tok);
+    if (!NEXT_TOK()) return false; out->satellites    = atoi(tok);
+    if (!NEXT_TOK()) return false; out->gpsFix2       = atoi(tok);
+    if (!NEXT_TOK()) return false; out->satellites2   = atoi(tok);
+
+    // Fields 28-39
+    if (!NEXT_TOK()) return false; out->mpuOnline     = atoi(tok);
+    if (!NEXT_TOK()) return false; out->bmpOnline     = atoi(tok);
+    if (!NEXT_TOK()) return false; out->rtcOnline     = atoi(tok);
+    if (!NEXT_TOK()) return false; out->gpsOnline     = atoi(tok);
+    if (!NEXT_TOK()) return false; out->algoEnabled   = atoi(tok);
+    if (!NEXT_TOK()) return false; out->normalRate    = (uint32_t)strtoul(tok, NULL, 10);
+    if (!NEXT_TOK()) return false; out->highRate      = (uint32_t)strtoul(tok, NULL, 10);
+    if (!NEXT_TOK()) return false; out->hMaxCm        = atof(tok);
+    if (!NEXT_TOK()) return false; out->floodZone     = atoi(tok);
+    if (!NEXT_TOK()) return false; out->realtimeMode  = atoi(tok);
+    if (!NEXT_TOK()) return false; out->uptime        = (uint32_t)strtoul(tok, NULL, 10);
+    if (!NEXT_TOK()) return false; out->healthScore   = atoi(tok);
+
+    #undef NEXT_TOK
+
+    // Sanity checks
+    if (out->mode < 0 || out->mode > 3) return false;
+    if (out->battery < 0 || out->battery > 100) return false;
+
+    out->valid = true;
+    return true;
+}
+
+void processCSVFrame() {
+    if (!csvRxReady) return;
+
+    memcpy(csvFrameBuffer, csvRxBuffer, csvRxIndex + 1);
+    csvRxReady = false;
+
+    // Control frames start with $
+    if (csvFrameBuffer[0] == '$') {
+        // $PING → respond $PONG
+        if (strncmp(csvFrameBuffer, "$PING", 5) == 0) {
+            Serial1.print("$PONG\n");
+            return;
+        }
+        // $DIAG → POST to server diagnostic endpoint
+        if (strncmp(csvFrameBuffer, "$DIAG,", 6) == 0) {
+            // Build and POST diagnostic payload
+            // Use whichever connection is available
+            postDiagnostic(csvFrameBuffer);
+            return;
+        }
+        // Unknown control frame — ignore
+        return;
+    }
+
+    // Regular CSV data frame
+    FullReading reading;
+    if (parseCSVLine(csvFrameBuffer, &reading)) {
+        lastReading = reading;
+        newReadingAvailable = true;
+        lastS3DataTime = millis();
+
+        Serial.print("[CSV] H=");
+        Serial.print(reading.waterHeight, 1);
+        Serial.print("cm zone=");
+        Serial.print(reading.floodZone);
+        Serial.print(" bat=");
+        Serial.print(reading.battery, 0);
+        Serial.print("% health=");
+        Serial.println(reading.healthScore);
+    } else {
+        Serial.println("[CSV] Parse failed");
+    }
+}
+```
+
+---
+
+## Section 8 — Replace buildSinglePostBody() with buildFullPostBody()
+
+Current builds 4-field JSON. Replace:
+
+```cpp
+// Build full 39-field JSON for server POST
+// Server pushes this directly to Firebase varuna/live
+void buildFullPostBody(const FullReading *r, char *buf, uint16_t bufSize) {
+    snprintf(buf, bufSize,
+        "{"
+        "\"device_id\":\"%s\","
+        "\"waterHeight\":%.2f,"
+        "\"tiltX\":%.3f,"
+        "\"tiltY\":%.3f,"
+        "\"tiltAngle\":%.3f,"
+        "\"lateralAccel\":%.4f,"
+        "\"temperature\":%.2f,"
+        "\"pressure\":%.2f,"
+        "\"bmpTemp\":%.2f,"
+        "\"atmosphericRef\":%.2f,"
+        "\"gaugePressure\":%.1f,"
+        "\"mode\":%d,"
+        "\"depth\":%.4f,"
+        "\"floodRatio\":%.4f,"
+        "\"timestamp\":%lu,"
+        "\"rtcString\":\"%s\","
+        "\"gpsFix\":%d,"
+        "\"tetherLength\":%.3f,"
+        "\"alertLevel\":%d,"
+        "\"sampleSec\":%lu,"
+        "\"battery\":%.1f,"
+        "\"battVoltage\":%.2f,"
+        "\"latitude\":%.6f,"
+        "\"longitude\":%.6f,"
+        "\"altitude\":%.1f,"
+        "\"satellites\":%d,"
+        "\"mpuOnline\":%d,"
+        "\"bmpOnline\":%d,"
+        "\"rtcOnline\":%d,"
+        "\"gpsOnline\":%d,"
+        "\"algorithmEnabled\":%d,"
+        "\"normalRate\":%lu,"
+        "\"highRate\":%lu,"
+        "\"hMaxCm\":%.1f,"
+        "\"floodZone\":%d,"
+        "\"uptime\":%lu,"
+        "\"healthScore\":%d"
+        "}",
+        DEVICE_ID,
+        r->waterHeight, r->tiltX, r->tiltY, r->tiltAngle,
+        r->lateralAccel, r->temperature, r->pressure,
+        r->bmpTemp, r->atmosphericRef, r->gaugePressure,
+        r->mode, r->depth, r->floodRatio,
+        (unsigned long)r->timestamp, r->rtcString,
+        r->gpsFix, r->tetherLength, r->alertLevel,
+        (unsigned long)r->sampleSec,
+        r->battery, r->battVoltage,
+        r->latitude, r->longitude, r->altitude,
+        r->satellites,
+        r->mpuOnline, r->bmpOnline, r->rtcOnline,
+        r->gpsOnline, r->algoEnabled,
+        (unsigned long)r->normalRate, (unsigned long)r->highRate,
+        r->hMaxCm, r->floodZone,
+        (unsigned long)r->uptime, r->healthScore
+    );
+}
+```
+
+---
+
+## Section 9 — Add entire WiFi subsystem (new, doesn't exist at all)
+
+Add this entire block after the SIM800L section:
+
+```cpp
+// ============================================================
+// WIFI SUBSYSTEM
+// Runs independently of SIM800L
+// Used as primary path if SIM unavailable
+// ============================================================
+
+void wifiInit() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("[WIFI] Connecting to ");
+    Serial.print(WIFI_SSID);
+}
+
+void wifiMaintain() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiConnected) {
+            wifiConnected = true;
+            Serial.print("\n[WIFI] Connected — IP: ");
+            Serial.println(WiFi.localIP());
+        }
+    } else {
+        if (wifiConnected) {
+            wifiConnected = false;
+            Serial.println("[WIFI] Disconnected");
+        }
+        // Attempt reconnect every 30s
+        if (millis() - lastWifiReconnectMs >= WIFI_RECONNECT_MS) {
+            lastWifiReconnectMs = millis();
+            WiFi.reconnect();
+            Serial.println("[WIFI] Reconnecting...");
+        }
+    }
+}
+
+// Synchronous WiFi HTTP POST — blocks briefly but acceptable
+// because it's only called when GPRS is unavailable
+// Returns HTTP response code, body in wifiRespBody
+int wifiPost(const char *url, const char *body) {
+    if (!wifiConnected) return -1;
+
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(10000);
+
+    int code = http.POST((uint8_t*)body, strlen(body));
+
+    if (code > 0) {
+        String resp = http.getString();
+        strncpy(wifiRespBody, resp.c_str(), HTTP_RESP_BUFFER_SIZE - 1);
+        wifiRespBody[HTTP_RESP_BUFFER_SIZE - 1] = '\0';
+    } else {
+        wifiRespBody[0] = '\0';
+    }
+
+    http.end();
+    return code;
+}
+
+// Synchronous WiFi HTTP GET — for config and OTA command polling
+int wifiGet(const char *url) {
+    if (!wifiConnected) return -1;
+
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(8000);
+
+    int code = http.GET();
+
+    if (code > 0) {
+        String resp = http.getString();
+        strncpy(wifiRespBody, resp.c_str(), HTTP_RESP_BUFFER_SIZE - 1);
+        wifiRespBody[HTTP_RESP_BUFFER_SIZE - 1] = '\0';
+    } else {
+        wifiRespBody[0] = '\0';
+    }
+
+    http.end();
+    return code;
+}
+
+// WiFi HTTP GET for binary file download — writes to SD
+// Returns number of bytes downloaded, -1 on error
+int32_t wifiDownloadToSD(const char *url, const char *localPath) {
+    if (!wifiConnected) return -1;
+    if (!sdInitialized) return -1;
+
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(60000);  // 60s for firmware download
+
+    int code = http.GET();
+    if (code != 200) {
+        http.end();
+        return -1;
+    }
+
+    int32_t totalLen = http.getSize();
+    WiFiClient *stream = http.getStreamPtr();
+
+    // Delete existing file if present
+    if (SD.exists(localPath)) SD.remove(localPath);
+    File f = SD.open(localPath, FILE_WRITE);
+    if (!f) {
+        http.end();
+        return -1;
+    }
+
+    uint8_t dlBuf[256];
+    int32_t downloaded = 0;
+    unsigned long lastProgress = millis();
+
+    while (http.connected() && (totalLen == -1 || downloaded < totalLen)) {
+        size_t avail = stream->available();
+        if (avail) {
+            size_t toRead = min(avail, (size_t)256);
+            int n = stream->readBytes(dlBuf, toRead);
+            if (n > 0) {
+                f.write(dlBuf, n);
+                downloaded += n;
+            }
+        }
+        // Progress log every 5s
+        if (millis() - lastProgress > 5000) {
+            lastProgress = millis();
+            Serial.print("[OTA-DL] ");
+            Serial.print(downloaded);
+            Serial.print(" / ");
+            Serial.println(totalLen);
+            // Report progress to server
+            char progBody[128];
+            snprintf(progBody, sizeof(progBody),
+                "{\"device_id\":\"%s\",\"status\":\"DOWNLOADING\","
+                "\"progress\":\"%ld/%ld\"}",
+                DEVICE_ID, (long)downloaded, (long)totalLen);
+            wifiPost(SERVER_OTA_STAT_URL, progBody);
+        }
+        if (avail == 0 && !http.connected()) break;
+    }
+
+    f.close();
+    http.end();
+
+    Serial.print("[OTA-DL] Done: ");
+    Serial.print(downloaded);
+    Serial.println(" bytes");
+
+    return downloaded;
+}
+
+// Unified send — tries GPRS first, falls back to WiFi
+// Returns HTTP code
+int unifiedPost(const char *url, const char *body, bool readResponse) {
+    // Try GPRS first
+    if (gprsConnected && simReady && !httpBusy && simState == SIM_IDLE) {
+        // Use async GPRS path — caller must use callback pattern
+        // This function is for WiFi-path only
+        // GPRS path goes through httpStartPost()
+    }
+    // WiFi fallback
+    if (wifiConnected) {
+        int code = wifiPost(url, body);
+        if (readResponse && code == 200) {
+            checkServerConfigResponse(wifiRespBody);
+        }
+        return code;
+    }
+    return -1;
+}
+
+// Determine which connectivity path to use
+void updateConnState() {
+    if (gprsConnected && simReady) {
+        connState = CONN_GPRS;
+        simAvailable = true;
+    } else if (wifiConnected) {
+        connState = CONN_WIFI;
+        simAvailable = false;
+    } else {
+        connState = CONN_NONE;
+        simAvailable = false;
+    }
+}
+```
+
+---
+
+## Section 10 — Add OTA state machine (new, doesn't exist at all)
+
+This is the largest new addition. Add this entire block:
+
+```cpp
+// ============================================================
+// ESP SERIAL BOOTLOADER PROTOCOL — simplified esptool subset
+// Implements: SYNC → FLASH_BEGIN → FLASH_DATA (blocks) →
+//             FLASH_END → reboot
+// Reference: ESP8266/ESP32 Serial Protocol documentation
+// ============================================================
+
+// SLIP encode a byte into output buffer
+// Returns number of bytes written
+int slipEncodeByte(uint8_t b, uint8_t *out) {
+    if (b == ESP_SLIP_END) {
+        out[0] = ESP_SLIP_ESC;
+        out[1] = ESP_SLIP_ESC_END;
+        return 2;
+    } else if (b == ESP_SLIP_ESC) {
+        out[0] = ESP_SLIP_ESC;
+        out[1] = ESP_SLIP_ESC_ESC;
+        return 2;
+    } else {
+        out[0] = b;
+        return 1;
+    }
+}
+
+// Compute ESP checksum (XOR of all data bytes)
+uint8_t espChecksum(const uint8_t *data, uint32_t len) {
+    uint8_t cs = 0xEF;
+    for (uint32_t i = 0; i < len; i++) cs ^= data[i];
+    return cs;
+}
+
+// Send a SLIP-framed ESP command
+// cmd: command byte, data: payload, dataLen: payload length
+void espSendCommand(HardwareSerial &ser, uint8_t cmd,
+                    const uint8_t *data, uint32_t dataLen,
+                    uint8_t checksum) {
+    // SLIP start
+    ser.write(ESP_SLIP_END);
+
+    // Direction byte (0x00 = request)
+    ser.write((uint8_t)0x00);
+
+    // Command
+    ser.write(cmd);
+
+    // Data length (2 bytes LE)
+    uint8_t lenBuf[2];
+    lenBuf[0] = dataLen & 0xFF;
+    lenBuf[1] = (dataLen >> 8) & 0xFF;
+    uint8_t encBuf[2];
+    for (int i = 0; i < 2; i++) {
+        int n = slipEncodeByte(lenBuf[i], encBuf);
+        ser.write(encBuf, n);
+    }
+
+    // Checksum (4 bytes LE, only low byte meaningful)
+    uint8_t csBuf[4] = {checksum, 0, 0, 0};
+    for (int i = 0; i < 4; i++) {
+        int n = slipEncodeByte(csBuf[i], encBuf);
+        ser.write(encBuf, n);
+    }
+
+    // Data
+    for (uint32_t i = 0; i < dataLen; i++) {
+        int n = slipEncodeByte(data[i], encBuf);
+        ser.write(encBuf, n);
+    }
+
+    // SLIP end
+    ser.write(ESP_SLIP_END);
+    ser.flush();
+}
+
+// Wait for ESP response, return true if success (0x01 in response[1])
+bool espWaitResponse(HardwareSerial &ser, uint8_t expectedCmd,
+                     uint32_t timeoutMs) {
+    uint8_t resp[32];
+    uint8_t ri = 0;
+    bool inSlip = false;
+    unsigned long start = millis();
+
+    while (millis() - start < timeoutMs) {
+        if (!ser.available()) {
+            delay(1);
+            continue;
+        }
+        uint8_t b = ser.read();
+
+        if (b == ESP_SLIP_END) {
+            if (inSlip && ri > 4) {
+                // End of packet — check response
+                // Response format: 0x01, cmd, size(2), val(4), data...
+                if (ri >= 8 && resp[0] == 0x01 &&
+                    resp[1] == expectedCmd) {
+                    // resp[4] is the error byte
+                    return (resp[4] == 0x00);
+                }
+            }
+            inSlip = !inSlip;
+            ri = 0;
+            continue;
+        }
+
+        if (inSlip) {
+            if (b == ESP_SLIP_ESC) continue;  // next byte handled below
+            if (ri < sizeof(resp)) resp[ri++] = b;
+        }
+    }
+    return false;
+}
+
+// Sync with ESP32 bootloader (10 attempts)
+bool bootloaderSync(HardwareSerial &ser) {
+    uint8_t syncData[36];
+    syncData[0] = 0x07;
+    syncData[1] = 0x07;
+    syncData[2] = 0x12;
+    syncData[3] = 0x20;
+    for (int i = 4; i < 36; i++) syncData[i] = 0x55;
+
+    for (int attempt = 0; attempt < OTA_SYNC_ATTEMPTS; attempt++) {
+        // Flush
+        while (ser.available()) ser.read();
+
+        espSendCommand(ser, ESP_SYNC, syncData, 36, 0);
+
+        if (espWaitResponse(ser, ESP_SYNC, 1000)) {
+            Serial.println("[BOOT] Sync OK");
+            return true;
+        }
+        delay(100);
+    }
+    Serial.println("[BOOT] Sync FAILED");
+    return false;
+}
+
+// Begin flash write operation
+// flashAddr: starting flash address (usually 0x10000 for app)
+// totalSize: total firmware size
+// numBlocks: ceil(totalSize / OTA_FLASH_BLOCK_SIZE)
+bool bootloaderFlashBegin(HardwareSerial &ser, uint32_t flashAddr,
+                          uint32_t totalSize, uint32_t numBlocks) {
+    uint8_t payload[16];
+    // erase size
+    payload[0]  = totalSize & 0xFF;
+    payload[1]  = (totalSize >> 8)  & 0xFF;
+    payload[2]  = (totalSize >> 16) & 0xFF;
+    payload[3]  = (totalSize >> 24) & 0xFF;
+    // num blocks
+    payload[4]  = numBlocks & 0xFF;
+    payload[5]  = (numBlocks >> 8)  & 0xFF;
+    payload[6]  = (numBlocks >> 16) & 0xFF;
+    payload[7]  = (numBlocks >> 24) & 0xFF;
+    // block size
+    payload[8]  = OTA_FLASH_BLOCK_SIZE & 0xFF;
+    payload[9]  = (OTA_FLASH_BLOCK_SIZE >> 8)  & 0xFF;
+    payload[10] = (OTA_FLASH_BLOCK_SIZE >> 16) & 0xFF;
+    payload[11] = (OTA_FLASH_BLOCK_SIZE >> 24) & 0xFF;
+    // flash offset
+    payload[12] = flashAddr & 0xFF;
+    payload[13] = (flashAddr >> 8)  & 0xFF;
+    payload[14] = (flashAddr >> 16) & 0xFF;
+    payload[15] = (flashAddr >> 24) & 0xFF;
+
+    espSendCommand(ser, ESP_FLASH_BEGIN, payload, 16, 0);
+    return espWaitResponse(ser, ESP_FLASH_BEGIN, 10000);
+}
+
+// Send one block of flash data
+bool bootloaderFlashBlock(HardwareSerial &ser, const uint8_t *data,
+                          uint32_t dataLen, uint32_t seqNum) {
+    // Payload: data_len(4) + seq(4) + 0(4) + 0(4) + data
+    uint32_t payloadLen = 16 + dataLen;
+    uint8_t *payload = (uint8_t*)malloc(payloadLen);
+    if (!payload) return false;
+
+    payload[0]  = dataLen & 0xFF;
+    payload[1]  = (dataLen >> 8) & 0xFF;
+    payload[2]  = (dataLen >> 16) & 0xFF;
+    payload[3]  = (dataLen >> 24) & 0xFF;
+    payload[4]  = seqNum & 0xFF;
+    payload[5]  = (seqNum >> 8) & 0xFF;
+    payload[6]  = (seqNum >> 16) & 0xFF;
+    payload[7]  = (seqNum >> 24) & 0xFF;
+    payload[8]  = 0; payload[9]  = 0;
+    payload[10] = 0; payload[11] = 0;
+    payload[12] = 0; payload[13] = 0;
+    payload[14] = 0; payload[15] = 0;
+    memcpy(payload + 16, data, dataLen);
+
+    uint8_t cs = espChecksum(payload + 16, dataLen);
+
+    espSendCommand(ser, ESP_FLASH_DATA, payload, payloadLen, cs);
+    bool ok = espWaitResponse(ser, ESP_FLASH_DATA, 5000);
+
+    free(payload);
+    return ok;
+}
+
+// End flash, reboot
+bool bootloaderFlashEnd(HardwareSerial &ser) {
+    uint8_t payload[4] = {0, 0, 0, 0};  // reboot flag = 0 = run after flash
+    espSendCommand(ser, ESP_FLASH_END, payload, 4, 0);
+    return espWaitResponse(ser, ESP_FLASH_END, 3000);
+}
+
+// Force S3 into bootloader mode using GPIO9 (BOOT) and GPIO10 (EN)
+void s3EnterBootloader() {
+    Serial.println("[OTA] Entering S3 bootloader mode");
+    digitalWrite(OTA_BOOT_PIN, LOW);     // hold BOOT low
+    delay(50);
+    digitalWrite(OTA_RESET_PIN, LOW);    // pull EN low (reset)
+    delay(200);
+    digitalWrite(OTA_RESET_PIN, HIGH);   // release EN — S3 starts resetting
+    delay(500);                          // wait for bootloader to initialise
+    // BOOT can be released now — bootloader is already running
+    digitalWrite(OTA_BOOT_PIN, HIGH);
+    Serial.println("[OTA] S3 now in download mode");
+}
+
+// Reboot S3 into normal firmware
+void s3Reboot() {
+    Serial.println("[OTA] Rebooting S3 into new firmware");
+    digitalWrite(OTA_BOOT_PIN, HIGH);   // ensure normal boot
+    delay(50);
+    digitalWrite(OTA_RESET_PIN, LOW);
+    delay(200);
+    digitalWrite(OTA_RESET_PIN, HIGH);
+    Serial.println("[OTA] S3 rebooting...");
+}
+
+// Report OTA status to server (tries WiFi then GPRS)
+void otaReportStatus(const char *status, const char *progress) {
+    char body[256];
+    snprintf(body, sizeof(body),
+        "{\"device_id\":\"%s\",\"status\":\"%s\",\"progress\":\"%s\"}",
+        DEVICE_ID, status, progress ? progress : "");
 
     if (wifiConnected) {
-      success = firebasePostData();
-      if (success) {
-        activeChannel = TX_CHANNEL_WIFI;
-      }
-      // Disconnect WiFi after use to save power
-      // (only if GPRS is the primary — keep WiFi if no SIM)
-      if (simAvailable) {
-        wifiDisconnect();
-      }
+        wifiPost(SERVER_OTA_STAT_URL, body);
     }
-  }
-
-  // ── Update tracking ───────────────────────────────────────────
-  if (success) {
-    lastSuccessfulTx = millis();
-    txSuccessCount++;
-    consecutiveFails = 0;
-    pendingTransmit  = false;
-    Serial.printf("[TX] SUCCESS via %s. Total: %lu  Fails: %lu\n",
-                  (activeChannel == TX_CHANNEL_GPRS) ? "GPRS" : "WiFi",
-                  txSuccessCount, txFailCount);
-  } else {
-    txFailCount++;
-    consecutiveFails++;
-    activeChannel = TX_CHANNEL_NONE;
-    Serial.printf("[TX] FAILED. Consecutive fails: %lu  Total fails: %lu\n",
-                  consecutiveFails, txFailCount);
-
-    // If too many consecutive failures, try SIM800L hard reset
-    if (consecutiveFails >= 5 && simAvailable) {
-      Serial.println("[TX] 5 consecutive fails — hard-resetting SIM800L...");
-      gprsDisconnect();
-      simAvailable = simInit();
-      if (simAvailable) {
-        gprsConnect();
-      }
-      consecutiveFails = 0;  // reset counter regardless
-    }
-  }
-
-  Serial.println("[TX] ═══════════════════════════════════════\n");
-  return success;
+    // GPRS path: if simReady and not busy, post via GPRS
+    // For simplicity during hackathon, WiFi path covers this
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  PHASE 4D — INBOUND SMS DIAGNOSTIC CHANNEL
-//  Allows field engineers to send a command via SMS when no
-//  laptop/WiFi is available. This is diagnostic only — has zero
-//  involvement in the alert pipeline.
-// ─────────────────────────────────────────────────────────────────
+// Compute simple checksum matching server's algorithm
+uint32_t computeFileChecksum(const char *path) {
+    if (!sdInitialized) return 0;
+    File f = SD.open(path, FILE_READ);
+    if (!f) return 0;
 
-/*
- * Check for and process inbound SMS messages.
- * Supported commands (same as serial, subset):
- *   STATUS    — returns full status via SMS reply
- *   PING      — returns PONG + uptime
- *   CAL       — triggers recalibration (algo must be off)
- *   GETCONFIG — returns OLP, thresholds, intervals
- *
- * All other commands are ignored (no alert routing here).
- */
-void checkInboundSMS() {
-  if (!simAvailable) return;
-
-  // Check for new SMS in text mode
-  char listBuf[512];
-  simSendCmd("AT+CMGF=1", "OK", 2000);  // text mode
-
-  if (!simSendCmd("AT+CMGL=\"REC UNREAD\"", "+CMGL:", 5000, listBuf, sizeof(listBuf))) {
-    return;  // no unread messages
-  }
-
-  // Parse sender number and message body
-  // Format: +CMGL: <index>,"REC UNREAD","<number>",...\r\n<message body>\r\n
-  char* msgStart = strstr(listBuf, "+CMGL:");
-  if (!msgStart) return;
-
-  // Extract sender number
-  char senderNum[20] = {0};
-  char* q1 = strchr(msgStart, '\"');
-  if (q1) q1 = strchr(q1 + 1, '\"');  // skip "REC UNREAD"
-  if (q1) q1 = strchr(q1 + 1, '\"');  // start of number
-  if (q1) {
-    char* q2 = strchr(q1 + 1, '\"');
-    if (q2 && (q2 - q1 - 1) < (int)sizeof(senderNum)) {
-      strncpy(senderNum, q1 + 1, q2 - q1 - 1);
+    uint32_t sum = 0;
+    while (f.available()) {
+        sum = (sum + (uint8_t)f.read()) & 0xFFFFFFFF;
     }
-  }
+    f.close();
+    return sum;
+}
 
-  // Extract message body (after the last \n of the header line)
-  char* bodyStart = strstr(msgStart, "\r\n");
-  if (bodyStart) {
-    bodyStart += 2;  // skip \r\n
-    char* bodyEnd = strstr(bodyStart, "\r\n");
-    if (!bodyEnd) bodyEnd = bodyStart + strlen(bodyStart);
+// ============================================================
+// OTA STATE MACHINE
+// Triggered by server writing ota/command = "FLASH" to Firebase
+// C3 polls via GET /api/ota/command/VARUNA_001
+// ============================================================
 
-    int bodyLen = bodyEnd - bodyStart;
-    if (bodyLen > 0 && bodyLen < SMS_BUF_SIZE) {
-      strncpy(smsBuf, bodyStart, bodyLen);
-      smsBuf[bodyLen] = '\0';
+// Poll server for OTA commands (called from loop periodically)
+void pollOtaCommand() {
+    if (otaState != OTA_IDLE) return;
 
-      // Trim and uppercase
-      String cmd = String(smsBuf);
-      cmd.trim();
-      cmd.toUpperCase();
+    // Need connectivity
+    if (!wifiConnected && !gprsConnected) return;
 
-      Serial.printf("[SMS] From %s: '%s'\n", senderNum, cmd.c_str());
+    int code = -1;
+    if (wifiConnected) {
+        code = wifiGet(SERVER_OTA_CMD_URL);
+    }
+    if (code != 200) return;
 
-      // Process command and build reply
-      char reply[300] = {0};
+    // Parse response for command field
+    // Response: {"command":"FLASH","url":"...","size":...,"checksum":...}
+    const char *cmdPtr = strstr(wifiRespBody, "\"command\":");
+    if (!cmdPtr) return;
 
-      if (cmd == "STATUS") {
-        snprintf(reply, sizeof(reply),
-                 "VARUNA %s\nH:%.0fcm %s\nLevel:%s Zone:%s\n"
-                 "Rate:%.1fcm/15m\nBatt:%d%% HP:%d\nUp:%lus",
-                 DEVICE_ID, waterHeightCm, modeStr(currentMode),
-                 levelStr(currentResponseLevel), zoneStr(currentZone),
-                 ratePer15Min, (int)batteryPercent, healthScore,
-                 millis() / 1000);
-      }
-      else if (cmd == "PING") {
-        snprintf(reply, sizeof(reply), "PONG %s uptime:%lus",
-                 DEVICE_ID, millis() / 1000);
-      }
-      else if (cmd == "GETCONFIG") {
-        snprintf(reply, sizeof(reply),
-                 "OLP:%.0fcm A:%d W:%d D:%d\nAlgo:%s Sig:%d/31\n"
-                 "Sample:%lus TX:%lus",
-                 olpLengthCm, alertLevelCm, warnLevelCm, dangerLevelCm,
-                 algorithmEnabled ? "ON" : "OFF", simSignalQuality,
-                 sampleInterval / 1000, transmitInterval / 1000);
-      }
-      else if (cmd == "CAL") {
-        if (!algorithmEnabled) {
-          mpuCalibrate();
-          snprintf(reply, sizeof(reply), "CAL OK — gyro offsets updated.");
-        } else {
-          snprintf(reply, sizeof(reply), "ERR: Disable algo first (ALGOOFF).");
+    if (strstr(cmdPtr, "\"FLASH\"") || strstr(cmdPtr, "\"CHECK_READY\"")) {
+        Serial.println("[OTA] Command received: FLASH");
+
+        // Extract url
+        const char *urlPtr = strstr(wifiRespBody, "\"url\":\"");
+        if (urlPtr) {
+            urlPtr += 7;
+            int ui = 0;
+            while (*urlPtr && *urlPtr != '"' && ui < 191) {
+                otaFwUrl[ui++] = *urlPtr++;
+            }
+            otaFwUrl[ui] = '\0';
         }
-      }
-      else if (cmd == "ALGOON") {
-        algorithmEnabled = true;
-        digitalWrite(ALGO_LED, LOW);
-        lastSampleTime = millis();
-        updateAdaptiveIntervals();
-        snprintf(reply, sizeof(reply), "ALGO ENABLED");
-      }
-      else if (cmd == "ALGOOFF") {
-        algorithmEnabled = false;
-        digitalWrite(ALGO_LED, HIGH);
-        snprintf(reply, sizeof(reply), "ALGO DISABLED");
-      }
-      else {
-        snprintf(reply, sizeof(reply), "Unknown cmd. Try: STATUS PING GETCONFIG CAL");
-      }
 
-      // Send reply SMS
-      if (strlen(reply) > 0 && strlen(senderNum) > 0) {
-        simSendSMS(senderNum, reply);
-      }
+        // Extract size
+        const char *szPtr = strstr(wifiRespBody, "\"size\":");
+        if (szPtr) otaFwSize = strtoul(szPtr + 7, NULL, 10);
+
+        // Extract checksum
+        const char *csPtr = strstr(wifiRespBody, "\"checksum\":");
+        if (csPtr) otaFwChecksum = strtoul(csPtr + 11, NULL, 10);
+
+        Serial.print("[OTA] URL: "); Serial.println(otaFwUrl);
+        Serial.print("[OTA] Size: "); Serial.println(otaFwSize);
+
+        // Gate 1: readiness check
+        otaState = OTA_CHECKING;
+        otaStateEntry = millis();
+
+        // Check flood zone — refuse if zone >= 2 (WARNING or DANGER)
+        if (lastReading.valid && lastReading.floodZone >= 2) {
+            Serial.println("[OTA] REFUSED — active flood event");
+            otaReportStatus("BUSY:FLOOD_EVENT_ACTIVE", "");
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // Check connectivity for download
+        if (!wifiConnected && !gprsConnected) {
+            Serial.println("[OTA] REFUSED — no connectivity");
+            otaReportStatus("BUSY:NO_CONNECTIVITY", "");
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // Check SD space
+        if (!sdInitialized) {
+            Serial.println("[OTA] REFUSED — no SD card");
+            otaReportStatus("BUSY:NO_SD", "");
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // All good — report READY and advance to DOWNLOADING
+        // (hackathon: skip engineer confirm step, proceed immediately)
+        otaReportStatus("READY", "");
+        otaState = OTA_DOWNLOADING;
+        otaStateEntry = millis();
+        otaDownloadedBytes = 0;
+
+        Serial.println("[OTA] Advancing to DOWNLOADING");
     }
-  }
-
-  // Delete all read messages to free SIM memory
-  simSendCmd("AT+CMGDA=\"DEL READ\"", "OK", 5000);
 }
 
-/*
- * Send an SMS to the specified number.
- * Used only for diagnostic replies — NOT for flood alerts.
- */
-bool simSendSMS(const char* number, const char* message) {
-  Serial.printf("[SMS] Sending to %s: %s\n", number, message);
+void runOtaStateMachine() {
+    if (otaState == OTA_IDLE) return;
 
-  simSendCmd("AT+CMGF=1", "OK", 2000);  // text mode
+    switch (otaState) {
 
-  char cmd[64];
-  snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", number);
+    case OTA_DOWNLOADING: {
+        Serial.println("[OTA] Starting firmware download...");
+        otaReportStatus("DOWNLOADING", "0");
 
-  // Send command and wait for '>' prompt
-  while (SimSerial.available()) SimSerial.read();
-  SimSerial.println(cmd);
+        int32_t dlBytes = -1;
 
-  uint32_t start = millis();
-  bool gotPrompt = false;
-  while (millis() - start < 5000) {
-    if (SimSerial.available()) {
-      char c = SimSerial.read();
-      if (c == '>') { gotPrompt = true; break; }
+        if (wifiConnected) {
+            dlBytes = wifiDownloadToSD(otaFwUrl, otaLocalPath);
+        }
+
+        if (dlBytes <= 0) {
+            Serial.println("[OTA] Download FAILED");
+            otaReportStatus("OTA_FAILED:DOWNLOAD", "");
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        otaDownloadedBytes = (uint32_t)dlBytes;
+        Serial.print("[OTA] Downloaded: "); Serial.println(dlBytes);
+
+        otaReportStatus("VERIFYING", "");
+        otaState = OTA_VERIFYING;
+        break;
     }
-    delay(10);
-  }
 
-  if (!gotPrompt) {
-    Serial.println("[SMS] No '>' prompt — send failed.");
-    SimSerial.write(0x1B);  // ESC to cancel
-    return false;
-  }
+    case OTA_VERIFYING: {
+        Serial.println("[OTA] Verifying checksum...");
 
-  // Send message body + Ctrl+Z to terminate
-  SimSerial.print(message);
-  SimSerial.write(0x1A);  // Ctrl+Z
+        uint32_t computed = computeFileChecksum(otaLocalPath);
+        Serial.print("[OTA] Expected: "); Serial.println(otaFwChecksum);
+        Serial.print("[OTA] Computed: "); Serial.println(computed);
 
-  // Wait for +CMGS or ERROR
-  char respBuf[128];
-  if (simSendCmd("", "+CMGS:", 15000, respBuf, sizeof(respBuf))) {
-    Serial.println("[SMS] Sent OK.");
-    return true;
-  }
+        if (computed != otaFwChecksum) {
+            Serial.println("[OTA] Checksum MISMATCH");
+            otaReportStatus("OTA_FAILED:CHECKSUM", "");
+            SD.remove(otaLocalPath);
+            otaState = OTA_IDLE;
+            return;
+        }
 
-  Serial.println("[SMS] Send failed or timed out.");
-  return false;
+        Serial.println("[OTA] Checksum OK");
+        otaReportStatus("FLASHING", "0");
+        otaState = OTA_FLASHING;
+        otaFlashedBytes = 0;
+        break;
+    }
+
+    case OTA_FLASHING: {
+        Serial.println("[OTA] Starting S3 flash...");
+
+        // Reconfigure SIM serial pins to act as bootloader UART
+        // SIM_RX_PIN (GPIO20) becomes bootloader ACK input from S3
+        // We temporarily repurpose SimSerial (UART0) for bootloader
+        // First: stop SIM AT engine
+        gprsConnected = false;
+        simReady = false;
+
+        // Reconfigure UART0 for bootloader protocol at 115200
+        SimSerial.end();
+        delay(100);
+        SimSerial.begin(BOOTLOADER_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+        delay(100);
+
+        // Force S3 into bootloader mode
+        s3EnterBootloader();
+        delay(500);
+
+        // Sync with bootloader
+        bool synced = bootloaderSync(SimSerial);
+        if (!synced) {
+            if (otaRetryCount < OTA_MAX_RETRIES) {
+                otaRetryCount++;
+                Serial.print("[OTA] Sync failed, retry ");
+                Serial.println(otaRetryCount);
+                s3EnterBootloader();
+                delay(500);
+                synced = bootloaderSync(SimSerial);
+            }
+        }
+
+        if (!synced) {
+            Serial.println("[OTA] Bootloader sync FAILED — aborting");
+            otaReportStatus("OTA_FAILED:SYNC", "");
+            // Reboot S3 anyway to restore normal mode
+            s3Reboot();
+            // Restore SIM serial
+            SimSerial.end();
+            SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+            simSetState(SIM_OFF);
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // Open firmware file
+        File fwFile = SD.open(otaLocalPath, FILE_READ);
+        if (!fwFile) {
+            Serial.println("[OTA] Cannot open firmware file");
+            otaReportStatus("OTA_FAILED:FILE", "");
+            s3Reboot();
+            SimSerial.end();
+            SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+            simSetState(SIM_OFF);
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        uint32_t fwSize = fwFile.size();
+        uint32_t numBlocks = (fwSize + OTA_FLASH_BLOCK_SIZE - 1) / OTA_FLASH_BLOCK_SIZE;
+
+        Serial.print("[OTA] FW size: "); Serial.print(fwSize);
+        Serial.print(" blocks: "); Serial.println(numBlocks);
+
+        // Flash begin — ESP32 app partition starts at 0x10000
+        if (!bootloaderFlashBegin(SimSerial, 0x10000, fwSize, numBlocks)) {
+            Serial.println("[OTA] FlashBegin FAILED");
+            fwFile.close();
+            otaReportStatus("OTA_FAILED:FLASH_BEGIN", "");
+            s3Reboot();
+            SimSerial.end();
+            SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+            simSetState(SIM_OFF);
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // Flash data blocks
+        uint8_t blockBuf[OTA_FLASH_BLOCK_SIZE];
+        uint32_t seqNum = 0;
+        bool flashOk = true;
+
+        while (fwFile.available() && flashOk) {
+            // Read one block (pad with 0xFF if partial)
+            memset(blockBuf, 0xFF, OTA_FLASH_BLOCK_SIZE);
+            uint32_t bytesRead = fwFile.read(blockBuf, OTA_FLASH_BLOCK_SIZE);
+
+            if (!bootloaderFlashBlock(SimSerial, blockBuf,
+                                      OTA_FLASH_BLOCK_SIZE, seqNum)) {
+                Serial.print("[OTA] Block "); Serial.print(seqNum);
+                Serial.println(" FAILED");
+                flashOk = false;
+                break;
+            }
+
+            otaFlashedBytes += bytesRead;
+            seqNum++;
+
+            // Progress every 10 blocks
+            if (seqNum % 10 == 0) {
+                char prog[32];
+                snprintf(prog, sizeof(prog), "%lu/%lu",
+                    (unsigned long)seqNum, (unsigned long)numBlocks);
+                otaReportStatus("FLASHING", prog);
+                Serial.print("[OTA] Block "); Serial.print(seqNum);
+                Serial.print("/"); Serial.println(numBlocks);
+            }
+        }
+
+        fwFile.close();
+
+        if (!flashOk) {
+            otaReportStatus("OTA_FAILED:FLASH_DATA", "");
+            s3Reboot();
+            SimSerial.end();
+            SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+            simSetState(SIM_OFF);
+            otaState = OTA_IDLE;
+            return;
+        }
+
+        // Flash end — trigger reboot of S3
+        bootloaderFlashEnd(SimSerial);
+        Serial.println("[OTA] Flash complete");
+
+        // Restore SIM serial
+        SimSerial.end();
+        delay(200);
+        SimSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+
+        // Reboot S3 via RESET pin
+        s3Reboot();
+
+        // Clean up firmware file
+        SD.remove(otaLocalPath);
+
+        // Advance to boot confirmation
+        otaState = OTA_CONFIRMING;
+        otaBootWaitStart = millis();
+        otaRetryCount = 0;
+
+        // Restart SIM state machine
+        simSetState(SIM_OFF);
+
+        Serial.println("[OTA] Waiting for S3 boot confirmation...");
+        break;
+    }
+
+    case OTA_CONFIRMING: {
+        // Watch GPIO2 (Serial1) for CSV lines resuming
+        // If 3 valid CSV lines received → success
+        // Timeout after OTA_BOOT_CONFIRM_MS
+
+        // csvRxReady is set by receiveCSVFromS3() in main loop
+        // lastReading.valid gets set when CSV parses successfully
+
+        static uint8_t confirmCount = 0;
+
+        if (newReadingAvailable && lastReading.valid) {
+            newReadingAvailable = false;
+            confirmCount++;
+            Serial.print("[OTA] Boot confirm ");
+            Serial.print(confirmCount);
+            Serial.println("/3");
+
+            if (confirmCount >= 3) {
+                confirmCount = 0;
+                Serial.println("[OTA] ✓ S3 booted successfully");
+                otaReportStatus("OTA_COMPLETE", "");
+                otaState = OTA_COMPLETE;
+            }
+            return;
+        }
+
+        if (millis() - otaBootWaitStart > OTA_BOOT_CONFIRM_MS) {
+            confirmCount = 0;
+
+            if (otaRetryCount < OTA_MAX_RETRIES) {
+                otaRetryCount++;
+                Serial.println("[OTA] Boot timeout — reflashing...");
+                otaReportStatus("OTA_RETRY", "");
+                otaState = OTA_FLASHING;
+            } else {
+                Serial.println("[OTA] Boot confirm FAILED");
+                otaReportStatus("OTA_FAILED:NO_BOOT", "");
+                otaState = OTA_FAILED;
+            }
+        }
+        break;
+    }
+
+    case OTA_COMPLETE:
+        // Reset to idle after a moment
+        otaState = OTA_IDLE;
+        otaRetryCount = 0;
+        Serial.println("[OTA] State machine reset to IDLE");
+        break;
+
+    case OTA_FAILED:
+        // Log and reset
+        Serial.println("[OTA] Failed — returning to normal operation");
+        otaState = OTA_IDLE;
+        otaRetryCount = 0;
+        break;
+
+    default:
+        break;
+    }
 }
 ```
 
 ---
 
-## Block 4: Updates to `updateHealthScore()`
+## Section 11 — postDiagnostic() helper (new)
 
-**Location: Replace your existing `updateHealthScore()` function (around line 520) with:**
+Add this small function before processCSVFrame():
 
 ```cpp
-void updateHealthScore() {
-  healthScore = 100;
-  if (!mpuHealthy)    healthScore -= 30;
-  if (!bmpAvailable)  healthScore -= 20;
-  if (!simAvailable)  healthScore -= 15;
-  if (batteryState == 1) healthScore -= 10;
-  if (batteryState == 2) healthScore -= 25;
-  if (mpuFrozenCount > 0) healthScore -= 10;
-  if (consecutiveFails > 3) healthScore -= 10;
-  if (simSignalQuality > 0 && simSignalQuality < 8) healthScore -= 5;
-  healthScore = max(0, healthScore);
+void postDiagnostic(const char *diagFrame) {
+    char body[640];
+    snprintf(body, sizeof(body),
+        "{\"device_id\":\"%s\",\"raw\":\"%s\"}",
+        DEVICE_ID, diagFrame);
+
+    if (wifiConnected) {
+        int code = wifiPost(SERVER_DIAG_URL, body);
+        Serial.print("[DIAG] POST code: "); Serial.println(code);
+    } else if (gprsConnected && !httpBusy) {
+        httpStartPost(SERVER_DIAG_URL, body, onDiagPostDone);
+    }
 }
 ```
 
 ---
 
-## Block 5: Updates to `printStatus()`
+## Section 12 — Replace opStateMachine() POST calls
 
-**Location: Inside your existing `printStatus()` function, add these lines before the closing `Serial.println("====================");`:**
+Every call to `buildSinglePostBody()` and `httpStartPost(SERVER_URL, ...)` needs to become dual-path. Replace the body-building and posting in all four OP states:
 
+**In OP_NORMAL and OP_REALTIME, replace:**
 ```cpp
-  Serial.printf("  SIM800L       : %s\n",        simAvailable ? "OK" : "UNAVAILABLE");
-  Serial.printf("  GPRS          : %s\n",        gprsConnected ? "CONNECTED" : "DOWN");
-  Serial.printf("  Signal (CSQ)  : %d/31\n",     simSignalQuality);
-  Serial.printf("  WiFi          : %s\n",        wifiConnected ? "CONNECTED" : "OFF");
-  Serial.printf("  TX Channel    : %s\n",
-                activeChannel == TX_CHANNEL_GPRS ? "GPRS" :
-                activeChannel == TX_CHANNEL_WIFI ? "WIFI" : "NONE");
-  Serial.printf("  TX Success    : %lu\n",       txSuccessCount);
-  Serial.printf("  TX Fails      : %lu (consec: %lu)\n", txFailCount, consecutiveFails);
-  Serial.printf("  Last TX       : %lu s ago\n",
-                lastSuccessfulTx > 0 ? (millis() - lastSuccessfulTx) / 1000 : 0);
+char body[HTTP_BODY_BUFFER_SIZE];
+buildSinglePostBody(&lastReading, body, sizeof(body));
+httpStartPost(SERVER_URL, body, onNormalPostDone);
+```
+
+**With:**
+```cpp
+char body[HTTP_BODY_BUFFER_SIZE];
+buildFullPostBody(&lastReading, body, sizeof(body));
+
+if (connState == CONN_GPRS && !httpBusy) {
+    httpStartPost(SERVER_DATA_URL, body, onNormalPostDone);
+} else if (connState == CONN_WIFI) {
+    int code = wifiPost(SERVER_DATA_URL, body);
+    onNormalPostDone(code == 200 || code == 201, code);
+    if (code == 200) checkServerConfigResponse(wifiRespBody);
+}
+```
+
+**In OP_OFFLINE recovery test, replace:**
+```cpp
+httpStartPost(SERVER_TEST_URL, testBody, onRecoveryTestDone);
+```
+
+**With:**
+```cpp
+if (connState == CONN_GPRS && !httpBusy) {
+    httpStartPost(SERVER_TEST_URL, testBody, onRecoveryTestDone);
+} else if (connState == CONN_WIFI) {
+    int code = wifiPost(SERVER_TEST_URL, testBody);
+    onRecoveryTestDone(code == 200, code);
+}
 ```
 
 ---
 
-## Block 6: New serial commands
+## Section 13 — Add config polling via WiFi (new)
 
-**Location: Inside your `processCommand()` function, add these cases before the final `else` block that prints "ERR: Unknown command":**
+Add this function:
 
 ```cpp
-  else if (cmd == "SIMINIT") {
-    simAvailable = simInit();
-    if (simAvailable) gprsConnect();
-    Serial.printf("SIM:%s GPRS:%s\n",
-                  simAvailable ? "OK" : "FAIL",
-                  gprsConnected ? "OK" : "FAIL");
-  }
-  else if (cmd == "SIMSTATUS") {
-    simReadSignalQuality();
-    Serial.printf("SIM:%s REG:%s GPRS:%s CSQ:%d/31 TX_OK:%lu TX_FAIL:%lu CH:%s\n",
-                  simAvailable ? "OK" : "DOWN",
-                  simRegistered ? "YES" : "NO",
-                  gprsConnected ? "UP" : "DOWN",
-                  simSignalQuality,
-                  txSuccessCount, txFailCount,
-                  activeChannel == TX_CHANNEL_GPRS ? "GPRS" :
-                  activeChannel == TX_CHANNEL_WIFI ? "WIFI" : "NONE");
-  }
-  else if (cmd == "TXNOW") {
-    Serial.println("Forcing immediate transmit...");
-    transmitData();
-  }
-  else if (cmd == "GPRSUP") {
-    if (simAvailable && !gprsConnected) {
-      gprsConnect();
-    } else if (gprsConnected) {
-      Serial.println("GPRS already connected.");
+void pollServerConfig() {
+    if (!wifiConnected) return;
+    if (millis() - lastConfigPollMs < CONFIG_POLL_INTERVAL_MS) return;
+    lastConfigPollMs = millis();
+
+    int code = wifiGet(SERVER_CONFIG_URL);
+    if (code == 200) {
+        checkServerConfigResponse(wifiRespBody);
+    }
+}
+```
+
+---
+
+## Section 14 — Replace setup()
+
+Key changes needed in `setup()`:
+
+```cpp
+// REMOVE:
+Serial1.begin(115200, SERIAL_8N1, S3_UART_RX_PIN, S3_UART_TX_PIN);
+
+// REPLACE WITH:
+// CSV receive from S3 GPIO14 — 9600 baud
+// TX at 9600 also used for $CFG frames to S3 GPIO44
+// S3 Serial2 must also be at 9600 to match
+Serial1.begin(9600, SERIAL_8N1, CSV_RX_PIN, CFG_TX_PIN);
+
+// ADD after Serial1 init:
+// OTA control pins
+pinMode(OTA_BOOT_PIN, OUTPUT);
+pinMode(OTA_RESET_PIN, OUTPUT);
+digitalWrite(OTA_BOOT_PIN, HIGH);    // S3 boots normally
+digitalWrite(OTA_RESET_PIN, HIGH);   // S3 not in reset
+
+// ADD WiFi init:
+wifiInit();
+lastWifiReconnectMs = millis();
+```
+
+---
+
+## Section 15 — Replace loop()
+
+The loop needs these additions in order:
+
+```cpp
+void loop() {
+    // 1. WiFi maintenance (always runs)
+    wifiMaintain();
+
+    // 2. Update connectivity state
+    updateConnState();
+
+    // 3. Receive CSV from S3
+    receiveCSVFromS3();
+    processCSVFrame();
+
+    // 4. SIM800L state machine (only if SIM present)
+    atPoll();
+    simStateMachine();
+
+    // 5. Operational state machine
+    // Runs if either WiFi or GPRS available
+    if (connState != CONN_NONE) {
+        opStateMachine();
+
+        // Boot-time buffer check
+        static bool bootBufferChecked = false;
+        if (!bootBufferChecked) {
+            bootBufferChecked = true;
+            if (sdBufferExists()) {
+                Serial.println("[BOOT] Old buffer → RECOVERY");
+                opState = OP_RECOVERY;
+            }
+        }
+
+        // Rate-limit posts
+        // (opStateMachine already has timing logic for OFFLINE/RECOVERY)
+        // For NORMAL and REALTIME, rate-limit via POST_INTERVAL_MS
     } else {
-      Serial.println("SIM not available.");
+        // No connectivity — buffer to SD
+        if (newReadingAvailable) {
+            newReadingAvailable = false;
+            sdWriteReading(&lastReading);
+            Serial.println("[CONN_NONE] Buffered to SD");
+        }
     }
-  }
-  else if (cmd == "GPRSDOWN") {
-    gprsDisconnect();
-  }
-  else if (cmd == "WIFION") {
-    wifiConnect();
-  }
-  else if (cmd == "WIFIOFF") {
-    wifiDisconnect();
-  }
-  else if (cmd == "FIREBASETEST") {
-    if (!wifiConnected) wifiConnect();
-    if (wifiConnected) firebasePostData();
-    else Serial.println("WiFi not available.");
-  }
+
+    // 6. Config push to S3 when dirty
+    if (config.dirty) sendConfigToS3();
+
+    // 7. Periodic config poll from server (WiFi path)
+    pollServerConfig();
+
+    // 8. Periodic OTA command poll
+    if (millis() - lastOtaPollMs >= OTA_POLL_INTERVAL_MS) {
+        lastOtaPollMs = millis();
+        pollOtaCommand();
+    }
+
+    // 9. OTA state machine
+    runOtaStateMachine();
+
+    // 10. SIM health check
+    if (millis() - lastSimHealthMs >= SIM_HEALTH_CHECK_MS) {
+        lastSimHealthMs = millis();
+        simHealthCheck();
+    }
+
+    // 11. S3 watchdog
+    checkS3Watchdog();
+
+    // 12. Serial debug
+    readSerialCommands();
+}
 ```
 
 ---
 
-## Block 7: Updates to `setup()`
+## Section 16 — One critical note on UART baud rate conflict
 
-**Location: Inside `setup()`, add after the BMP280 section (after `"[INIT] BMP280 ready."` around line 635), and before the `"Sensor source summary"` section. This becomes step 7.5:**
+The S3 currently has `Serial2.begin(115200, ...)` for receiving `$CFG`. The C3 now sends on Serial1 TX at 9600. **You must also change this one line in the S3 firmware:**
 
 ```cpp
-  // ── 7.5  SIM800L + GPRS ──────────────────────────────────────
-  esp_task_wdt_reset();
-  Serial.println("[INIT] Initialising SIM800L...");
-  simAvailable = false;
+// S3 firmware — in setup(), find:
+Serial2.begin(UART_C3_BAUD, SERIAL_8N1, UART_C3_RX, UART_C3_TX);
 
-  for (int attempt = 0; attempt < SIM_INIT_RETRIES; attempt++) {
-    Serial.printf("[INIT] SIM800L attempt %d/%d\n", attempt + 1, SIM_INIT_RETRIES);
-    if (simInit()) {
-      simAvailable = true;
-      break;
-    }
-    delay(2000);
-    esp_task_wdt_reset();
-  }
-
-  if (simAvailable) {
-    Serial.println("[INIT] SIM800L ready — connecting GPRS...");
-    if (gprsConnect()) {
-      activeChannel = TX_CHANNEL_GPRS;
-      Serial.println("[INIT] GPRS connected — primary TX channel active.");
-    } else {
-      Serial.println("[INIT] GPRS failed — will retry on first transmit.");
-    }
-  } else {
-    Serial.println("[INIT] SIM800L unavailable — will use WiFi fallback.");
-    // Try WiFi as fallback
-    if (strlen(WIFI_SSID) > 0) {
-      if (wifiConnect()) {
-        activeChannel = TX_CHANNEL_WIFI;
-        Serial.println("[INIT] WiFi connected as fallback TX channel.");
-      }
-    }
-  }
-
-  simInitFailCount = simAvailable ? 0 : SIM_INIT_RETRIES;
+// Change UART_C3_BAUD from 115200 to 9600:
+Serial2.begin(9600, SERIAL_8N1, UART_C3_RX, UART_C3_TX);
 ```
 
-**Also update the sensor source summary section to include comms status. Add after the existing source summary block:**
-
+And update the S3 define:
 ```cpp
-  // ── 8.5 Comms source summary ──────────────────────────────────
-  if (!simAvailable && !wifiConnected) {
-    Serial.println("[WARN] NO COMMUNICATION CHANNEL — data will not be transmitted.");
-    Serial.println("[WARN] Device will continue sampling and storing locally.");
-  } else {
-    Serial.printf("[INIT] Primary TX: %s\n",
-                  activeChannel == TX_CHANNEL_GPRS ? "GPRS (SIM800L)" :
-                  activeChannel == TX_CHANNEL_WIFI ? "WiFi (Firebase)" : "NONE");
-  }
+// Change:
+#define UART_C3_BAUD 115200
+// To:
+#define UART_C3_BAUD 9600
 ```
 
-**Update the help text at the end of `setup()` — replace the existing commands help lines with:**
-
-```cpp
-  Serial.println("[INIT] Commands: STATUS | SENSORTEST | ALGOON | ALGOOFF | PING | CAL");
-  Serial.println("[INIT] Thresholds: SETALERT:<cm> | SETWARN:<cm> | SETDANGER:<cm>");
-  Serial.println("[INIT] Config: OLP:<cm> | GETCONFIG | GETTHRESH | SAVEEEPROM | DUMP");
-  Serial.println("[INIT] Comms: SIMINIT | SIMSTATUS | TXNOW | GPRSUP | GPRSDOWN");
-  Serial.println("[INIT] Comms: WIFION | WIFIOFF | FIREBASETEST\n");
-```
+This makes the $CFG path work at 9600 which is what Serial1 on the C3 uses. $CFG frames are 20 characters — at 9600 baud that's 20ms. Completely acceptable.
 
 ---
 
-## Block 8: Updates to `loop()`
-
-**Location: Inside `loop()`, replace the algorithm-gated section (section 7) and add section 7.5 for transmission. Here's the complete replacement for sections 7 and 8, plus the new additions:**
-
-```cpp
-  // ── 7. ALGORITHM-GATED: flood state machine (Phase 3) ─────────
-  if (algorithmEnabled) {
-    if (now - lastSampleTime >= sampleInterval) {
-      lastSampleTime = now;
-
-      evaluateFloodStatus();
-      updateAdaptiveIntervals();
-      pendingTransmit = true;  // flag that we have new data to send
-
-      Serial.printf("[SAMPLE] H=%.1fcm  Mode=%s  Level=%s  Rate=%.1f  Sustained=%d  Health=%d\n",
-                    waterHeightCm, modeStr(currentMode),
-                    levelStr(currentResponseLevel), ratePer15Min,
-                    (int)sustainedRise, healthScore);
-    }
-
-    // ── 7.5 TRANSMISSION — at transmitInterval or on level change ──
-    bool levelJustChanged = false;  // set in evaluateFloodStatus via forceSaveEeprom
-    bool txDue = (now - lastTransmitTime >= transmitInterval) && pendingTransmit;
-
-    if (txDue) {
-      lastTransmitTime = now;
-      transmitData();
-    }
-
-    // Periodic EEPROM save — every 30 minutes if no level-change triggered it
-    if (now - lastEepromSave >= 1800000UL) {
-      forceSaveEeprom();
-    }
-  }
-
-  // ── 8. SIM800L maintenance (runs always, not just when algo enabled) ──
-
-  // Check for inbound diagnostic SMS every 30 seconds
-  static uint32_t lastSmsCheck = 0;
-  if (simAvailable && (now - lastSmsCheck >= 30000UL)) {
-    lastSmsCheck = now;
-    checkInboundSMS();
-  }
-
-  // GPRS keepalive check every 5 minutes
-  if (simAvailable && gprsConnected && (now - lastSimCheck >= 300000UL)) {
-    lastSimCheck = now;
-    if (!gprsCheckActive()) {
-      Serial.println("[SIM] GPRS bearer dropped — will reconnect on next TX.");
-    }
-    simReadSignalQuality();
-  }
-
-  // If SIM was unavailable, retry init every 10 minutes
-  if (!simAvailable && (now - lastGprsReconnect >= 600000UL)) {
-    lastGprsReconnect = now;
-    Serial.println("[SIM] Retrying SIM800L init...");
-    simAvailable = simInit();
-    if (simAvailable) gprsConnect();
-  }
-
-  // ── 9. Minimal delay to prevent tight spinning ────────────────
-  delay(5);
-```
-
----
-
-## Complete Data Flow Summary
-
-```
-┌──────────────────────────────────────────────────────┐
-│                   ESP32-S3 DEVICE                    │
-│                                                      │
-│  MPU6050 ─→ Tilt ─→ H = L·cosθ ─→ evaluateFlood()  │
-│  BMP280  ─→ Pressure ─→ submerge depth              │
-│  Battery ─→ health score                             │
-│                                                      │
-│  Every transmitInterval:                             │
-│    buildJsonPayload() ─→ one JSON blob               │
-│                                                      │
-│  ┌─────────────────────────────────────┐             │
-│  │ Try GPRS (SIM800L)                  │             │
-│  │   HTTP POST to SERVER_URL           │             │
-│  │   ↓ fail?                           │             │
-│  │ Try WiFi (ESP32 native)             │             │
-│  │   HTTPS PUT to Firebase             │             │
-│  │   ↓ fail?                           │             │
-│  │ Log failure, retry next interval    │             │
-│  └─────────────────────────────────────┘             │
-│                                                      │
-│  Device's job ends here.                             │
-└──────────────────────────────────────────────────────┘
-                        │
-                   HTTP POST
-                   (one JSON)
-                        │
-                        ▼
-┌──────────────────────────────────────────────────────┐
-│                     SERVER                           │
-│                                                      │
-│  Receives: device_id, water_height_cm, mode,         │
-│            response_level, zone, rate, sustained,     │
-│            battery, health, GPS, timestamp            │
-│                                                      │
-│  Compares incoming response_level to stored level:   │
-│                                                      │
-│  WATCH    → SMS to ops team only                     │
-│  WARNING  → SMS to Sarpanch + Tahsildar              │
-│  FLOOD    → SMS to DC, Control Room, Police          │
-│  CRITICAL → All above + State EOC + IVR call         │
-│                                                      │
-│  Step-down  → de-escalation SMS to all contacted     │
-│  All-clear  → closure SMS when back to NORMAL        │
-│                                                      │
-│  Reminders: CRITICAL=15min, FLOOD=30min, WARN=60min  │
-│  Contacts: stored in DB, edited via web UI           │
-│  No ACK needed. No device changes needed ever.       │
-└──────────────────────────────────────────────────────┘
-```
-
-Every function above compiles standalone against your existing code. The JSON payload carries everything the server needs. The device never knows or cares who gets alerted — it just faithfully reports its state every interval.
-````
-
-
-
-```
-Sensor Health & Graceful Degradation
-
-The system has **two measurement channels** that cover different regimes:
-
-```
-Primary (MODE 0-2): MPU6050 (tilt angle → H = L×cos(θ))
-Primary (MODE 3):   BMP280 (pressure → H = L + depth)
-
-These are NOT backup for each other — they cover DIFFERENT modes.
-Both are always active when available.
-```
-
-**MPU6050 failure:**
-```
-IF 5 consecutive I2C read failures:
-  mpuHealthy = false
-  activeSensor = SENSOR_NONE for tilt measurement
-  
-  System can still detect:
-    MODE 0: Via BMP280 (pressure ≈ atmospheric = safe)
-    MODE 3: Via BMP280 (pressure > atmospheric = submerged)
-    
-  System CANNOT detect:
-    MODE 1: No tilt → no H = L×cos(θ) → no precise water level
-    MODE 2: No tilt → cannot confirm H ≈ L exactly
-    
-  Fallback behavior:
-    Report "TILT SENSOR OFFLINE"
-    If pressure shows submersion → report MODE 3 directly
-    If pressure shows atmospheric → report "SAFE (sensor degraded)"
-    Cannot report intermediate water levels
-```
-
-**BMP280 failure:**
-```
-IF I2C read fails:
-  bmpAvailable = false
-  
-  System can still detect:
-    MODE 0: Via MPU6050 (lateral accel ≈ 0 = slack)
-    MODE 1: Via MPU6050 (H = L×cos(θ) precisely)
-    MODE 2: Via MPU6050 (θ → 0° = flood level)
-    
-  System CANNOT detect:
-    MODE 3: No pressure → cannot measure depth below surface
-    
-  Fallback behavior:
-    Report "PRESSURE SENSOR OFFLINE"
-    If θ ≈ 0° → report MODE 2 (flood reached)
-    Cannot quantify how far ABOVE flood level water has risen
-    Alert dispatched at MODE 2 regardless
-```
-
-**Both sensors failed:**
-```
-activeSensor = SENSOR_NONE
-Report "CRITICAL: ALL SENSORS OFFLINE"
-Response level set to CRITICAL in next HTTP POST
-Continue attempting I2C recovery every 60 seconds
-```
-
-**Health check every 60 seconds** (`checkSensorHealth()`):
-```
-1. I2C Bus 0: Probe MPU6050 address (0x68)
-   └── Fail? → Clock 9 SCL pulses (bus recovery), retry
-       └── Still fail? → increment mpuConsecutiveFailures
-           └── ≥ 5? → mpuHealthy = false
-
-2. I2C Bus 1: Probe BMP280 address (0x76)
-   └── Fail? → bmpAvailable = false
-
-3. If MPU6050 was offline, re-probe
-   └── Recovered? → Re-initialize (reg 0x6B = 0x00),
-       recalibrate, switch back to SENSOR_MPU6050
-
-4. GPS fix tracking:
-   └── No fix for > 1 hour? → WARNING:GPS_NO_FIX_1HR
-```
-
-**I2C bus recovery** (`i2cBusRecovery()`):
-```
-1. Set SDA as INPUT_PULLUP
-2. Set SCL as OUTPUT
-3. Clock 9 pulses on SCL (release stuck slave)
-4. Generate STOP condition (SDA LOW → HIGH while SCL HIGH)
-5. Re-initialize I2C bus at 100kHz
-```
-
-## 17. Failure Detection & Diagnostics System
-
-The system implements three categories of failure detection, each with autonomous on-device detection and server-coordinated diagnostics.
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                FAILURE DETECTION ARCHITECTURE                    │
-│                                                                 │
-│  ALWAYS ACTIVE (on-device, every loop):                        │
-│  ├── A1: MPU6050 latch-up / frozen output detection            │
-│  ├── A2: MPU6050 drift / gravity magnitude check               │
-│  ├── A3: BMP280 range check / staleness / cross-validation     │
-│  ├── B1: Battery voltage monitoring & staged shutdown          │
-│  ├── B2: Watchdog timer (MCU crash recovery)                   │
-│  ├── B3: SIM800L communication health                          │
-│  ├── C1-PASSIVE: GPS origin drift detection                    │
-│  └── C2-PASSIVE: Draft pressure trend (leak detection)         │
-│                                                                 │
-│  SERVER-TRIGGERED (activate via GSM command):                  │
-│  ├── C1-FULL: Tether break diagnostic suite                    │
-│  │   ├── Oscillation period analysis                           │
-│  │   ├── Lateral acceleration sustained-slack check            │
-│  │   └── GPS displacement + heading analysis                   │
-│  ├── C3: Anchor shift detection (L_eff comparison)             │
-│  └── FULL_DIAG: Run all diagnostics, report to server          │
-│                                                                 │
-│  CONTINUOUS SELF-CALIBRATION:                                  │
-│  ├── Atmospheric pressure baseline (while at surface)          │
-│  ├── Gravity reference correction (in SLACK mode)              │
-│  └── Draft baseline tracking (biofouling/leak detection)       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 17.1 Origin Coordinate System — GPS Geofence
-
-At deployment, the system stores the GPS position as the **anchor origin**. Every GPS fix is compared to this origin. If the buoy drifts beyond a configurable radius (default = OLP length + margin), the system flags a potential detachment.
-
-```
-DEPLOYMENT:
-  Store: originLat, originLon (from first valid GPS fix after CAL)
-  Store: geofenceRadiusM = olpLength / 100.0 (convert cm to meters)
-         + GEOFENCE_MARGIN_M (default 5.0 meters for GPS error)
-
-                    Geofence boundary
-                   ╱                  ╲
-                 ╱     Safe zone        ╲
-               ╱    (buoy can reach      ╲
-              │      anywhere on arc)      │
-              │                            │
-              │        ● Origin            │
-              │     (anchor GPS)           │
-               ╲                          ╱
-                 ╲                      ╱
-                   ╲__________________╱
-                   
-                   radius = L + margin
-
-EVERY GPS FIX:
-  distance = distanceFromOrigin(currentLat, currentLon,
-                                originLat, originLon)
-  
-  IF distance > geofenceRadiusM:
-    geofenceBreachCount++
-    
-    IF geofenceBreachCount >= 3 (consecutive):
-      → FLAG: TETHER_DETACHMENT_SUSPECTED
-      → Include in next HTTP POST to server
-      → Server dispatches alert to all tiers:
-        "VARUNA ALERT: Buoy may be detached.
-         Distance from anchor: [X]m
-         Position: [lat],[lon]
-         Heading: [bearing]° from origin"
-      → Increase GPS fix rate to continuous
-      → Begin logging position trail
-      → Set flag: tetherBreachDetected = true
-      → Server can issue DIAG_TETHER command for full analysis
-          
-  ELSE:
-    geofenceBreachCount = 0
-```
-
-**Distance calculation (flat-earth approximation for short distances):**
-```
-For distances < 10km, simplified formula is sufficient:
-
-  dLat = (currentLat - originLat) × 111320.0   (meters)
-  dLon = (currentLon - originLon) × 111320.0 × cos(originLat × π/180)
-  distance = sqrt(dLat² + dLon²)               (meters)
-
-Accuracy: ±0.1% at equator, ±0.5% at 60° latitude
-More than sufficient for 1-5 meter geofence detection
-```
-
-**Origin coordinate persistence:**
-```
-EEPROM storage:
-  EEPROM_ORIGIN_LAT_ADDR    (4 bytes, float)
-  EEPROM_ORIGIN_LON_ADDR    (4 bytes, float)
-  EEPROM_ORIGIN_MAGIC_ADDR  (1 byte, 0xGF)
-  EEPROM_GEOFENCE_RADIUS    (4 bytes, float, meters)
-
-Set at deployment using handheld debugger:
-  SETORIGIN              (capture current GPS as origin)
-  SETORIGIN:<lat>,<lon>  (manual coordinates)
-  SETFENCE:<meters>      (set geofence radius)
-
-Queryable via console diagnostic:
-  GETCONFIG reports origin and fence values
-  GPSFIX reports distance from origin
-```
-
----
-
-### 17.2 Category A — Sensor Failures
-
-#### A1: MPU6050 Latch-Up (Frozen Output)
-
-```
-WHAT HAPPENS:
-  Electrical noise or moisture causes I2C bus lock.
-  MPU6050 returns identical values every read, or 0xFF on all bytes.
-
-DETECTION (runs every loop iteration):
-
-  Maintain variance buffer of last 50 accelerometer readings:
-  
-  accelVarianceBuffer[50]   ← rolling window of |a| magnitudes
-  
-  Every 50 readings:
-    variance = computeVariance(accelVarianceBuffer, 50)
-    
-    A floating buoy in water ALWAYS has micro-motion:
-    thermal drift, micro-currents, wind ripple.
-    Variance should NEVER be exactly zero.
-    
-    IF variance < 0.0001 m/s²:
-      mpuFrozenCount++
-      
-      IF mpuFrozenCount >= 3 (consecutive variance windows):
-        → FLAG: MPU6050_FROZEN
-        → Attempt recovery:
-           1. I2C bus recovery (9 SCL clocks)
-           2. MPU6050 power cycle (reg 0x6B = 0x80, then 0x00)
-           3. Re-read WHO_AM_I register
-           4. If WHO_AM_I ≠ 0x68 → I2C_BUS_FAULT
-           5. If WHO_AM_I == 0x68 but still frozen → MPU6050_HARDWARE_FAULT
-        → Report to serial: "FAULT:MPU6050_FROZEN:RECOVERY_[OK/FAIL]"
-        → If recovery fails → mpuHealthy = false
-        
-    ELSE:
-      mpuFrozenCount = 0
-
-  ALSO — I2C register validation (every 60 seconds):
-    whoami = mpuReadReg(0x75)
-    IF whoami ≠ 0x68 AND whoami ≠ 0x72:
-      → I2C_BUS_CORRUPTION
-      → Full bus recovery sequence
-```
-
-#### A2: MPU6050 Drift Beyond Correction
-
-```
-WHAT HAPPENS:
-  Temperature change shifts accelerometer offset.
-  Gyro bias drifts faster than complementary filter corrects.
-
-DETECTION:
-
-  Gravity magnitude check (every reading):
-    g_measured = sqrt(ax² + ay² + az²)
-    
-    IF |g_measured - 9.81| > 1.0 m/s²:
-      gravityErrorCount++
-      
-      IF gravityErrorCount >= 20 (consecutive):
-        → FLAG: ACCEL_CALIBRATION_DRIFT
-        → Check context: is buoy under extreme acceleration?
-           (wave impact, collision — transient, should clear)
-        → If sustained > 5 seconds:
-           → ACCEL_HARDWARE_FAULT or ORIENTATION_LOST
-           
-    ELSE:
-      gravityErrorCount = 0
-
-  SLACK mode auto-correction (continuous self-calibration):
-    IF currentMode == MODE_0_SLACK:
-      Buoy is floating upright, no tether tension.
-      Accelerometer SHOULD read: ax ≈ 0, ay ≈ 0, az ≈ 9.81
-      
-      IF |az - 9.81| > 0.5 OR |ax| > 0.5 OR |ay| > 0.5:
-        → FLAG: ACCEL_OFFSET_DRIFT
-        → Auto-correct offsets:
-           accelOffsetX = -ax_measured
-           accelOffsetY = -ay_measured
-           accelOffsetZ = 9.81 - az_measured
-        → Apply to all future readings
-        → Log: "AUTOCAL:ACCEL_OFFSET_CORRECTED"
-        → This is SELF-CALIBRATION, not a fault
-        
-      This runs only in MODE 0 because that is the only mode
-      where the buoy's orientation is known a priori (upright).
-```
-
-#### A3: BMP280 Pressure Sensor Failure
-
-```
-WHAT HAPPENS:
-  Water intrusion destroys sensor element.
-  Sensor reads 0, maximum value, or constant stuck value.
-
-DETECTION (runs every BMP280 read, every 5 seconds):
-
-  Range check:
-    IF currentPressure < 300 hPa OR currentPressure > 1200 hPa:
-      → Atmospheric pressure on Earth: 870-1084 hPa
-      → Even at 10m depth: P < 2000 hPa
-      → FAULT: PRESSURE_OUT_OF_RANGE
-      → bmpAvailable = false
-
-  Staleness check:
-    Maintain pressureVarianceBuffer[20]
-    
-    IF pressureVariance < 0.01 hPa over 20 readings:
-      → Even in calm conditions, pressure fluctuates
-         from micro-waves, wind, thermal changes
-      → FAULT: PRESSURE_SENSOR_FROZEN
-      → Attempt: re-initialize BMP280
-      → If still frozen: bmpAvailable = false
-
-  Cross-validation with tilt (MODE 1, tether TAUT):
-    IF currentMode == MODE_1_TAUT AND theta > 20°:
-      Buoy is significantly tilted → definitely at surface.
-      Pressure SHOULD be near atmospheric baseline.
-      
-      IF currentPressure > baselinePressure + 50 hPa:
-        → Pressure says deeply submerged
-        → Tilt says clearly at surface
-        → FAULT: PRESSURE_TILT_DISAGREEMENT
-        → Trust tilt (MPU6050), flag pressure as suspect
-        → Report: "FAULT:PRESSURE_CROSS_CHECK_FAIL"
-        
-    IF currentMode == MODE_3_SUBMERGED AND theta > 15°:
-      → Pressure says submerged, tilt says angled (surface)
-      → Contradiction → one sensor is wrong
-      → Apply confidence weighting:
-         If pressure changed gradually → trust pressure
-         If pressure jumped suddenly → suspect pressure fault
-```
-
----
-
-### 17.3 Category B — System Failures
-
-#### B1: Battery Death (Staged Shutdown)
-
-```
-Handled by readBatteryLevel() with piecewise Li-ion curve.
-(See Section 6 for voltage-to-percent mapping)
-
-STAGED RESPONSE:
-
-  VOLTAGE     PERCENT    STATE         ACTION
-  ─────────   ───────    ─────         ──────────────────────────
-  > 3.85V     > 70%      GOOD          Normal operation
-  
-  3.50-3.85V  20-70%     OK            Normal, report in telemetry
-  
-  3.30-3.50V  5-20%      LOW           • Extend sample intervals
-                                       • Reduce GPRS to conserve mode
-                                       • Reduce obstruction light
-                                         duty cycle
-                                       • Report LOW in HTTP POST
-                                       
-  3.00-3.30V  0-5%       CRITICAL      • Emergency mode:
-                                         measure + transmit 1×/hour
-                                       • Disable obstruction lights
-                                       • Force EEPROM save
-                                       • Report CRITICAL in HTTP POST
-                                       
-  < 3.00V     0%         CUTOFF        • Force save all state
-                                       • Deep sleep (no wake timer)
-                                       • Protects cells from damage
-                                       
-  3 consecutive readings below cutoff required to prevent
-  transient voltage dips from triggering false shutdown.
-```
-
-#### B2: MCU Crash / Lockup
-
-```
-HANDLED BY: ESP32 hardware watchdog timer
-
-  Setup: WDT_TIMEOUT_SEC = 120 seconds
-  Initially configured at 180 seconds during setup() (extended
-  for sensor initialization and SIM800L boot), then reconfigured
-  to 120 seconds for operational mode.
-  
-  Every loop iteration: esp_task_wdt_reset()
-  During long operations (AT commands, SMS send): reset inside loops
-  
-  IF loop() hangs for > 120 seconds:
-    → Hardware watchdog triggers panic
-    → ESP32 performs hard reset
-    → System reboots
-    → setup() runs again
-    → EEPROM warm boot restores state (if < 30 min old)
-    → System resumes monitoring
-  
-  AFTER REBOOT — detect reason:
-    esp_reset_reason_t reason = esp_reset_reason()
-    
-    IF reason == ESP_RST_TASK_WDT OR reason == ESP_RST_WDT:
-      watchdogResetCount++  (stored in RTC memory, survives reset)
-      
-      Report: "STATUS:WATCHDOG_RECOVERY:COUNT=[N]"
-      
-      IF watchdogResetCount > 10 (in 24 hours):
-        → FAULT: FREQUENT_CRASHES
-        → Report in HTTP POST health score
-        → Server flags station for service
-        → Possible causes: memory leak, I2C bus permanent
-           fault, SIM800L hanging system
-```
-
-#### B3: SIM800L Communication Failure
-
-```
-  AT command timeout      → Retry up to 5 times
-  No network registration → Periodic re-check every 30 seconds
-  GPRS upload failure     → 3 fails → flag GPRS_OFFLINE
-  Signal lost             → Periodic re-registration check
-  Module unresponsive     → Hardware reset (RST pin LOW 200ms)
-  
-  SERVER-SIDE MONITORING:
-    Server expects GPRS heartbeat at transmitInterval.
-    IF no data received for 3× transmitInterval:
-      → Server flags buoy as SILENT on dashboard
-      → Server can attempt SMS diagnostic command to buoy
-      → If buoy responds → GPRS path broken, SMS path works
-      → If no response → buoy may be offline or out of range
-```
-
----
-
-### 17.4 Category C — Physical Failures
-
-#### C1: Tether Break Detection
-
-**Two-tier detection: passive (always on) + active (server-triggered)**
-
-```
-TIER 1 — PASSIVE (always active, no server command needed):
-
-  GPS GEOFENCE CHECK (every valid GPS fix):
-  
-    distance = distanceFromOrigin(currentLat, currentLon,
-                                  originLat, originLon)
-    
-    IF distance > geofenceRadiusM:
-      geofenceBreachConsecutive++
-      
-      IF geofenceBreachConsecutive >= 3:
-        → ALERT: TETHER_DETACHMENT_SUSPECTED
-        → Flag in next HTTP POST to server
-        → Server dispatches:
-           "VARUNA CRITICAL: Buoy detached!
-            Dist from anchor: [X]m
-            Position: [lat],[lon]
-            Moving: [bearing]° at [speed]km/h"
-        → Begin continuous GPS logging (position trail)
-        → Set flag: tetherBreachDetected = true
-        → Server can issue DIAG_TETHER for full analysis
-          
-    ELSE:
-      geofenceBreachConsecutive = 0
-
-
-TIER 2 — ACTIVE DIAGNOSTICS (triggered by server command):
-
-  Server sends SMS: "DIAG_TETHER" to buoy
-  
-  Buoy executes full tether diagnostic suite:
-
-  ┌─────────────────────────────────────────────────────┐
-  │  TETHER BREAK DIAGNOSTIC SUITE                      │
-  │                                                     │
-  │  TEST 1: Sustained Slack Check                      │
-  │  ──────────────────────────                         │
-  │  Monitor lateral_accel for 5 minutes:               │
-  │                                                     │
-  │  IF lateral_accel < 0.10 m/s² sustained > 5 min    │
-  │  AND currentMode == MODE_0_SLACK:                   │
-  │    → Buoy has NO tether tension for extended period │
-  │    → In flowing water, this should not happen       │
-  │    → RESULT: TETHER_TENSION_ABSENT                  │
-  │                                                     │
-  │  TEST 2: Oscillation Period Analysis                │
-  │  ──────────────────────────────────                 │
-  │  Attempt to measure pendulum oscillation:           │
-  │  Sample tilt angle at 10 Hz for 60 seconds.         │
-  │  Compute FFT or zero-crossing period.               │
-  │                                                     │
-  │  IF no periodic oscillation detected:               │
-  │    oscillationPeriod = UNDEFINED (∞)                │
-  │    → No pendulum restoring force                    │
-  │    → RESULT: NO_OSCILLATION_DETECTED                │
-  │                                                     │
-  │  IF oscillation detected:                           │
-  │    T = measured period                              │
-  │    L_eff = g × (T/2π)²                             │
-  │    Compare to L_KNOWN (olpLength)                   │
-  │    IF |L_eff - L_KNOWN| < 15%:                     │
-  │      → RESULT: TETHER_INTACT (oscillation matches) │
-  │    ELSE:                                            │
-  │      → RESULT: TETHER_LENGTH_ANOMALY               │
-  │                                                     │
-  │  TEST 3: GPS Displacement Analysis                  │
-  │  ────────────────────────────────                   │
-  │  Record GPS position every 10 seconds for 5 min.   │
-  │  Compute: total displacement, heading, speed.       │
-  │                                                     │
-  │  IF displacement > geofenceRadiusM:                 │
-  │    → Buoy has moved beyond tether reach             │
-  │    → RESULT: BUOY_DISPLACED_BEYOND_TETHER           │
-  │                                                     │
-  │  IF speed > 0.5 m/s sustained AND no oscillation:  │
-  │    → Buoy moving freely with current               │
-  │    → RESULT: BUOY_DRIFTING_FREE                     │
-  │                                                     │
-  │  COMPOSITE VERDICT:                                 │
-  │  ──────────────────                                 │
-  │  IF (TENSION_ABSENT OR NO_OSCILLATION)             │
-  │  AND (DISPLACED OR DRIFTING):                       │
-  │    → VERDICT: TETHER_BROKEN (high confidence)      │
-  │                                                     │
-  │  IF TENSION_ABSENT but NOT DISPLACED:               │
-  │    → VERDICT: TETHER_POSSIBLY_BROKEN                │
-  │    → (could be very calm water with no current)     │
-  │                                                     │
-  │  IF oscillation matches AND within geofence:        │
-  │    → VERDICT: TETHER_INTACT                         │
-  │                                                     │
-  │  Report full results via SMS reply + GPRS upload    │
-  └─────────────────────────────────────────────────────┘
-```
-
-**SMS diagnostic reply format:**
-```
-"VARUNA TETHER DIAG:
- Tension: [PRESENT/ABSENT]
- Oscillation: [T=Xs/NONE]
- L_eff: [X]cm vs L=[Y]cm
- GPS dist: [X]m from origin
- Speed: [X]m/s
- Verdict: [INTACT/BROKEN/UNKNOWN]"
-```
-
----
-
-#### C2: Buoy Leak / Water Ingress Detection
-
-**Always active — passive monitoring**
-
-```
-DRAFT PRESSURE TREND MONITORING:
-
-  Track the pressure reading when buoy is at surface
-  (MODE 0 or MODE 1) as "draft pressure":
-  
-  draftPressure = currentPressure - baselinePressure
-  
-  This represents how deep the buoy sits in the water.
-  As water enters the capsule, mass increases, buoy sits lower,
-  draft pressure increases.
-
-  Maintain 24-hour draft history:
-    draftHistory[24]   ← one reading per hour (hourly average)
-    draftHistoryIdx    ← circular index
-    draftHistoryCount  ← entries filled
-  
-  Every hour (when buoy is at surface):
-    Store current average draft pressure in draftHistory[]
-    
-    IF draftHistoryCount >= 24:
-      draftRate = (draftCurrent - draft24hAgo) / 24.0
-      (hPa per hour)
-      
-      Biofouling:  draftRate ≈ 0.001-0.01 hPa/hr (weeks to show)
-      Slow leak:   draftRate ≈ 0.05-0.5 hPa/hr (days to show)
-      Fast leak:   draftRate > 0.5 hPa/hr (hours to concern)
-
-      IF draftRate > 0.5 hPa/hr:
-        → ALERT: POSSIBLE_LEAK
-        → Flag in HTTP POST health score
-        → Server dispatches: "VARUNA: Draft increasing [X] hPa/hr.
-                Possible water ingress. Inspect buoy."
-                
-      IF draftRate > 2.0 hPa/hr:
-        → ALERT: ACTIVE_LEAK
-        → Flag in HTTP POST as critical health issue
-        → Server dispatches: "VARUNA CRITICAL: Rapid draft increase.
-                Active water ingress suspected.
-                Retrieve buoy immediately."
-
-  CROSS-CHECK — Sinking Detection:
-    IF pressure increasing (buoy going deeper)
-    AND currentMode == MODE_1_TAUT (tether taut)
-    AND theta NOT approaching 0° (water not actually rising):
-      → Pressure up + tilt unchanged = buoy sinking, not flood
-      → ALERT: BUOY_SINKING
-      → Server dispatches: "VARUNA CRITICAL: Buoy sinking without
-              water rise. Water ingress confirmed. Retrieve immediately."
-
-  OPTIONAL HUMIDITY SENSOR (DHT11 inside capsule):
-    IF available:
-      Read every 5 minutes
-      IF humidity > 80%:
-        → ALERT: MOISTURE_DETECTED
-      IF humidity > 95%:
-        → ALERT: MOISTURE_CRITICAL
-        → Possible condensation on electronics
-```
-
----
-
-#### C3: Anchor Shift Detection
-
-**Server-triggered diagnostic**
-
-```
-Server sends SMS: "DIAG_ANCHOR" to buoy
-
-Buoy executes anchor position analysis:
-
-  ┌─────────────────────────────────────────────────────┐
-  │  ANCHOR SHIFT DIAGNOSTIC                            │
-  │                                                     │
-  │  TEST 1: Effective Tether Length (L_eff)            │
-  │  ─────────────────────────────────────              │
-  │  Measure oscillation period T over 60 seconds.      │
-  │  L_eff = g × (T / 2π)²                             │
-  │                                                     │
-  │  Compare to L_KNOWN:                                │
-  │    IF L_eff < L_KNOWN - 10%:                       │
-  │      → Tether effectively shortened                 │
-  │      → Possible: sediment burial of anchor/base     │
-  │      → RESULT: TETHER_SHORTENED                     │
-  │                                                     │
-  │    IF L_eff > L_KNOWN + 10%:                       │
-  │      → Tether effectively lengthened                │
-  │      → Possible: anchor dragged, tether stretched   │
-  │      → RESULT: TETHER_LENGTHENED                    │
-  │                                                     │
-  │    IF |L_eff - L_KNOWN| < 10%:                     │
-  │      → RESULT: TETHER_LENGTH_NORMAL                 │
-  │                                                     │
-  │  TEST 2: Equilibrium Angle Shift                    │
-  │  ─────────────────────────────                      │
-  │  In TAUT mode, record average θ over 5 minutes.    │
-  │  Compare to historical average at similar water      │
-  │  levels (from archived data).                        │
-  │                                                     │
-  │  IF θ_current differs from θ_historical by > 10°   │
-  │  at similar water level:                             │
-  │    → Anchor position has changed                    │
-  │    → RESULT: EQUILIBRIUM_SHIFTED                    │
-  │                                                     │
-  │  TEST 3: GPS Centroid Shift                         │
-  │  ──────────────────────                             │
-  │  Record GPS positions over 10 minutes.              │
-  │  Compute centroid (average position).               │
-  │  Compare to historical centroid.                     │
-  │                                                     │
-  │  IF centroid shifted > 2m from deployment centroid: │
-  │    → Anchor has moved laterally                     │
-  │    → RESULT: ANCHOR_DISPLACED                       │
-  │                                                     │
-  │  COMPOSITE REPORT:                                  │
-  │    L_eff vs L_KNOWN, equilibrium angle,             │
-  │    GPS centroid shift, recommended action            │
-  └─────────────────────────────────────────────────────┘
-
-SMS diagnostic reply:
-"VARUNA ANCHOR DIAG:
- L_eff: [X]cm (known: [Y]cm, diff: [Z]%)
- Eq.angle: [X]° (historical: [Y]°)
- Centroid shift: [X]m
- Verdict: [NORMAL/SEDIMENT/DRAGGED]"
-```
-
----
-
-### 17.5 Server-Triggered Diagnostic Commands
-
-These commands are sent from the server (or an authorized field engineer phone) via SMS. The buoy executes the diagnostic suite and replies with results.
-
-```
-DIAGNOSTIC COMMANDS (via SMS from authorized number):
-
-  DIAG_TETHER        Full tether integrity check
-                     (5 minutes of data collection)
-                     → Reply: tension, oscillation, GPS, verdict
-
-  DIAG_ANCHOR        Anchor position analysis
-                     (10 minutes of data collection)
-                     → Reply: L_eff, angle shift, centroid, verdict
-
-  DIAG_LEAK          Force immediate leak/draft analysis
-                     (uses existing 24h draft history)
-                     → Reply: draft rate, humidity, verdict
-
-  DIAG_SENSORS       Full sensor health report
-                     → Reply: MPU6050 status, BMP280 status,
-                       variance readings, gravity magnitude,
-                       cross-validation results
-
-  DIAG_ALL           Run ALL diagnostics sequentially
-                     (≈20 minutes total)
-                     → Reply: comprehensive health report
-                     → Also uploaded via GPRS as JSON
-
-  DIAG_ABORT         Cancel running diagnostic
-                     (if taking too long or conditions changed)
-
-TIMING:
-  DIAG_TETHER:  ~5 minutes  (oscillation + GPS sampling)
-  DIAG_ANCHOR:  ~10 minutes (longer GPS averaging)
-  DIAG_LEAK:    ~10 seconds (reads existing history)
-  DIAG_SENSORS: ~30 seconds (variance computation)
-  DIAG_ALL:     ~20 minutes (sequential, all above)
-
-DURING DIAGNOSTICS:
-  Normal flood monitoring CONTINUES
-  Diagnostics run in parallel using existing sensor data
-  Flood alerts are NOT suppressed during diagnostics
-  Watchdog is fed during long diagnostic operations
-```
-
----
-
-### 17.6 Continuous Self-Calibration
-
-These calibrations run automatically without server commands or manual intervention.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  AUTO-CALIBRATION 1: Atmospheric Pressure Baseline              │
-│  ──────────────────────────────────────────────                 │
-│  WHEN: Buoy confirmed at surface (MODE 0, 1, or 2)            │
-│  HOW:  Rolling 48-sample average, updated every 30 min         │
-│  WHY:  Weather fronts shift P by ±2-4 hPa over hours          │
-│        Must track this to detect submersion accurately          │
-│  STATUS: ✅ Implemented (baselinePressure)                      │
-│                                                                 │
-│  AUTO-CALIBRATION 2: Gravity Reference Vector                  │
-│  ──────────────────────────────────────────────                 │
-│  WHEN: MODE 0 (SLACK — buoy floating upright freely)           │
-│  HOW:  Accelerometer should read (0, 0, 9.81)                 │
-│        Any deviation = accumulated offset drift                 │
-│        Correct: offset = expected - measured                    │
-│  WHY:  Temperature changes shift MEMS accel offset             │
-│        by 0.5-2 mg/°C (0.005-0.02 m/s²)                       │
-│  INTERVAL: Every time MODE 0 persists > 60 seconds             │
-│                                                                 │
-│  AUTO-CALIBRATION 3: Tether Length Verification                │
-│  ──────────────────────────────────────────────                 │
-│  WHEN: MODE 1 (TAUT — buoy oscillating on tether)             │
-│  HOW:  Measure pendulum oscillation period T                   │
-│        L_eff = g × (T/2π)²                                    │
-│        Compare to olpLength                                    │
-│  WHY:  Detects sediment burial, tether stretch,                │
-│        anchor shift without manual measurement                  │
-│  INTERVAL: Every 10 minutes while in MODE 1                    │
-│  ALERT: If |L_eff - olpLength| > 15% for > 1 hour            │
-│                                                                 │
-│  AUTO-CALIBRATION 4: Draft Baseline                            │
-│  ──────────────────────────────────────────────                 │
-│  WHEN: Buoy at surface (MODE 0 or 1)                          │
-│  HOW:  Track pressure offset from atmospheric                   │
-│        (represents how deep buoy sits = draft)                 │
-│        Slow upward drift = biofouling or water ingress         │
-│  INTERVAL: Hourly average stored for 24 hours                  │
-│  ALERT: Rate > 0.5 hPa/hr → possible leak                     │
-│                                                                 │
-│  CANNOT AUTO-CALIBRATE (requires manual):                      │
-│  ──────────────────────────────────────────                     │
-│  ❌ Absolute water level (need staff gauge)                     │
-│  ❌ Absolute current speed (need flow meter)                    │
-│  ❌ Physical tether length (need tape measure)                  │
-│  ❌ Origin GPS coordinates (set at deployment)                  │
-│  These require manual verification quarterly.                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 17.7 Health Score — Composite System Health Metric
-
-All failure detections feed into a single health score reported in telemetry:
-
-```
-HEALTH SCORE (0-100):
-
-  Component              Weight    Score
-  ─────────────────────  ──────    ─────
-  MPU6050 status         20 pts    20 = healthy, 10 = recovering,
-                                   0 = offline
-  BMP280 status          15 pts    15 = healthy, 0 = offline
-  Battery level          15 pts    15 = >70%, 10 = 20-70%,
-                                   5 = 5-20%, 0 = <5%
-  GPS fix quality        10 pts    10 = fix+HDOP<3, 5 = fix+HDOP>3,
-                                   0 = no fix
-  SIM/communication      10 pts    10 = registered+RSSI>10,
-                                   5 = registered+weak,
-                                   0 = unregistered
-  Tether integrity       15 pts    15 = confirmed intact,
-                                   10 = not recently checked,
-                                   0 = breach detected
-  Buoy integrity         10 pts    10 = no leak indicators,
-                                   5 = slow draft increase,
-                                   0 = active leak suspected
-  Sensor agreement       5 pts     5 = cross-checks pass,
-                                   0 = disagreements detected
-
-  Total: sum of components
-
-  REPORTING:
-    Score 80-100: GREEN  — "System healthy"
-    Score 60-79:  YELLOW — "Degraded, monitoring continues"
-    Score 40-59:  ORANGE — "Significant issues, service recommended"
-    Score 20-39:  RED    — "Critical degradation, service required"
-    Score 0-19:   BLACK  — "System failure, data unreliable"
-
-  Health score included in:
-    • Every GPRS data upload (JSON field "health")
-    • Every serial CSV output (field 39)
-    • SMS STATUS reply
-    • DIAG_ALL report
-```
-
----
-
-### 17.8 Field Calibration Procedure
-
-#### When to Calibrate
-
-```
-EVENT                     CALIBRATION NEEDED
-━━━━━━━━━━━━━━━━━━━━      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Initial deployment        FULL calibration (all parameters)
-After maintenance         Verification calibration
-After flood event         Verification (anchor may have moved)
-Quarterly check           Spot verification
-After firmware update     Sensor recalibration
-After battery replacement IMU recalibration (CoM may shift)
-Seasonal (temp change)    Pressure baseline update
-```
-
-#### Full Calibration Protocol (Initial Deployment)
-
-```
-STEP 1: DRY CALIBRATION (Before deployment, in lab/workshop)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  1a. IMU CALIBRATION (via handheld debugger)
-      • Place buoy on flat, level surface
-      • Power on, wait 30 seconds for stabilization
-      • Issue CAL command from handheld debugger
-      • Gyro: 1000 samples averaged for offset
-      • Accel: 500 samples averaged for reference gravity
-      • Store offsets
-
-  1b. PRESSURE SENSOR CALIBRATION
-      • Record pressure reading in open air
-      • Compare to known local atmospheric pressure
-        (from weather service or calibrated barometer)
-      • Store offset in EEPROM if needed
-
-  1c. PHYSICAL MEASUREMENTS
-      • Measure and record:
-          L (tether length) with tape measure ± 1 cm
-          Capsule dimensions ± 1 mm
-          Total buoy mass with batteries ± 1 g
-      • Set OLP length via handheld debugger: OLP:<cm>
-
-  1d. BUOYANCY VERIFICATION
-      • Place buoy in tank of water
-      • Verify it floats (if it sinks, add flotation)
-      • Measure actual draft (waterline position) with ruler
-
-  1e. TETHER LENGTH VERIFICATION
-      • Stretch tether to full length under ~5N tension
-      • Measure with tape measure
-      • Record L_verified ± 0.5 cm
-
-
-STEP 2: WET CALIBRATION (At deployment site)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  2a. REFERENCE WATER LEVEL
-      • Install temporary staff gauge near deployment point
-      • Read water level: H_reference
-      • OR: measure from fixed point down to water surface
-
-  2b. DEPLOY AND VERIFY
-      • Anchor the buoy
-      • Wait 5 minutes for stabilization
-      • System reports: H_system = L × cos(θ)
-      • Compare: H_error = H_system - H_reference
-      • |H_error| < 5 cm → PASS ✅
-      • |H_error| 5-15 cm → ADJUST calibration offset
-      • |H_error| > 15 cm → INVESTIGATE
-
-  2c. ORIGIN COORDINATES
-      • Issue SETORIGIN command from handheld debugger
-      • Captures current GPS as anchor origin
-      • Sets geofence radius = L + 5m margin
-
-  2d. OSCILLATION BASELINE
-      • Gently push buoy sideways and release
-      • System records oscillation period
-      • L_eff computed and compared to L_KNOWN
-      • |L_eff - L_KNOWN| < 15% → PASS ✅
-
-  2e. P_atm BASELINE
-      • While buoy floating at surface:
-      • Record P_atm_tracked value
-      • Compare to weather service P_atm
-
-  2f. DOCUMENT DEPLOYMENT
-      Record and store (in EEPROM + written log):
-      • Date, time, GPS coordinates
-      • L_KNOWN, H_reference at deployment
-      • All calibration offsets
-      • Battery voltage at deployment
-      • Firmware version
-      • Anchor type and installation method
-      • River name and station identifier
-```
-
-#### Verification Calibration (Quarterly)
-
-```
-TIME: ~30 minutes on site
-
-1. READ STAFF GAUGE (or measure water level manually)
-   H_manual = ___ m
-
-2. READ SYSTEM OUTPUT (via diagnostic command or console)
-   H_system = ___ m
-
-3. COMPARE
-   Error = H_system - H_manual
-   |Error| < 5 cm   → PASS ✅  System is accurate
-   |Error| 5-15 cm  → WARNING ⚠️  Recalibrate offset
-   |Error| > 15 cm  → FAIL ❌  Investigate
-
-4. CHECK TETHER
-   • Visual inspection: tether intact, no debris
-   • Tug test: firm connection at buoy and anchor
-   • Verify tether length hasn't changed if possible
-
-5. CHECK BUOY
-   • Visual: biofouling level? Damage? Waterline position?
-   • Compare waterline to deployment photo
-   • Wipe excessive growth if present
-
-6. CHECK SYSTEM HEALTH
-   • Issue BATT command: battery voltage?
-   • Issue FLOODSTATUS: health score?
-   • Check GPRS connectivity: NETTEST
-   • Review any alerts in server log
-
-7. RECORD
-   • Log all readings and observations
-   • Photo of buoy and staff gauge
-   • Update calibration offset if needed
-```
-
----
-
-
-```
-
-
-
-```
-The SIM800L module on the device has one responsibility: transmitting sensor data and system status to the server via HTTP POST. The device does not contact any authorities directly, does not manage contact lists, and does not wait for acknowledgments from anyone.
-
-All alert routing — deciding who gets notified, through which channel, and at what escalation level — is handled entirely by the server. The server receives the device's status payload, evaluates the response level, and dispatches notifications to the appropriate authorities through SMS, WhatsApp, IVR calls, or email depending on the severity. Contact lists are managed through the server's web interface and can be updated at any time without any changes to the device. The escalation chain, cooldowns, and re-alert logic all live on the server side.
-
-The device's role ends the moment the HTTP POST is confirmed. Everything after that is the server's responsibility.
-
-
-
-
-What the device sends
-
-Every transmit interval, the SIM800L makes one HTTP POST to the server. The payload already contains everything the server needs — water height, response level, zone, rate of change, GPS coordinates, battery, timestamp. The device does not decide anything about alerting. It just reports its state.
-
-What the server receives and tracks
-
-The server keeps a record of the last known response level for each device. Every time a new payload arrives, the server compares the incoming response level to the previously stored one. This comparison is the only trigger for any notification. If the level hasn't changed, no SMS is sent — no matter how many payloads come in. The server is not reacting to individual readings, it is reacting to level transitions.
-
-When an SMS is actually sent
-
-An SMS goes out only when the response level steps up. Specifically:
-
-When the level moves from NORMAL to WATCH, only your internal operations team is messaged. No authorities yet.
-
-When the level moves to WARNING, the server sends SMS to the Sarpanch or Ward officer and the Tahsildar's circle office. These are the closest ground-level officials who can physically verify and begin preparations.
-
-When the level moves to FLOOD, the server sends SMS to the District Control Room, the District Collector's duty number, and the local police station duty officer. At this point NDRF/SDRF mobilization becomes possible.
-
-When the level moves to CRITICAL, all the FLOOD-level contacts are re-messaged immediately with no cooldown, and the State Emergency Operations Centre is added. This is also when an IVR voice call is triggered for the most critical numbers — a recorded message that goes to voicemail even if no one picks up.
-
-The cooldown logic
-
-The cooldown now lives entirely on the server. Its purpose is different from the old device-side cooldown. It is not there to prevent the device from spamming — the device only sends one POST per interval anyway. The cooldown is there to handle sustained levels.
-
-If the water rises to FLOOD and stays there, the level-change trigger fires once. After that, no new SMS goes out unless the level changes again. However, if the water is still at FLOOD after 30 minutes with no change, the server sends a reminder SMS to the FLOOD contacts — not as a new escalation, just a status update saying the situation is ongoing. The same logic applies at CRITICAL with a 15-minute reminder interval. At WARNING the reminder interval is 60 minutes. At WATCH there is no reminder — your ops team can see the dashboard.
-
-These reminders are clearly worded differently from escalation alerts so recipients know the situation hasn't worsened, it's just persisting.
-
-De-escalation
-
-When the level steps down — say from FLOOD back to WARNING — the server sends a de-escalation message to everyone who received the FLOOD alert, telling them the level has dropped and monitoring is continuing. When the level returns fully to NORMAL, an all-clear message goes out to everyone who was contacted during the event. This gives officials a clean closure signal so they are not left wondering whether the situation resolved.
-
-The message format
-
-Since you're dealing with Indian government officials who receive messages from unknown numbers, the message format needs to look credible and official. Every message should contain the station name, the current water level in centimeters, the zone classification, the rate of rise, GPS coordinates, and a timestamp in IST. Something like:
-
-VARUNA FLOOD ALERT | Station: Godavari-KG-01 | Level: 275cm (DANGER) | Rising at 12cm/15min | GPS: 16.5N 81.8E | 14:32 IST 21-Mar-2026
-
-Short, structured, no abbreviations that an official wouldn't understand. The same format every time so that once a recipient has seen one message, they immediately know how to read the next one.
-
-Contact management
-
-All contacts are stored in the server database with their level assignment — which level triggers their notification. They are added and edited through the web interface. No SMS commands, no device-side storage, no need to touch the hardware at all. If a Tahsildar is transferred and replaced, you update one field in the database and the new person starts receiving alerts from the next event onward.
-
-The one place SMS still touches the device
-
-The device can still receive a single inbound SMS command for emergency recalibration or a manual status request, since sometimes field engineers need to interact with the device directly when there is no internet on the laptop they have with them. But this is a diagnostic channel only — it has no involvement in the alert pipeline whatsoever.
-
-<svg width="100%" viewBox="0 0 680 700" xmlns="http://www.w3.org/2000/svg">
-<defs>
-  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-  </marker>
-<mask id="imagine-text-gaps-81ubpi" maskUnits="userSpaceOnUse"><rect x="0" y="0" width="680" height="700" fill="white"/><rect x="241.7303009033203" y="12.457036018371582" width="196.30914306640625" height="23.4287052154541" fill="black" rx="2"/><rect x="233.4427490234375" y="33.04753112792969" width="213.114501953125" height="19.5429630279541" fill="black" rx="2"/><rect x="45.9349479675293" y="64.45703887939453" width="56.91021728515625" height="23.428709030151367" fill="black" rx="2"/><rect x="5.114418983459473" y="79.04753112792969" width="139.84963989257812" height="19.5429630279541" fill="black" rx="2"/><rect x="314.6602478027344" y="64.45703887939453" width="151.32748413085938" height="23.428709030151367" fill="black" rx="2"/><rect x="248.77467346191406" y="79.04753112792969" width="281.8709716796875" height="19.5429630279541" fill="black" rx="2"/><rect x="36.49380874633789" y="122.45703125" width="76.30854797363281" height="23.4287052154541" fill="black" rx="2"/><rect x="22.85323143005371" y="137.0475311279297" width="102.9982681274414" height="19.5429630279541" fill="black" rx="2"/><rect x="179.24942016601562" y="114.45703125" width="168.2058563232422" height="23.4287052154541" fill="black" rx="2"/><rect x="197.52455139160156" y="131.0475311279297" width="133.94638061523438" height="19.5429630279541" fill="black" rx="2"/><rect x="190.39056396484375" y="143.0475311279297" width="148.21266174316406" height="19.5429630279541" fill="black" rx="2"/><rect x="430.6220703125" y="114.45703125" width="171.09463500976562" height="23.4287052154541" fill="black" rx="2"/><rect x="456.9823913574219" y="131.0475311279297" width="118.70305633544922" height="19.5429630279541" fill="black" rx="2"/><rect x="442.390625" y="143.0475311279297" width="148.21266174316406" height="19.5429630279541" fill="black" rx="2"/><rect x="48.67722702026367" y="195.45703125" width="52.95791244506836" height="23.4287052154541" fill="black" rx="2"/><rect x="23.935976028442383" y="210.0475311279297" width="103.23526000976562" height="19.5429630279541" fill="black" rx="2"/><rect x="183.15451049804688" y="188.45703125" width="84.41699981689453" height="23.4287052154541" fill="black" rx="2"/><rect x="166.0937042236328" y="205.0475311279297" width="117.82756042480469" height="19.5429630279541" fill="black" rx="2"/><rect x="152.67575073242188" y="217.0475311279297" width="144.74656677246094" height="19.5429630279541" fill="black" rx="2"/><rect x="336.02642822265625" y="188.45703125" width="115.24504852294922" height="23.4287052154541" fill="black" rx="2"/><rect x="327.29364013671875" y="205.0475311279297" width="132.41786193847656" height="19.5429630279541" fill="black" rx="2"/><rect x="329.287109375" y="217.0475311279297" width="127.69081115722656" height="19.5429630279541" fill="black" rx="2"/><rect x="516.6604614257812" y="188.45703125" width="83.0098876953125" height="23.4287052154541" fill="black" rx="2"/><rect x="503.6675109863281" y="205.0475311279297" width="109.6598129272461" height="19.5429630279541" fill="black" rx="2"/><rect x="542.2415771484375" y="217.0475311279297" width="31.618019104003906" height="19.5429630279541" fill="black" rx="2"/><rect x="41.89741897583008" y="267.45703125" width="67.12244415283203" height="23.4287052154541" fill="black" rx="2"/><rect x="25.433605194091797" y="282.0475158691406" width="100.13720703125" height="19.5429630279541" fill="black" rx="2"/><rect x="157.63584899902344" y="260.45703125" width="131.8745346069336" height="23.4287052154541" fill="black" rx="2"/><rect x="159.8317108154297" y="277.04754638671875" width="128.99864959716797" height="19.5429630279541" fill="black" rx="2"/><rect x="185.4229736328125" y="289.0475158691406" width="77.15404510498047" height="19.5429630279541" fill="black" rx="2"/><rect x="356.8331298828125" y="260.45703125" width="70.69903564453125" height="23.4287052154541" fill="black" rx="2"/><rect x="327.4674377441406" y="277.04754638671875" width="129.25638580322266" height="19.5429630279541" fill="black" rx="2"/><rect x="349.5777282714844" y="291.0475158691406" width="84.84457397460938" height="19.5429630279541" fill="black" rx="2"/><rect x="501.562744140625" y="260.45703125" width="112.99354553222656" height="23.4287052154541" fill="black" rx="2"/><rect x="506.9360046386719" y="277.04754638671875" width="102.1280288696289" height="19.5429630279541" fill="black" rx="2"/><rect x="500.02459716796875" y="291.0475158691406" width="116.14379119873047" height="19.5429630279541" fill="black" rx="2"/><rect x="161.5464630126953" y="343.04754638671875" width="357.1065368652344" height="19.5429630279541" fill="black" rx="2"/><rect x="80.91419219970703" y="378.4570617675781" width="36.31732177734375" height="23.4287052154541" fill="black" rx="2"/><rect x="49.01873779296875" y="395.04754638671875" width="100.70144653320312" height="19.5429630279541" fill="black" rx="2"/><rect x="40.09367752075195" y="409.04754638671875" width="116.70704650878906" height="19.5429630279541" fill="black" rx="2"/><rect x="214.5545196533203" y="378.4570617675781" width="76.22227478027344" height="23.4287052154541" fill="black" rx="2"/><rect x="200.83302307128906" y="395.04754638671875" width="104.33399200439453" height="19.5429630279541" fill="black" rx="2"/><rect x="200.55979919433594" y="409.04754638671875" width="103.67552185058594" height="19.5429630279541" fill="black" rx="2"/><rect x="379.594482421875" y="378.4570617675781" width="55.0265007019043" height="23.4287052154541" fill="black" rx="2"/><rect x="353.7603759765625" y="395.04754638671875" width="107.14833068847656" height="19.5429630279541" fill="black" rx="2"/><rect x="366.05511474609375" y="409.04754638671875" width="82.55722045898438" height="19.5429630279541" fill="black" rx="2"/><rect x="516.1008911132812" y="378.4570617675781" width="109.90618896484375" height="23.4287052154541" fill="black" rx="2"/><rect x="514.4615478515625" y="395.04754638671875" width="113.74856567382812" height="19.5429630279541" fill="black" rx="2"/><rect x="502.67279052734375" y="409.04754638671875" width="136.67942810058594" height="19.5429630279541" fill="black" rx="2"/><rect x="293.07470703125" y="457.0475158691406" width="93.9410629272461" height="19.5429630279541" fill="black" rx="2"/><rect x="50.92656707763672" y="486.45703125" width="248.4693145751953" height="23.4287052154541" fill="black" rx="2"/><rect x="45.76581573486328" y="503.04754638671875" width="258.4683837890625" height="19.5429630279541" fill="black" rx="2"/><rect x="390.4969482421875" y="486.45703125" width="208.32199096679688" height="23.4287052154541" fill="black" rx="2"/><rect x="372.4950256347656" y="503.04754638671875" width="245.00994873046875" height="19.5429630279541" fill="black" rx="2"/><rect x="65.63976287841797" y="538.45703125" width="219.1489715576172" height="23.4287052154541" fill="black" rx="2"/><rect x="64.85047149658203" y="555.0475463867188" width="220.299072265625" height="19.5429630279541" fill="black" rx="2"/><rect x="382.6445007324219" y="538.45703125" width="225.04103088378906" height="23.4287052154541" fill="black" rx="2"/><rect x="375.6420593261719" y="555.0475463867188" width="238.79400634765625" height="19.5429630279541" fill="black" rx="2"/><rect x="75.6756362915039" y="591.0475463867188" width="528.6488037109375" height="19.5429630279541" fill="black" rx="2"/><rect x="133.74925231933594" y="607.0475463867188" width="412.5015869140625" height="19.5429630279541" fill="black" rx="2"/></mask></defs>
-
-<!-- Title -->
-<text x="340" y="30" text-anchor="middle" style="fill:rgb(250, 249, 245);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Who gets alerted — and how</text>
-<text x="340" y="48" text-anchor="middle" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Server dispatches. SIM only posts data.</text>
-
-<!-- ===== WATCH ===== -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="64" width="90" height="36" rx="6" stroke-width="0.5" style="fill:rgb(8, 80, 65);stroke:rgb(93, 202, 165);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="75" y="82" text-anchor="middle" style="fill:rgb(159, 225, 203);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">WATCH</text>
-  <text x="75" y="94" text-anchor="middle" style="fill:rgb(93, 202, 165);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">rising, not yet dangerous</text>
-</g>
-<line x1="120" y1="82" x2="148" y2="82" marker-end="url(#arrow)" stroke="#1D9E75" mask="url(#imagine-text-gaps-81ubpi)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="150" y="64" width="480" height="36" rx="6" stroke-width="0.5" style="fill:rgb(8, 80, 65);stroke:rgb(93, 202, 165);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="390" y="82" text-anchor="middle" style="fill:rgb(159, 225, 203);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Internal ops team only</text>
-  <text x="390" y="94" text-anchor="middle" style="fill:rgb(93, 202, 165);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">your engineers / field staff — via SMS or WhatsApp</text>
-</g>
-
-<!-- ===== WARNING ===== -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="122" width="90" height="36" rx="6" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="75" y="140" text-anchor="middle" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">WARNING</text>
-  <text x="75" y="152" text-anchor="middle" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">threshold crossed</text>
-</g>
-<line x1="120" y1="140" x2="148" y2="140" marker-end="url(#arrow)" stroke="#BA7517" mask="url(#imagine-text-gaps-81ubpi)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="150" y="110" width="228" height="58" rx="6" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="264" y="132" text-anchor="middle" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Village Panchayat / Ward</text>
-  <text x="264" y="146" text-anchor="middle" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Sarpanch / Ward officer</text>
-  <text x="264" y="158" text-anchor="middle" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">SMS to registered number</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="402" y="110" width="228" height="58" rx="6" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="516" y="132" text-anchor="middle" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Revenue / Tahsildar office</text>
-  <text x="516" y="146" text-anchor="middle" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Circle officer on duty</text>
-  <text x="516" y="158" text-anchor="middle" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">SMS to registered number</text>
-</g>
-
-<!-- ===== FLOOD ===== -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="196" width="90" height="36" rx="6" stroke-width="0.5" style="fill:rgb(113, 43, 19);stroke:rgb(240, 153, 123);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="75" y="213" text-anchor="middle" style="fill:rgb(245, 196, 179);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">FLOOD</text>
-  <text x="75" y="225" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">active flood event</text>
-</g>
-<line x1="120" y1="214" x2="148" y2="214" marker-end="url(#arrow)" stroke="#993C1D" mask="url(#imagine-text-gaps-81ubpi)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="150" y="184" width="150" height="58" rx="6" stroke-width="0.5" style="fill:rgb(113, 43, 19);stroke:rgb(240, 153, 123);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="225" y="206" text-anchor="middle" style="fill:rgb(245, 196, 179);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">NDRF/SDRF</text>
-  <text x="225" y="220" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">District control room</text>
-  <text x="225" y="232" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">registered landline + SMS</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="316" y="184" width="154" height="58" rx="6" stroke-width="0.5" style="fill:rgb(113, 43, 19);stroke:rgb(240, 153, 123);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="393" y="206" text-anchor="middle" style="fill:rgb(245, 196, 179);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">District Collector</text>
-  <text x="393" y="220" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">DM office duty number</text>
-  <text x="393" y="232" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">SMS (Twilio/Fast2SMS)</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="486" y="184" width="144" height="58" rx="6" stroke-width="0.5" style="fill:rgb(113, 43, 19);stroke:rgb(240, 153, 123);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="558" y="206" text-anchor="middle" style="fill:rgb(245, 196, 179);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Local police</text>
-  <text x="558" y="220" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Station duty officer</text>
-  <text x="558" y="232" text-anchor="middle" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">SMS</text>
-</g>
-
-<!-- ===== CRITICAL ===== -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="268" width="90" height="36" rx="6" stroke-width="0.5" style="fill:rgb(121, 31, 31);stroke:rgb(240, 149, 149);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="75" y="285" text-anchor="middle" style="fill:rgb(247, 193, 193);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">CRITICAL</text>
-  <text x="75" y="297" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">imminent danger</text>
-</g>
-<line x1="120" y1="286" x2="148" y2="286" marker-end="url(#arrow)" stroke="#A32D2D" mask="url(#imagine-text-gaps-81ubpi)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="150" y="256" width="148" height="58" rx="6" stroke-width="0.5" style="fill:rgb(121, 31, 31);stroke:rgb(240, 149, 149);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="224" y="278" text-anchor="middle" style="fill:rgb(247, 193, 193);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">All FLOOD contacts</text>
-  <text x="224" y="292" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">re-alerted immediately</text>
-  <text x="224" y="304" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">no cooldown</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="314" y="256" width="156" height="58" rx="6" stroke-width="0.5" style="fill:rgb(121, 31, 31);stroke:rgb(240, 149, 149);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="392" y="278" text-anchor="middle" style="fill:rgb(247, 193, 193);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">State EOC</text>
-  <text x="392" y="292" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Emergency Ops Centre</text>
-  <text x="392" y="306" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">SMS + IVR call</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="486" y="256" width="144" height="58" rx="6" stroke-width="0.5" style="fill:rgb(121, 31, 31);stroke:rgb(240, 149, 149);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="558" y="278" text-anchor="middle" style="fill:rgb(247, 193, 193);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Public broadcast</text>
-  <text x="558" y="292" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Common Alerting</text>
-  <text x="558" y="306" text-anchor="middle" style="fill:rgb(240, 149, 149);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Protocol (CAP) if live</text>
-</g>
-
-<!-- Divider -->
-<line x1="30" y1="340" x2="650" y2="340" stroke="var(--color-border-tertiary)" stroke-width="0.5" stroke-dasharray="4 4" style="fill:rgb(0, 0, 0);stroke:rgba(222, 220, 209, 0.15);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-dasharray:4px, 4px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-<text x="340" y="358" text-anchor="middle" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">How the message reaches them — from the server, not the device</text>
-
-<!-- Channel boxes -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="372" width="138" height="60" rx="8" stroke-width="0.5" style="fill:rgb(39, 80, 10);stroke:rgb(151, 196, 89);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="99" y="396" text-anchor="middle" style="fill:rgb(192, 221, 151);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">SMS</text>
-  <text x="99" y="410" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Fast2SMS / Twilio</text>
-  <text x="99" y="424" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">works on any phone</text>
-</g>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="184" y="372" width="138" height="60" rx="8" stroke-width="0.5" style="fill:rgb(39, 80, 10);stroke:rgb(151, 196, 89);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="253" y="396" text-anchor="middle" style="fill:rgb(192, 221, 151);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">WhatsApp</text>
-  <text x="253" y="410" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Meta Business API</text>
-  <text x="253" y="424" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">for staff + officers</text>
-</g>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="338" y="372" width="138" height="60" rx="8" stroke-width="0.5" style="fill:rgb(39, 80, 10);stroke:rgb(151, 196, 89);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="407" y="396" text-anchor="middle" style="fill:rgb(192, 221, 151);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">IVR call</text>
-  <text x="407" y="410" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Exotel / Knowlarity</text>
-  <text x="407" y="424" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">CRITICAL only</text>
-</g>
-
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="492" y="372" width="158" height="60" rx="8" stroke-width="0.5" style="fill:rgb(39, 80, 10);stroke:rgb(151, 196, 89);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="571" y="396" text-anchor="middle" style="fill:rgb(192, 221, 151);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">Dashboard alert</text>
-  <text x="571" y="410" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">browser push notify</text>
-  <text x="571" y="424" text-anchor="middle" style="fill:rgb(151, 196, 89);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">always-on for your team</text>
-</g>
-
-<!-- Divider 2 -->
-<line x1="30" y1="454" x2="650" y2="454" stroke="var(--color-border-tertiary)" stroke-width="0.5" stroke-dasharray="4 4" style="fill:rgb(0, 0, 0);stroke:rgba(222, 220, 209, 0.15);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-dasharray:4px, 4px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-<text x="340" y="472" text-anchor="middle" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Key design rules</text>
-
-<!-- Rules -->
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="486" width="290" height="38" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="175" y="504" text-anchor="middle" style="fill:rgb(211, 209, 199);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">One SMS per person per level-change</text>
-  <text x="175" y="518" text-anchor="middle" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">cooldown resets only when level changes again</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="340" y="486" width="310" height="38" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="495" y="504" text-anchor="middle" style="fill:rgb(211, 209, 199);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">All contacts stored in server DB</text>
-  <text x="495" y="518" text-anchor="middle" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">edit via web UI — no SMS command needed</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="30" y="538" width="290" height="38" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="175" y="556" text-anchor="middle" style="fill:rgb(211, 209, 199);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">No ACK expected from recipients</text>
-  <text x="175" y="570" text-anchor="middle" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">dashboard ACK for your team is enough</text>
-</g>
-<g style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
-  <rect x="340" y="538" width="310" height="38" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
-  <text x="495" y="556" text-anchor="middle" style="fill:rgb(211, 209, 199);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:auto">IVR call = recorded voice message</text>
-  <text x="495" y="570" text-anchor="middle" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">no one needs to pick up — voicemail works</text>
-</g>
-
-<!-- Bottom note -->
-<text x="340" y="606" text-anchor="middle" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">Government contacts are registered once in the DB. The device never needs to know who they are.</text>
-<text x="340" y="622" text-anchor="middle" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">If the contact list changes, update the server. No reflash, no SMS commands.</text>
-
-</svg>
-
-The SIM's only job is to **push data to the server**. The server handles who gets notified and how.
-
-Now for the "who do we alert" question — this is actually a well-established pattern in Indian disaster management. Let me lay it out practically:**The real-world India escalation chain:**
-
-**WATCH** — only your own team gets notified. No point disturbing officials over a sensor that's just risen a bit.
-
-**WARNING** — the Sarpanch/Ward officer and the Tahsildar's circle office. These are the people closest to the ground who can physically verify and start moving people.
-
-**FLOOD** — the District Control Room (this is a real 24/7 number every district has), the District Collector's duty number, and the local police station. These three together can mobilize NDRF/SDRF and issue evacuations.
-
-**CRITICAL** — everyone above, plus the State Emergency Operations Centre, plus an IVR voice call for the most critical contacts. A recorded voice message saying *"Flood alert — water level 280cm at Station X, GPS coordinates Y — please respond"* works even if they ignore an SMS from an unknown number.
-
-**On the IVR point specifically** — services like Exotel and Knowlarity are Indian, cheap, and built exactly for this. You configure a recorded message, give it a list of numbers, it calls each one. No one needs to pick up — it logs to voicemail. This is far more likely to get attention than an SMS from an unknown number at 3am.
-
-**The SMS message itself** also matters. Government officials respond better to messages that look official — *"VARUNA FLOOD ALERT | Station: Godavari-KG-01 | Water level: 275cm (DANGER zone) | Rate: +12cm/15min | GPS: 16.5°N 81.8°E | Issued: 14:32 IST"* is taken seriously. *"VARUNA FLOOD ALERT Level:275cm Zone:DANGER"* looks like spam.
-
-**What this means for your firmware** — literally nothing changes in the `.ino` file except removing the tier contact system and the ACK tracking. The `gprsPostData()` function you already have is perfect. The server does everything else.
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```
-
-The current algorithm is too heavy for the buoy. The buoy is running a 3D decision matrix, sustained rise detection, step-down hysteresis, time gates, cold start logic, and ACK tracking — all of that belongs on the server. The buoy's CPU should not be doing flood intelligence. It should be doing one thing: **measuring accurately and transmitting urgently based on how alarming the raw numbers look.**
-
-Here is the principle: **the buoy does not decide the flood level. It decides the transmission urgency.**
-
----
-
-## What stays on the buoy
-
-Only three things:
-
-**1. Raw measurement** — water height, rate of change, battery, GPS, sensor health. No interpretation beyond the physics.
-
-**2. Transmission urgency** — a simple 4-level escalation matrix that answers only one question: *how fast must I send this right now?* The buoy has no memory of previous states, no hysteresis, no time gates. It looks at the current reading and current rate, picks a transmission interval, and sends.
-
-**3. Immediate trigger transmits** — certain conditions bypass the interval entirely and transmit right now regardless of when the last transmit was.
-
----
-
-## The Escalation Matrix — Buoy Side OnlyGood. Now let me build the complete answer with the diagram.
-
-The key insight is this: the current code treats the buoy as a **decision maker**. It decides what level of emergency exists, holds state, manages hysteresis, and dispatches alerts. That is wrong. The buoy is a **sensor node**. Its only intelligence should be: *given what I am reading right now, how urgently must I transmit?*
-
-The server does everything else — pattern recognition, sustained rise, hysteresis, de-escalation, alert routing, cooldowns.
-
-Here is the buoy-side escalation matrix:Now the full explanation of the logic and why each decision was made this way.
-
----
-
-## The core principle
-
-The buoy has exactly two variables it looks at to decide its transmit tier: **current water height** relative to the three thresholds, and **current rate of change** per 15 minutes. That is it. No memory of previous tiers, no step-down counters, no time gates. Every reading is evaluated fresh. The tier is stateless on the buoy.
-
-The rate of change calculation stays on the buoy because it requires two consecutive readings and arithmetic — that is trivial computation the buoy must do anyway to know its own urgency. Everything beyond that — sustained rise detection, hysteresis, de-escalation logic, alert dispatch — lives on the server.
-
----
-
-## Why the thresholds for each tier are OR conditions, not AND
-
-In the current firmware the matrix requires both zone AND rate to be elevated before escalating. This is appropriate for a system that manages its own alerts and wants to avoid false alarms. But since the server now handles false alarm suppression, the buoy should be conservative in the opposite direction — it should transmit urgently whenever **either** condition is alarming, not only when both are. A fast rate in a normal zone is dangerous. A high level with a slow rate is dangerous. The buoy should not wait for both to be true simultaneously before increasing transmit frequency.
-
----
-
-## The four transmit intervals and their reasoning
-
-**30 minutes** for Tier 0 is a heartbeat. The server needs to know the device is alive and the river is stable. This is not flood monitoring interval — it is a watchdog interval.
-
-**10 minutes** for Tier 1 gives the server enough data points to build a credible trend before anything dangerous happens. The alert threshold is the first sign of trouble. At 10-minute intervals over the course of a rising river, the server gets 3-4 readings before the warning threshold is reached — enough to establish whether the rise is genuine or a transient.
-
-**2 minutes** for Tier 2 is where flood intelligence on the server side becomes meaningful. At 2-minute intervals the server can calculate its own rate of change, detect sustained rise across multiple readings, and make confident escalation decisions. If the rate is 5 cm/15 min, the buoy crosses 15 cm of rise in 45 minutes — at 2-minute intervals the server sees 22 readings in that window.
-
-**30 seconds** for Tier 3 is the absolute maximum urgency the SIM800L can sustain without overloading the GPRS session. At danger threshold with an extreme rate, the situation can become catastrophic within minutes. 30-second transmits give the server near-real-time data and allow it to escalate every tier of authorities without waiting.
-
----
-
-## The immediate triggers — why each one exists
-
-**Tier jump** — when a single reading pushes the buoy from Tier 0 to Tier 2 without passing through Tier 1, the server would not know about it until the next scheduled transmit on the new interval. Transmitting immediately on any upward jump ensures the server sees the step-change in the same reading that caused it.
-
-**Rate spike** — a jump of more than 15 cm/15min in a single step is physically unusual. It suggests either a dam opening upstream, a levee breach, or a flash flood front arriving. This is the most time-critical scenario and must reach the server immediately regardless of which tier the height puts the buoy in.
-
-**Submersion** — when the BMP280 confirms the buoy is going underwater, the tilt-based measurement has already become unreliable. The buoy needs to transmit its last valid reading and its submersion state before the data quality degrades further. After this point the pressure-based depth calculation takes over, and those readings must also arrive at the server in near real time.
-
-**Sensor fault** — if the MPU6050 fails and the HC-SR04 takes over, the server must know immediately. A reading gap followed by resumed data on a different sensor looks like a data anomaly to the server's algorithm. An explicit sensor fault transmission tells the server to update its model of the device's data quality.
-
-**Battery critical** — when battery drops below 10% the buoy may shut down within hours. The server must receive a final valid state packet so it knows the last confirmed water level before the device goes silent. Without this the server cannot distinguish between "device went offline because the flood destroyed it" and "battery died during a calm period."
-
-**Post-sleep wake** — after any light sleep period, the first reading must transmit immediately rather than waiting for the next interval. The sleep may have lasted 25 minutes. Conditions could have changed significantly. The server should not be extrapolating across a 25-minute gap when it can have a fresh reading the moment the buoy wakes.
-
----
-
-## What the buoy's payload must always contain
-
-Since the server is doing all the intelligence now, the payload from every transmit must be complete. The server cannot ask follow-up questions. Every POST must include: water height, rate of change, current tier (so the server knows why this transmit happened), battery percentage, GPS coordinates, active sensor flag (MPU6050 or HC-SR04), submersion state, pressure deviation, timestamp, and a sensor health byte that encodes the status of all sensors in a single field. The server stores all of this and runs its own flood detection algorithm across the incoming stream.
-
----
-
-## What gets removed from the firmware entirely
-
-The `sustainedBuffer` and all associated logic. The `lookupDecisionMatrix()` function. The `evaluateStepDown()` function. The `canStepDown()` function. All the step-down consecutive reading counters and time gates. The `RESP_WATCH`, `RESP_WARNING`, `RESP_FLOOD`, `RESP_CRITICAL` response levels as internal state — the buoy no longer tracks its own response level. The `currentZone` classification. The `floodAlertLevel` variable. The cold-start level detection logic. All the `dispatchAlerts()`, `dispatchDeescalation()`, and `dispatchAllClear()` functions. The ACK system entirely.
-
-What replaces all of that is one function: `classifyTransmitTier(waterHeight, ratePer15Min)` that returns 0, 1, 2, or 3, and one function: `shouldTransmitImmediately(previousTier, currentTier, ratePrevious, rateCurrent, submersionState, sensorChanged, batteryPercent)` that returns true or false. These two functions are the entire flood intelligence remaining on the buoy. Everything else moves to the server.
-```
-## 37. Serial CSV Output Format — 38 Fields
-
-```
-Field  Content                    Example
-─────  ────────────────────────   ─────────
- 1     theta (degrees)            12.45
- 2     waterHeight (cm)           45.23
- 3     correctedTiltX (deg)       10.32
- 4     correctedTiltY (deg)       6.89
- 5     olpLength (cm)             100.00
- 6     horizontalDist (cm)        21.56
- 7     currentPressure (hPa)      1013.25
- 8     currentTemperature (°C)    28.50
- 9     baselinePressure (hPa)     1013.00
-10     pressureDeviation (hPa)    0.25
-11     submersionState (0-3)      0
-12     estimatedDepth (cm)        0.00
-13     bmpAvailable (0/1)         1
-14     unixTime                   1706000000
-15     dateTimeString             2024-01-23 10:30:00
-16     rtcValid (0/1)             1
-17     ratePer15Min (cm/15m)      1.234
-18     floodAlertLevel (0-3)      0
-19     sessionDuration (sec)      3600
-20     peakHeight (cm)            48.50
-21     minHeight (cm)             12.30
-22     latitude                   12.971600
-23     longitude                  77.594600
-24     altitude (m)               920.5
-25     gpsSatellites              8
-26     gpsFixValid (0/1)          1
-27     simSignalRSSI              18
-28     simRegistered (0/1)        1
-29     simAvailable (0/1)         1
-30     currentZone (0-3)          0
-31     currentResponseLevel (0-4) 0
-32     sustainedRise (0/1)        0
-33     batteryPercent             85.5
-34     sampleInterval (sec)       1800
-35     transmitInterval (sec)     3600
-36     obLightEnabled (0/1)       1
-37     debugEnabled (0/1)         0
-38     algorithmEnabled (0/1)     0
+That is every edit needed. The logic thread is: **CSV in at 9600 → parse all 39 fields → WiFi or GPRS POST → server pushes Firebase → website updates. Config polls via WiFi GET. OTA triggered by server poll → download to SD → flash via bootloader protocol on SimSerial repurposed pins → confirm via CSV resuming.** Every piece connects.
