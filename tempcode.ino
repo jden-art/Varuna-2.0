@@ -1,5 +1,22 @@
 #include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <math.h>
+
+// ─── WiFi Configuration ───
+#define WIFI_SSID "YOUR_SSID"
+#define WIFI_PASSWORD "YOUR_PASSWORD"
+
+// ─── Firebase Configuration ───
+#define FIREBASE_API_KEY "YOUR_API_KEY"
+#define FIREBASE_AUTH_DOMAIN "YOUR_PROJECT.firebaseapp.com"
+#define FIREBASE_DATABASE_URL "https://YOUR_PROJECT-default-rtdb.firebaseio.com"
+#define FIREBASE_PROJECT_ID "YOUR_PROJECT_ID"
+#define FIREBASE_STORAGE_BUCKET "YOUR_PROJECT.appspot.com"
+#define FIREBASE_MESSAGING_SENDER_ID "YOUR_SENDER_ID"
+#define FIREBASE_APP_ID "YOUR_APP_ID"
+
+#define FIREBASE_STATION_PATH "/stations/station_01"
 
 // ─── Pin Definitions ───
 #define SDA_BUS0 8
@@ -9,19 +26,11 @@
 
 #define UART1_RX 7
 #define UART1_TX 6
-#define UART2_RX 16
-#define UART2_TX 15
-
-#define SW_UART_TX 14
-#define OTA_TX 43
-#define OTA_RX 44
-#define BOOT_CTRL 0
 
 #define BATTERY_ADC 2
 #define ALGO_BUTTON 12
 #define ALGO_LED 13
 #define STATUS_LED 3
-#define SIM800L_RST 17
 
 // ─── I2C Addresses ───
 #define MPU6050_ADDR 0x68
@@ -34,7 +43,7 @@
 #define PA_PER_METER (WATER_DENSITY * GRAVITY)
 
 // ─── OLP Configuration ───
-#define OLP_LENGTH 2.0f  // Tether length in meters — SET AT INSTALLATION
+#define OLP_LENGTH 2.0f
 
 // ─── Mode Detection Thresholds ───
 #define LATERAL_ACCEL_TAUT_ENTER 0.15f
@@ -57,8 +66,10 @@
 #define REPORT_INTERVAL_MS 5000
 #define PRESSURE_BASELINE_INTERVAL_MS 600000
 #define GPS_READ_INTERVAL_MS 2000
+#define WIFI_RECONNECT_INTERVAL_MS 30000
+#define FIREBASE_RETRY_INTERVAL_MS 15000
 
-// ─── BMP280 Calibration Data ───
+// ─── BMP280 Calibration ───
 struct BMP280Calib {
     uint16_t dig_T1;
     int16_t dig_T2, dig_T3;
@@ -75,7 +86,6 @@ enum FloodMode : uint8_t {
     MODE_SUBMERGED = 3
 };
 
-// ─── Sensor State ───
 struct IMUData {
     float ax, ay, az;
     float gx, gy, gz;
@@ -115,16 +125,20 @@ struct SystemState {
     uint32_t last_mode_eval;
     uint32_t last_report;
     uint32_t last_gps_read;
+    uint32_t last_wifi_attempt;
     bool algo_enabled;
     bool mpu_ok;
     bool bmp_ok;
     bool gps_ok;
-    bool gsm_ok;
+    bool wifi_connected;
     float latitude;
     float longitude;
     uint8_t hour, minute, second;
     uint8_t day, month;
     uint16_t year;
+    uint32_t boot_time;
+    uint32_t successful_uploads;
+    uint32_t failed_uploads;
 };
 
 // ─── Globals ───
@@ -138,8 +152,6 @@ SystemState sys;
 
 char gps_buffer[128];
 uint8_t gps_buf_idx = 0;
-char report_buffer[512];
-char gsm_response[256];
 
 // ─── Forward Declarations ───
 void initMPU6050();
@@ -149,15 +161,13 @@ void readBMP280();
 void updateSensorFusion(float dt);
 void evaluateMode();
 float computeWaterLevel();
-void initGSM();
-void sendReport();
+void connectWiFi();
+void sendToFirebase();
 void readGPS();
 void parseGNRMC(char* sentence);
 void readRTC();
 void updatePressureBaseline();
 float readBattery();
-void gsmSendAT(const char* cmd, uint32_t timeout);
-bool gsmWaitResponse(const char* expected, uint32_t timeout);
 void i2cWriteByte(TwoWire &bus, uint8_t addr, uint8_t reg, uint8_t val);
 uint8_t i2cReadByte(TwoWire &bus, uint8_t addr, uint8_t reg);
 void i2cReadBytes(TwoWire &bus, uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len);
@@ -171,18 +181,15 @@ void setup() {
     pinMode(ALGO_BUTTON, INPUT_PULLUP);
     pinMode(ALGO_LED, OUTPUT);
     pinMode(STATUS_LED, OUTPUT);
-    pinMode(SIM800L_RST, OUTPUT);
     pinMode(BATTERY_ADC, INPUT);
 
     digitalWrite(STATUS_LED, HIGH);
     digitalWrite(ALGO_LED, LOW);
-    digitalWrite(SIM800L_RST, HIGH);
 
     I2C_BUS0.begin(SDA_BUS0, SCL_BUS0, 400000);
     I2C_BUS1.begin(SDA_BUS1, SCL_BUS1, 400000);
 
     Serial1.begin(9600, SERIAL_8N1, UART1_RX, UART1_TX);
-    Serial2.begin(9600, SERIAL_8N1, UART2_RX, UART2_TX);
 
     memset(&imu, 0, sizeof(imu));
     memset(&press, 0, sizeof(press));
@@ -193,6 +200,7 @@ void setup() {
     sys.previous_mode = MODE_SLACK;
     sys.algo_enabled = true;
     sys.tether_was_taut = false;
+    sys.boot_time = millis();
 
     initMPU6050();
     initBMP280();
@@ -214,7 +222,7 @@ void setup() {
         delay(SENSOR_READ_INTERVAL_MS);
     }
 
-    initGSM();
+    connectWiFi();
 
     sys.last_sensor_read = millis();
     sys.last_mode_eval = millis();
@@ -241,7 +249,6 @@ void loop() {
     if (now - sys.last_sensor_read >= SENSOR_READ_INTERVAL_MS) {
         float dt = (now - sys.last_sensor_read) / 1000.0f;
         sys.last_sensor_read = now;
-
         readMPU6050();
         readBMP280();
         updateSensorFusion(dt);
@@ -249,13 +256,12 @@ void loop() {
 
     if (now - sys.last_mode_eval >= MODE_EVAL_INTERVAL_MS) {
         sys.last_mode_eval = now;
-
         updatePressureBaseline();
-
         if (sys.algo_enabled) {
             evaluateMode();
             sys.water_level_h = computeWaterLevel();
-            sys.flood_ratio = sys.water_level_h / sys.tether_length;
+            sys.flood_ratio = (sys.water_level_h > 0) ?
+                              sys.water_level_h / sys.tether_length : 0.0f;
         }
     }
 
@@ -264,11 +270,186 @@ void loop() {
         readGPS();
     }
 
+    if (!sys.wifi_connected && (now - sys.last_wifi_attempt >= WIFI_RECONNECT_INTERVAL_MS)) {
+        connectWiFi();
+    }
+
     if (now - sys.last_report >= REPORT_INTERVAL_MS) {
         sys.last_report = now;
         sys.battery_voltage = readBattery();
         readRTC();
-        sendReport();
+        if (sys.wifi_connected) {
+            sendToFirebase();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// WiFi
+// ═══════════════════════════════════════════════════════
+void connectWiFi() {
+    sys.last_wifi_attempt = millis();
+    sys.wifi_connected = false;
+
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start < 15000)) {
+        delay(250);
+        digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        sys.wifi_connected = true;
+        digitalWrite(STATUS_LED, LOW);
+    } else {
+        digitalWrite(STATUS_LED, HIGH);
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// FIREBASE RTDB — REST API via HTTPS PUT
+// ═══════════════════════════════════════════════════════
+void sendToFirebase() {
+    if (WiFi.status() != WL_CONNECTED) {
+        sys.wifi_connected = false;
+        return;
+    }
+
+    const char* mode_str;
+    switch (sys.current_mode) {
+        case MODE_SLACK:     mode_str = "SLACK"; break;
+        case MODE_TAUT:      mode_str = "TAUT"; break;
+        case MODE_FLOOD:     mode_str = "FLOOD"; break;
+        case MODE_SUBMERGED: mode_str = "SUBMERGED"; break;
+        default:             mode_str = "UNKNOWN"; break;
+    }
+
+    float theta_deg = imu.theta * (180.0f / M_PI);
+    uint32_t uptime_sec = (millis() - sys.boot_time) / 1000;
+
+    char timestamp[32];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d",
+             sys.year, sys.month, sys.day, sys.hour, sys.minute, sys.second);
+
+    char json[1024];
+    snprintf(json, sizeof(json),
+        "{"
+            "\"mode\":%d,"
+            "\"mode_str\":\"%s\","
+            "\"water_level\":%.3f,"
+            "\"flood_ratio\":%.3f,"
+            "\"theta_deg\":%.2f,"
+            "\"lateral_accel\":%.3f,"
+            "\"pressure_pa\":%.1f,"
+            "\"gauge_pa\":%.1f,"
+            "\"depth_m\":%.3f,"
+            "\"temperature\":%.1f,"
+            "\"battery_v\":%.2f,"
+            "\"latitude\":%.6f,"
+            "\"longitude\":%.6f,"
+            "\"timestamp\":\"%s\","
+            "\"tether_length\":%.2f,"
+            "\"uptime_s\":%lu,"
+            "\"sensors\":{"
+                "\"mpu\":%s,"
+                "\"bmp\":%s,"
+                "\"gps\":%s"
+            "},"
+            "\"uploads_ok\":%lu,"
+            "\"uploads_fail\":%lu"
+        "}",
+        sys.current_mode, mode_str,
+        sys.water_level_h,
+        sys.flood_ratio,
+        theta_deg,
+        imu.lateral_accel,
+        press.pressure_filtered,
+        press.gauge_pressure,
+        press.depth,
+        press.temperature,
+        sys.battery_voltage,
+        sys.latitude, sys.longitude,
+        timestamp,
+        sys.tether_length,
+        uptime_sec,
+        sys.mpu_ok ? "true" : "false",
+        sys.bmp_ok ? "true" : "false",
+        sys.gps_ok ? "true" : "false",
+        sys.successful_uploads,
+        sys.failed_uploads);
+
+    // ── PUT to /stations/station_01/latest.json ──
+    char url_latest[256];
+    snprintf(url_latest, sizeof(url_latest),
+             "%s%s/latest.json?auth=%s",
+             FIREBASE_DATABASE_URL, FIREBASE_STATION_PATH, FIREBASE_API_KEY);
+
+    HTTPClient http;
+    http.begin(url_latest);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.PUT(json);
+    http.end();
+
+    bool latest_ok = (code == 200);
+
+    // ── POST to /stations/station_01/history.json ──
+    char url_history[256];
+    snprintf(url_history, sizeof(url_history),
+             "%s%s/history.json?auth=%s",
+             FIREBASE_DATABASE_URL, FIREBASE_STATION_PATH, FIREBASE_API_KEY);
+
+    http.begin(url_history);
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(json);
+    http.end();
+
+    bool history_ok = (code == 200);
+
+    // ── POST alert node on mode transition ──
+    if (sys.current_mode != sys.previous_mode &&
+        (sys.current_mode == MODE_FLOOD || sys.current_mode == MODE_SUBMERGED)) {
+
+        char alert_json[512];
+        snprintf(alert_json, sizeof(alert_json),
+            "{"
+                "\"mode\":%d,"
+                "\"mode_str\":\"%s\","
+                "\"water_level\":%.3f,"
+                "\"flood_ratio\":%.3f,"
+                "\"timestamp\":\"%s\","
+                "\"latitude\":%.6f,"
+                "\"longitude\":%.6f,"
+                "\"acknowledged\":false"
+            "}",
+            sys.current_mode, mode_str,
+            sys.water_level_h,
+            sys.flood_ratio,
+            timestamp,
+            sys.latitude, sys.longitude);
+
+        char url_alert[256];
+        snprintf(url_alert, sizeof(url_alert),
+                 "%s%s/alerts.json?auth=%s",
+                 FIREBASE_DATABASE_URL, FIREBASE_STATION_PATH, FIREBASE_API_KEY);
+
+        http.begin(url_alert);
+        http.addHeader("Content-Type", "application/json");
+        http.POST(alert_json);
+        http.end();
+
+        sys.previous_mode = sys.current_mode;
+    }
+
+    if (latest_ok && history_ok) {
+        sys.successful_uploads++;
+        digitalWrite(STATUS_LED, LOW);
+    } else {
+        sys.failed_uploads++;
+        digitalWrite(STATUS_LED, HIGH);
     }
 }
 
@@ -276,14 +457,13 @@ void loop() {
 // MPU6050
 // ═══════════════════════════════════════════════════════
 void initMPU6050() {
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x6B, 0x00); // Wake
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x6B, 0x00);
     delay(50);
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x6B, 0x01); // PLL with X gyro
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1A, 0x03); // DLPF 44Hz
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1B, 0x00); // Gyro ±250°/s
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1C, 0x00); // Accel ±2g
-    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x19, 0x04); // Sample rate divider: 200Hz
-
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x6B, 0x01);
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1A, 0x03);
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1B, 0x00);
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x1C, 0x00);
+    i2cWriteByte(I2C_BUS0, MPU6050_ADDR, 0x19, 0x04);
     delay(100);
 
     uint8_t who = i2cReadByte(I2C_BUS0, MPU6050_ADDR, 0x75);
@@ -321,7 +501,7 @@ void readMPU6050() {
 }
 
 // ═══════════════════════════════════════════════════════
-// SENSOR FUSION — Complementary Filter
+// SENSOR FUSION
 // ═══════════════════════════════════════════════════════
 void updateSensorFusion(float dt) {
     if (!sys.mpu_ok) return;
@@ -335,10 +515,13 @@ void updateSensorFusion(float dt) {
     float pitch_gyro = imu.pitch_fused + imu.gy * dt * (M_PI / 180.0f);
     float roll_gyro = imu.roll_fused + imu.gx * dt * (M_PI / 180.0f);
 
-    imu.pitch_fused = COMPLEMENTARY_ALPHA * pitch_gyro + (1.0f - COMPLEMENTARY_ALPHA) * imu.pitch_accel;
-    imu.roll_fused = COMPLEMENTARY_ALPHA * roll_gyro + (1.0f - COMPLEMENTARY_ALPHA) * imu.roll_accel;
+    imu.pitch_fused = COMPLEMENTARY_ALPHA * pitch_gyro +
+                      (1.0f - COMPLEMENTARY_ALPHA) * imu.pitch_accel;
+    imu.roll_fused = COMPLEMENTARY_ALPHA * roll_gyro +
+                     (1.0f - COMPLEMENTARY_ALPHA) * imu.roll_accel;
 
-    imu.theta = sqrtf(imu.pitch_fused * imu.pitch_fused + imu.roll_fused * imu.roll_fused);
+    imu.theta = sqrtf(imu.pitch_fused * imu.pitch_fused +
+                      imu.roll_fused * imu.roll_fused);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -368,10 +551,8 @@ void initBMP280() {
     bmp_cal.dig_P8 = cal[20] | (cal[21] << 8);
     bmp_cal.dig_P9 = cal[22] | (cal[23] << 8);
 
-    // Oversampling x16 for both, normal mode, 0.5ms standby
-    i2cWriteByte(I2C_BUS1, BMP280_ADDR, 0xF5, 0x00); // config: standby 0.5ms, filter coeff 16
-    i2cWriteByte(I2C_BUS1, BMP280_ADDR, 0xF4, 0xFF); // ctrl_meas: osrs_t x16, osrs_p x16, normal
-
+    i2cWriteByte(I2C_BUS1, BMP280_ADDR, 0xF5, 0x00);
+    i2cWriteByte(I2C_BUS1, BMP280_ADDR, 0xF4, 0xFF);
     delay(50);
 }
 
@@ -384,8 +565,8 @@ void readBMP280() {
     int32_t adc_P = ((int32_t)buf[0] << 12) | ((int32_t)buf[1] << 4) | (buf[2] >> 4);
     int32_t adc_T = ((int32_t)buf[3] << 12) | ((int32_t)buf[4] << 4) | (buf[5] >> 4);
 
-    // Temperature compensation
-    int32_t var1t = ((((adc_T >> 3) - ((int32_t)bmp_cal.dig_T1 << 1))) * ((int32_t)bmp_cal.dig_T2)) >> 11;
+    int32_t var1t = ((((adc_T >> 3) - ((int32_t)bmp_cal.dig_T1 << 1))) *
+                     ((int32_t)bmp_cal.dig_T2)) >> 11;
     int32_t var2t = (((((adc_T >> 4) - ((int32_t)bmp_cal.dig_T1)) *
                        ((adc_T >> 4) - ((int32_t)bmp_cal.dig_T1))) >> 12) *
                      ((int32_t)bmp_cal.dig_T3)) >> 14;
@@ -393,7 +574,6 @@ void readBMP280() {
     press.temperature = (bmp_cal.t_fine * 5 + 128) >> 8;
     press.temperature /= 100.0f;
 
-    // Pressure compensation
     int64_t var1 = ((int64_t)bmp_cal.t_fine) - 128000;
     int64_t var2 = var1 * var1 * (int64_t)bmp_cal.dig_P6;
     var2 = var2 + ((var1 * (int64_t)bmp_cal.dig_P5) << 17);
@@ -414,7 +594,8 @@ void readBMP280() {
     p = ((p + var1 + var2) >> 8) + (((int64_t)bmp_cal.dig_P7) << 4);
 
     press.pressure_raw = (float)p / 256.0f;
-    press.pressure_filtered += PRESSURE_LPF_ALPHA * (press.pressure_raw - press.pressure_filtered);
+    press.pressure_filtered += PRESSURE_LPF_ALPHA *
+                               (press.pressure_raw - press.pressure_filtered);
 
     if (press.baseline_valid) {
         press.gauge_pressure = press.pressure_filtered - press.baseline_atmospheric;
@@ -424,7 +605,7 @@ void readBMP280() {
 }
 
 // ═══════════════════════════════════════════════════════
-// PRESSURE BASELINE MANAGEMENT
+// PRESSURE BASELINE
 // ═══════════════════════════════════════════════════════
 void updatePressureBaseline() {
     if (!sys.bmp_ok || !press.baseline_valid) return;
@@ -504,7 +685,8 @@ void evaluateMode() {
         case MODE_FLOOD:
             if (pressure_submerged) {
                 new_mode = MODE_SUBMERGED;
-            } else if (theta_deg > FLOOD_THETA_DEG * 1.2f || h_trig < FLOOD_H_RATIO * L * 0.98f) {
+            } else if (theta_deg > FLOOD_THETA_DEG * 1.2f ||
+                       h_trig < FLOOD_H_RATIO * L * 0.98f) {
                 new_mode = MODE_TAUT;
             }
             break;
@@ -663,128 +845,7 @@ float readBattery() {
         delayMicroseconds(100);
     }
     float adc_avg = sum / 16.0f;
-    float voltage = (adc_avg / 4095.0f) * 3.3f * 2.0f;
-    return voltage;
-}
-
-// ═══════════════════════════════════════════════════════
-// GSM / GPRS
-// ═══════════════════════════════════════════════════════
-void initGSM() {
-    digitalWrite(SIM800L_RST, LOW);
-    delay(200);
-    digitalWrite(SIM800L_RST, HIGH);
-    delay(3000);
-
-    for (int retry = 0; retry < 5; retry++) {
-        gsmSendAT("AT", 1000);
-        if (gsmWaitResponse("OK", 1000)) {
-            sys.gsm_ok = true;
-            break;
-        }
-        delay(1000);
-    }
-
-    if (!sys.gsm_ok) return;
-
-    gsmSendAT("ATE0", 500);
-    gsmWaitResponse("OK", 500);
-
-    gsmSendAT("AT+CMGF=1", 500);
-    gsmWaitResponse("OK", 500);
-
-    gsmSendAT("AT+CGATT=1", 5000);
-    gsmWaitResponse("OK", 5000);
-
-    gsmSendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 2000);
-    gsmWaitResponse("OK", 2000);
-
-    gsmSendAT("AT+SAPBR=3,1,\"APN\",\"internet\"", 2000);
-    gsmWaitResponse("OK", 2000);
-
-    gsmSendAT("AT+SAPBR=1,1", 10000);
-    gsmWaitResponse("OK", 10000);
-
-    gsmSendAT("AT+HTTPINIT", 2000);
-    gsmWaitResponse("OK", 2000);
-}
-
-void sendReport() {
-    if (!sys.gsm_ok) return;
-
-    const char* mode_str;
-    switch (sys.current_mode) {
-        case MODE_SLACK:     mode_str = "SLACK"; break;
-        case MODE_TAUT:      mode_str = "TAUT"; break;
-        case MODE_FLOOD:     mode_str = "FLOOD"; break;
-        case MODE_SUBMERGED: mode_str = "SUBMERGED"; break;
-        default:             mode_str = "UNKNOWN"; break;
-    }
-
-    float theta_deg = imu.theta * (180.0f / M_PI);
-
-    snprintf(report_buffer, sizeof(report_buffer),
-             "AT+HTTPPARA=\"URL\",\"http://YOUR_SERVER/api/station/report?"
-             "mode=%d&mode_str=%s"
-             "&water_level=%.3f"
-             "&flood_ratio=%.3f"
-             "&theta=%.2f"
-             "&lateral_accel=%.3f"
-             "&pressure=%.1f"
-             "&gauge_pa=%.1f"
-             "&depth=%.3f"
-             "&temp=%.1f"
-             "&bat=%.2f"
-             "&lat=%.6f&lon=%.6f"
-             "&time=%04d-%02d-%02dT%02d:%02d:%02d"
-             "&L=%.2f"
-             "&mpu=%d&bmp=%d&gps=%d\"",
-             sys.current_mode, mode_str,
-             sys.water_level_h,
-             sys.flood_ratio,
-             theta_deg,
-             imu.lateral_accel,
-             press.pressure_filtered,
-             press.gauge_pressure,
-             press.depth,
-             press.temperature,
-             sys.battery_voltage,
-             sys.latitude, sys.longitude,
-             sys.year, sys.month, sys.day,
-             sys.hour, sys.minute, sys.second,
-             sys.tether_length,
-             sys.mpu_ok, sys.bmp_ok, sys.gps_ok);
-
-    gsmSendAT(report_buffer, 3000);
-    gsmWaitResponse("OK", 3000);
-
-    gsmSendAT("AT+HTTPACTION=0", 10000);
-    if (gsmWaitResponse("+HTTPACTION:", 10000)) {
-        // Server received the data; response code in gsm_response
-    }
-}
-
-void gsmSendAT(const char* cmd, uint32_t timeout) {
-    while (Serial2.available()) Serial2.read();
-    Serial2.println(cmd);
-}
-
-bool gsmWaitResponse(const char* expected, uint32_t timeout) {
-    uint32_t start = millis();
-    uint16_t idx = 0;
-    memset(gsm_response, 0, sizeof(gsm_response));
-
-    while (millis() - start < timeout) {
-        if (Serial2.available()) {
-            char c = Serial2.read();
-            if (idx < sizeof(gsm_response) - 1) {
-                gsm_response[idx++] = c;
-            }
-            if (strstr(gsm_response, expected)) return true;
-            if (strstr(gsm_response, "ERROR")) return false;
-        }
-    }
-    return false;
+    return (adc_avg / 4095.0f) * 3.3f * 2.0f;
 }
 
 // ═══════════════════════════════════════════════════════
