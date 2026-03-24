@@ -1,2250 +1,2296 @@
 // ============================================================================
-// VARUNA BUOY — ESP32-C3 COMMUNICATION BRIDGE FIRMWARE
+// VARUNA BUOY — ESP32-C3 COMMUNICATION & OTA BRIDGE FIRMWARE
 // ============================================================================
-// ZERO external libraries — uses only ESP32 Arduino core
-// All JSON built manually with snprintf
+//
+// This firmware runs on the XIAO ESP32-C3. It handles:
+//
+// 1. RECEIVING 39-field CSV data from S3 (via software serial on GPIO 10)
+// 2. PUSHING CSV data to Firebase Realtime Database over WiFi
+// 3. BUFFERING data to SD card when WiFi is unavailable
+// 4. FLUSHING buffered SD data when WiFi reconnects
+// 5. RECEIVING configuration commands from Firebase (website)
+// 6. FORWARDING configuration commands to S3 via hardware serial
+// 7. RECEIVING OTA firmware binary from Firebase Storage
+// 8. PROGRAMMING the S3 via its UART bootloader (BOOT/EN pins)
+// 9. RESPONDING to S3 diagnostic pings ($PING → $PONG)
+// 10. REAL-TIME MODE: bypassing SD buffer when server requests it
+//
+// The C3 NEVER processes sensor data. It is a dumb pipe + OTA programmer.
+// All intelligence is on the S3.
+//
 // ============================================================================
 
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <SPI.h>
 #include <SD.h>
 
+// We implement a minimal software serial receiver for GPIO 10
+// (S3's GPIO 14 software UART TX at 9600 baud)
+
 // ============================================================================
-// PIN DEFINITIONS
+// WiFi CREDENTIALS
 // ============================================================================
-
-#define S3_DATA_RX_PIN        3
-#define S3_DATA_BAUD          9600
-
-#define S3_CMD_TX_PIN         0
-#define S3_CMD_RX_PIN         1
-#define S3_CMD_BAUD           9600
-
-#define SD_CS_PIN             4
-#define SD_SCK_PIN            5
-#define SD_MOSI_PIN           6
-#define SD_MISO_PIN           7
-
-#define S3_RESET_PIN          10
-#define S3_BOOT_PIN           8
+#define WIFI_SSID          "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD      "YOUR_WIFI_PASSWORD"
 
 // ============================================================================
 // FIREBASE CONFIGURATION
 // ============================================================================
+// Firebase Realtime Database (RTDB) REST API
+// Using REST API with database secret (legacy) or ID token
+// This avoids the need for ArduinoJson or Firebase libraries
+#define FIREBASE_HOST      "your-project-id.firebaseio.com"
+#define FIREBASE_AUTH      "YOUR_FIREBASE_DATABASE_SECRET"
+// Alternative: use Firebase Auth ID token flow
 
-#define FIREBASE_HOST         "varuna-buoy-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH         "YOUR_FIREBASE_DATABASE_SECRET"
-#define FIREBASE_PROJECT_ID   "varuna-buoy"
-#define FIREBASE_STORAGE_BUCKET "varuna-buoy.appspot.com"
+// Firebase Storage for OTA binary
+#define FIREBASE_STORAGE_BUCKET  "your-project-id.appspot.com"
 
-// Firebase paths (format with device ID using snprintf)
-#define DEVICE_ID             "VARUNA_001"
+// Device ID — unique per buoy deployment
+#define DEVICE_ID          "buoy_001"
 
 // ============================================================================
-// WIFI CONFIGURATION
+// PIN DEFINITIONS
 // ============================================================================
+// Hardware Serial to S3 (command channel)
+#define S3_CMD_RX_PIN      20   // C3 RX ← S3 TX (GPIO 43)
+#define S3_CMD_TX_PIN      21   // C3 TX → S3 RX (GPIO 44)
 
-struct WiFiCredential {
-    const char* ssid;
-    const char* password;
+// Software Serial from S3 (CSV data channel)
+#define S3_DATA_RX_PIN     10   // C3 RX ← S3 GPIO 14 (SW UART)
+
+// S3 Programming pins
+#define S3_BOOT_PIN        2    // C3 GPIO 2 → S3 GPIO 0 (BOOT)
+#define S3_RESET_PIN       3    // C3 GPIO 3 → S3 EN (RESET)
+
+// SD Card SPI pins
+#define SD_CS_PIN          4
+#define SD_SCK_PIN         5
+#define SD_MOSI_PIN        6
+#define SD_MISO_PIN        7
+
+// ============================================================================
+// SOFTWARE SERIAL CONSTANTS (receiving from S3 GPIO 14)
+// ============================================================================
+#define SW_SERIAL_BAUD     9600
+#define SW_SERIAL_BIT_US   104   // 1000000 / 9600
+#define SW_RX_BUFFER_SIZE  1200  // Large enough for 39-field CSV
+
+// ============================================================================
+// SD CARD BUFFER FILE
+// ============================================================================
+#define SD_BUFFER_FILE     "/buffer.csv"
+#define SD_BUFFER_INDEX    "/buf_idx.txt"
+#define SD_MAX_BUFFERED    10000  // Maximum lines before oldest are dropped
+
+// ============================================================================
+// FIREBASE POLL INTERVAL
+// ============================================================================
+#define FIREBASE_POLL_INTERVAL_MS    5000   // Check for commands every 5 seconds
+#define FIREBASE_POLL_FAST_MS        1000   // During real-time mode
+#define WIFI_RECONNECT_INTERVAL_MS   30000  // Retry WiFi every 30 seconds
+#define SD_FLUSH_BATCH_SIZE          10     // Lines per flush batch
+#define SD_FLUSH_INTERVAL_MS         2000   // Between flush batches
+
+// ============================================================================
+// OTA CONSTANTS
+// ============================================================================
+#define OTA_CHUNK_SIZE     1024   // Bytes per UART write to S3 bootloader
+#define S3_BOOTLOADER_BAUD 115200 // ESP32-S3 ROM bootloader baud rate
+// ESP32 ROM bootloader sync sequence
+#define SLIP_END           0xC0
+#define SLIP_ESC           0xDB
+#define SLIP_ESC_END       0xDC
+#define SLIP_ESC_ESC       0xDD
+
+// ============================================================================
+// STATE MACHINE STATES
+// ============================================================================
+enum C3State {
+    STATE_NORMAL,          // Normal operation — receive CSV, push to Firebase
+    STATE_BUFFERING,       // WiFi down — buffer to SD
+    STATE_FLUSHING,        // WiFi restored — flushing SD buffer
+    STATE_OTA_DOWNLOAD,    // Downloading OTA binary from Firebase Storage
+    STATE_OTA_FLASH,       // Flashing S3 via bootloader
+    STATE_OTA_VERIFY       // Verifying S3 came back after flash
 };
 
-WiFiCredential wifiCredentials[] = {
-    {"VARUNA_FIELD_AP",     "varuna_secure_2024"},
-    {"VARUNA_BACKUP_AP",    "varuna_backup_2024"},
-    {"VARUNA_MOBILE_AP",    "varuna_mobile_2024"},
-};
-#define NUM_WIFI_CREDENTIALS  3
-
-// ============================================================================
-// TIMING CONSTANTS
-// ============================================================================
-
-#define WIFI_CONNECT_TIMEOUT_MS       15000
-#define WIFI_RECONNECT_INTERVAL_MS    30000
-#define FIREBASE_POLL_INTERVAL_MS     10000
-#define FIREBASE_PUSH_TIMEOUT_MS      10000
-#define SD_FLUSH_BATCH_SIZE           20
-#define SD_FLUSH_INTERVAL_MS          5000
-#define HEARTBEAT_INTERVAL_MS         60000
-#define S3_RESET_PULSE_MS             100
-#define S3_BOOT_WAIT_MS               500
-#define SOFTWARE_UART_BIT_TIME_US     104
-
-// ============================================================================
-// SD CARD FILE PATHS
-// ============================================================================
-
-#define SD_DATA_DIR           "/data"
-#define SD_BUFFER_FILE        "/data/buffer.csv"
-#define SD_OTA_DIR            "/ota"
-#define SD_OTA_FILE           "/ota/s3_firmware.bin"
-
-// ============================================================================
-// SOFTWARE UART RECEIVER
-// ============================================================================
-
-#define SOFT_RX_BUFFER_SIZE   1200
-
-volatile char softRxBuffer[SOFT_RX_BUFFER_SIZE];
-volatile uint16_t softRxHead = 0;
-volatile uint16_t softRxTail = 0;
-volatile bool softRxBusy = false;
-volatile uint8_t softRxBitCount = 0;
-volatile uint8_t softRxByte = 0;
-
-hw_timer_t* softUartTimer = NULL;
-
-// ============================================================================
-// GLOBAL STATE STRUCTURES
-// ============================================================================
-
-struct WiFiState {
-    bool connected;
-    bool wasConnected;
-    unsigned long lastReconnectAttempt;
-    int currentCredentialIdx;
-    int rssi;
-    char ipAddress[16];
-} wifi_state;
-
-struct FirebaseState {
-    bool authenticated;
-    unsigned long lastPollMs;
-    unsigned long lastPushMs;
-    unsigned long lastHeartbeatMs;
-    int consecutiveFailures;
-    bool pushInProgress;
-} fb_state;
-
-struct SDCardState {
-    bool available;
-    bool bufferHasData;
-    uint32_t bufferedRecordCount;
-    uint32_t totalRecordsWritten;
-    uint32_t totalRecordsFlushed;
-    bool flushInProgress;
-    unsigned long lastFlushBatchMs;
-} sd_state;
-
-// ============================================================================
-// SENSOR DATA — parsed from S3 CSV (39 fields)
-// ============================================================================
-
-struct SensorData {
-    float theta;                    // 1
-    float waterHeight;              // 2
-    float correctedTiltX;           // 3
-    float correctedTiltY;           // 4
-    float olpLength;                // 5
-    float horizontalDist;           // 6
-    float currentPressure;          // 7
-    float currentTemperature;       // 8
-    float baselinePressure;         // 9
-    float pressureDeviation;        // 10
-    int   submersionState;          // 11
-    float estimatedDepth;           // 12
-    int   bmpAvailable;             // 13
-    unsigned long unixTime;         // 14
-    char  dateTimeString[24];       // 15
-    int   rtcValid;                 // 16
-    float ratePer15Min;             // 17
-    int   floodAlertLevel;          // 18
-    unsigned long sessionDuration;  // 19
-    float peakHeight;               // 20
-    float minHeight;                // 21
-    float latitude;                 // 22
-    float longitude;                // 23
-    float altitude;                 // 24
-    int   gpsSatellites;            // 25
-    int   gpsFixValid;              // 26
-    int   simSignalRSSI;            // 27
-    int   simRegistered;            // 28
-    int   simAvailable;             // 29
-    int   currentZone;              // 30
-    int   currentResponseLevel;     // 31
-    int   sustainedRise;            // 32
-    float batteryPercent;           // 33
-    unsigned long sampleInterval;   // 34
-    unsigned long transmitInterval; // 35
-    int   obLightEnabled;           // 36
-    int   algorithmEnabled;         // 37
-    int   currentMode;              // 38
-    int   healthScore;              // 39
-
-    bool  valid;
-    unsigned long receivedMs;
-    char  rawCSV[1024];
-} sensorData;
-
-// ============================================================================
-// CONFIG STATE
-// ============================================================================
-
-struct ConfigState {
-    uint32_t normalRateSec;
-    uint32_t highRateSec;
-    float    hMaxCm;
-    bool     realtimeMode;
-    bool     pendingConfigChange;
-    bool     configSentToS3;
-
-    uint32_t s3NormalRateSec;
-    uint32_t s3HighRateSec;
-    float    s3HMaxCm;
-} config;
-
-// ============================================================================
-// OTA STATE
-// ============================================================================
-
-enum OTAPhase {
-    OTA_IDLE = 0,
-    OTA_DOWNLOAD_PENDING,
-    OTA_DOWNLOADING,
-    OTA_DOWNLOAD_COMPLETE,
-    OTA_PROGRAMMING_S3,
-    OTA_VERIFY,
-    OTA_COMPLETE,
-    OTA_FAILED
+enum RealTimeMode {
+    RT_OFF = 0,            // Normal buffered operation
+    RT_ON  = 1             // Real-time passthrough (skip SD buffer)
 };
 
-struct OTAState {
-    OTAPhase phase;
-    char firmwareURL[256];
-    char firmwareVersion[32];
-    uint32_t firmwareSize;
-    uint32_t downloadedBytes;
-    uint32_t writtenBytes;
-    bool s3WasActive;
-    int  retryCount;
-    char errorMsg[128];
-    unsigned long phaseStartMs;
-} ota_state;
-
 // ============================================================================
-// S3 COMMUNICATION STATE
+// GLOBAL STATE
 // ============================================================================
 
-struct S3CommState {
-    bool s3Active;
-    bool pongReceived;
-    unsigned long lastDataReceived;
-    unsigned long lastPingSent;
-} s3_comm;
+// ---- WiFi ----
+bool wifiConnected       = false;
+unsigned long lastWifiAttemptMs = 0;
 
-// ============================================================================
-// BUFFERS
-// ============================================================================
+// ---- Firebase ----
+unsigned long lastFirebasePollMs = 0;
 
-static char csvLineBuf[1200];
-static uint16_t csvLineIdx = 0;
+// ---- State machine ----
+C3State currentState     = STATE_NORMAL;
+RealTimeMode realTimeMode = RT_OFF;
 
-static char s3CmdBuf[256];
-static uint8_t s3CmdIdx = 0;
+// ---- SD Card ----
+bool sdAvailable          = false;
+unsigned long sdBufferedCount = 0;
+bool sdFlushInProgress    = false;
+unsigned long lastFlushMs = 0;
+File sdFlushFile;
+bool sdFlushFileOpen      = false;
 
-// Reusable JSON buffer — large enough for sensor data JSON
-static char jsonBuffer[3072];
+// ---- Software serial receive buffer (from S3 GPIO 14) ----
+volatile char    swRxBuffer[SW_RX_BUFFER_SIZE];
+volatile int     swRxWriteIdx = 0;
+volatile int     swRxReadIdx  = 0;
+volatile bool    swRxOverflow = false;
 
-// Reusable URL buffer
-static char urlBuffer[512];
+// ---- CSV line assembly buffer ----
+char csvLineBuffer[SW_RX_BUFFER_SIZE];
+int  csvLineBufIdx = 0;
+bool csvLineReady  = false;
+char lastCSVLine[SW_RX_BUFFER_SIZE];  // Last complete CSV for Firebase push
+
+// ---- Command channel buffer (from S3 via HW Serial) ----
+char cmdRxBuffer[512];
+int  cmdRxBufIdx = 0;
+
+// ---- S3 status tracking ----
+bool s3Active            = true;   // False during OTA flash
+unsigned long s3LastDataMs = 0;
+
+// ---- OTA state ----
+bool otaPending          = false;
+char otaUrl[512]         = {0};     // URL to download firmware binary
+uint32_t otaExpectedSize = 0;
+uint32_t otaDownloadedSize = 0;
+bool otaInProgress       = false;
+
+// ---- SIM status (if SIM module connected to C3 — placeholder) ----
+int  simRSSI             = 0;
+bool simRegistered       = false;
+bool simAvailable        = false;
+
+// ---- Diagnostic forwarding ----
+bool diagPending         = false;
+
+// ---- Config received from Firebase ----
+int  cfgNormalRateSec    = 900;
+int  cfgHighRateSec      = 60;
+float cfgHMaxCm          = 200.0f;
+bool cfgDirty            = false;  // True when new config received from Firebase
 
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
-void initPins();
+// WiFi
+void wifiConnect();
+void wifiCheck();
+
+// Firebase REST API
+bool firebasePush(const char* path, const char* jsonPayload);
+bool firebasePut(const char* path, const char* jsonPayload);
+String firebaseGet(const char* path);
+bool firebaseDelete(const char* path);
+
+// CSV processing
+void processIncomingCSVData();
+void assembleCSVLine(char c);
+void handleCompleteCSVLine(const char* line);
+
+// Firebase data push
+void pushCSVToFirebase(const char* csvLine);
+String csvToFirebaseJson(const char* csvLine);
+
+// Firebase command polling
+void pollFirebaseCommands();
+void parseFirebaseConfig(const String& response);
+void parseFirebaseOTACommand(const String& response);
+void parseFirebaseRealtimeFlag(const String& response);
+void parseFirebaseDiagRequest(const String& response);
+
+// SD Card operations
 void initSDCard();
-void initWiFi();
-void initFirebase();
-void initSoftwareUARTReceiver();
-void initConfig();
-void initOTA();
+void bufferToSD(const char* csvLine);
+void flushSDToFirebase();
+void flushSDOneBatch();
+unsigned long countSDBufferedLines();
 
-void wifiConnectLoop();
-bool wifiTryConnect(const char* ssid, const char* password);
-void wifiCheckConnection();
-
-void buildFirebaseURL(char* buf, size_t bufSize, const char* path);
-bool firebaseHTTPPut(const char* path, const char* json);
-bool firebaseHTTPPatch(const char* path, const char* json);
-bool firebaseHTTPGet(const char* path, char* responseBuffer, size_t responseSize);
-bool firebaseHTTPPost(const char* path, const char* json);
-
-void buildSensorJSON(char* buf, size_t bufSize, const SensorData& data);
-void firebasePushSensorData(const SensorData& data);
-void firebasePushLatest(const SensorData& data);
-void firebasePollConfig();
-void firebasePollOTA();
-void firebasePollRealtimeMode();
-void firebaseUpdateOTAStatus(const char* status, int progress);
-void firebaseUpdateDeviceStatus();
-void firebasePushDiagnostic(const char* diagFrame);
-void firebaseUpdateSDFlushStatus(uint32_t flushed, uint32_t remaining);
-
-void sdWriteBufferRecord(const char* csvLine);
-void sdFlushToFirebase();
-void sdCreateDirectories();
-bool sdSaveOTABinary(uint8_t* data, size_t len, bool append);
-void sdDeleteOTABinary();
-size_t sdGetOTABinarySize();
-
-void IRAM_ATTR softUartStartBitISR();
-void IRAM_ATTR softUartBitSampleISR();
-void softUartProcessReceived();
-
-bool parseCSVLine(const char* csv, SensorData& data);
-int csvSplitFields(const char* csv, char fields[][32], int maxFields);
-
-void sendConfigToS3(uint32_t normalSec, uint32_t highSec, float hMaxCm);
+// Command channel with S3
+void processS3Commands();
+void handleS3Message(const char* msg);
+void sendConfigToS3();
 void sendPingToS3();
 void sendDiagRunToS3();
-void processS3Commands();
-void handleS3Response(const char* response);
 
-void startOTADownload();
-void startS3OTA();
-void s3EnterBootloader();
-void s3ExitBootloader();
+// OTA programming
+void startOTAProcess();
+void downloadOTABinary();
+void flashS3WithBinary(const char* filePath, uint32_t fileSize);
+void enterS3BootloadMode();
+void exitS3BootloadMode();
 bool s3BootloaderSync();
-void s3HardReset();
-void slipSendByte(uint8_t b);
-void slipSendFrame(uint8_t* data, size_t len);
-int slipReceiveFrame(uint8_t* buf, size_t maxLen, unsigned long timeoutMs);
-void espSendCommand(uint8_t op, uint8_t* data, uint16_t dataLen, uint32_t checksum);
-bool espReceiveResponse(uint8_t expectedOp, unsigned long timeoutMs);
-bool s3BootloaderFlashBegin(uint32_t totalSize, uint32_t blockSize, uint32_t blockCount, uint32_t offset);
-bool s3BootloaderFlashData(uint8_t* data, size_t dataLen, uint32_t seqNum);
-bool s3BootloaderFlashEnd(bool reboot);
+bool s3BootloaderBeginFlash(uint32_t size, uint32_t numBlocks,
+                             uint32_t blockSize, uint32_t offset);
+bool s3BootloaderWriteBlock(const uint8_t* data, uint32_t dataLen,
+                             uint32_t seqNum);
+bool s3BootloaderEndFlash(bool reboot);
+void slipSend(const uint8_t* data, uint32_t len);
+bool slipReceive(uint8_t* buf, uint32_t maxLen, uint32_t* receivedLen,
+                  uint32_t timeoutMs);
+uint8_t calculateChecksum(const uint8_t* data, uint32_t len);
 
-void handleNewSensorData();
-void handleRealtimeData();
-void handleBufferedData();
+// Software serial (GPIO 10 bit-bang receive via interrupt)
+void initSoftwareSerialRx();
+void IRAM_ATTR swSerialStartBitISR();
+void swSerialReadByte();
 
-void processDataPipeline();
-void processConfigPipeline();
-void processOTAPipeline();
-void processHeartbeat();
+// Utility
+void logMsg(const char* level, const char* msg);
+String urlEncode(const String& str);
+void extractJsonStringValue(const String& json, const char* key,
+                             char* outBuf, int outBufSize);
+int extractJsonIntValue(const String& json, const char* key, int defaultVal);
+float extractJsonFloatValue(const String& json, const char* key, float defaultVal);
+bool extractJsonBoolValue(const String& json, const char* key, bool defaultVal);
 
-void logMessage(const char* level, const char* msg);
-
-// ============================================================================
-// MANUAL JSON PARSING HELPERS (replacing ArduinoJson)
-// ============================================================================
-
-// Extract a string value from JSON for a given key
-// Input:  json = {"key1":"val1","key2":123,"key3":true}
-// Returns: true if found, copies value to outVal
-bool jsonExtractString(const char* json, const char* key, char* outVal, size_t outSize) {
-    // Build search pattern: "key":"
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
-
-    const char* pos = strstr(json, pattern);
-    if (!pos) return false;
-
-    pos += strlen(pattern);
-
-    size_t i = 0;
-    while (pos[i] != '"' && pos[i] != '\0' && i < outSize - 1) {
-        outVal[i] = pos[i];
-        i++;
-    }
-    outVal[i] = '\0';
-    return true;
-}
-
-// Extract a numeric value (int or float) from JSON as a long
-bool jsonExtractLong(const char* json, const char* key, long* outVal) {
-    // Try "key": pattern (number without quotes)
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-
-    const char* pos = strstr(json, pattern);
-    if (!pos) return false;
-
-    pos += strlen(pattern);
-
-    // Skip whitespace
-    while (*pos == ' ' || *pos == '\t') pos++;
-
-    // Handle quoted numbers too
-    if (*pos == '"') pos++;
-
-    char numBuf[32];
-    size_t i = 0;
-    while ((pos[i] >= '0' && pos[i] <= '9') || pos[i] == '-' || pos[i] == '.') {
-        if (i < sizeof(numBuf) - 1) numBuf[i] = pos[i];
-        i++;
-    }
-    numBuf[i < sizeof(numBuf) ? i : sizeof(numBuf) - 1] = '\0';
-
-    if (i == 0) return false;
-
-    *outVal = atol(numBuf);
-    return true;
-}
-
-// Extract a float value from JSON
-bool jsonExtractFloat(const char* json, const char* key, float* outVal) {
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-
-    const char* pos = strstr(json, pattern);
-    if (!pos) return false;
-
-    pos += strlen(pattern);
-    while (*pos == ' ' || *pos == '\t') pos++;
-    if (*pos == '"') pos++;
-
-    char numBuf[32];
-    size_t i = 0;
-    while ((pos[i] >= '0' && pos[i] <= '9') || pos[i] == '-' || pos[i] == '.') {
-        if (i < sizeof(numBuf) - 1) numBuf[i] = pos[i];
-        i++;
-    }
-    numBuf[i < sizeof(numBuf) ? i : sizeof(numBuf) - 1] = '\0';
-
-    if (i == 0) return false;
-
-    *outVal = atof(numBuf);
-    return true;
-}
-
-// Extract a boolean value from JSON
-bool jsonExtractBool(const char* json, const char* key, bool* outVal) {
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-
-    const char* pos = strstr(json, pattern);
-    if (!pos) return false;
-
-    pos += strlen(pattern);
-    while (*pos == ' ' || *pos == '\t') pos++;
-
-    if (strncmp(pos, "true", 4) == 0) {
-        *outVal = true;
-        return true;
-    } else if (strncmp(pos, "false", 5) == 0) {
-        *outVal = false;
-        return true;
-    }
-
-    return false;
-}
-
-// Check if JSON response is "null" or empty
-bool jsonIsNull(const char* json) {
-    if (!json) return true;
-    if (json[0] == '\0') return true;
-    if (strcmp(json, "null") == 0) return true;
-    if (strcmp(json, "\"null\"") == 0) return true;
-    return false;
-}
 
 // ============================================================================
-// IMPLEMENTATION — INITIALIZATION
+// ============================================================================
+//                              SETUP
+// ============================================================================
 // ============================================================================
 
-void initPins() {
-    pinMode(S3_RESET_PIN, OUTPUT);
-    digitalWrite(S3_RESET_PIN, HIGH);
+void setup() {
+    // ========================================================================
+    // 1. Initialize USB Serial for debug output
+    // ========================================================================
+    Serial.begin(115200);
+    delay(1000);
+    logMsg("INFO", "VARUNA C3 Communication Bridge — Firmware v2.0");
+    logMsg("INFO", "Initializing...");
 
+    // ========================================================================
+    // 2. Initialize S3 programming pins (BOOT and RESET)
+    //    Set them to HIGH (inactive) initially
+    // ========================================================================
     pinMode(S3_BOOT_PIN, OUTPUT);
-    digitalWrite(S3_BOOT_PIN, HIGH);
+    digitalWrite(S3_BOOT_PIN, HIGH);   // HIGH = normal boot (not flash mode)
 
-    pinMode(S3_DATA_RX_PIN, INPUT);
+    pinMode(S3_RESET_PIN, OUTPUT);
+    digitalWrite(S3_RESET_PIN, HIGH);  // HIGH = not in reset
 
-    logMessage("INFO", "Control pins initialized");
-}
+    logMsg("INFO", "S3 BOOT/RESET pins initialized (both HIGH/inactive)");
 
-void initSDCard() {
-    sd_state.available = false;
-    sd_state.bufferHasData = false;
-    sd_state.bufferedRecordCount = 0;
-    sd_state.totalRecordsWritten = 0;
-    sd_state.totalRecordsFlushed = 0;
-    sd_state.flushInProgress = false;
-    sd_state.lastFlushBatchMs = 0;
+    // ========================================================================
+    // 3. Initialize Hardware Serial to S3 (command channel)
+    //    C3 RX=GPIO20 ← S3 TX=GPIO43
+    //    C3 TX=GPIO21 → S3 RX=GPIO44
+    // ========================================================================
+    Serial1.begin(9600, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
+    logMsg("INFO", "Serial1 (S3 cmd channel) initialized @ 9600 baud");
 
+    // ========================================================================
+    // 4. Initialize Software Serial RX on GPIO 10 (CSV data from S3)
+    // ========================================================================
+    initSoftwareSerialRx();
+    logMsg("INFO", "Software Serial RX initialized on GPIO 10 @ 9600 baud");
+
+    // ========================================================================
+    // 5. Initialize SPI for SD Card
+    // ========================================================================
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    initSDCard();
 
-    if (SD.begin(SD_CS_PIN, SPI)) {
-        sd_state.available = true;
+    // ========================================================================
+    // 6. Connect to WiFi
+    // ========================================================================
+    wifiConnect();
 
-        uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-        char msg[80];
-        snprintf(msg, sizeof(msg), "SD card initialized — %llu MB", cardSize);
-        logMessage("INFO", msg);
+    // ========================================================================
+    // 7. Initialize timing
+    // ========================================================================
+    lastFirebasePollMs = millis();
+    lastWifiAttemptMs  = millis();
+    s3LastDataMs       = millis();
 
-        sdCreateDirectories();
+    logMsg("INFO", "C3 initialization complete — entering main loop");
+}
 
-        // Check for existing buffered data
-        if (SD.exists(SD_BUFFER_FILE)) {
-            File f = SD.open(SD_BUFFER_FILE, FILE_READ);
-            if (f) {
-                uint32_t count = 0;
-                while (f.available()) {
-                    String line = f.readStringUntil('\n');
-                    if (line.length() > 10) count++;
-                }
-                f.close();
 
-                if (count > 0) {
-                    sd_state.bufferHasData = true;
-                    sd_state.bufferedRecordCount = count;
-                    char msg2[80];
-                    snprintf(msg2, sizeof(msg2), "Found %lu buffered records", (unsigned long)count);
-                    logMessage("INFO", msg2);
-                }
-            }
-        }
-    } else {
-        logMessage("ERROR", "SD card initialization FAILED");
+// ============================================================================
+// ============================================================================
+//                             MAIN LOOP
+// ============================================================================
+// ============================================================================
+
+void loop() {
+    unsigned long nowMs = millis();
+
+    // ========================================================================
+    // TASK 0: WiFi monitoring and reconnection
+    // ========================================================================
+    wifiCheck();
+
+    // ========================================================================
+    // TASK 1: Receive CSV data from S3 (software serial GPIO 10)
+    //         Assemble complete lines and process them
+    // ========================================================================
+    if (s3Active) {
+        processIncomingCSVData();
     }
+
+    // ========================================================================
+    // TASK 2: Process command channel messages from S3 (HW Serial1)
+    // ========================================================================
+    if (s3Active) {
+        processS3Commands();
+    }
+
+    // ========================================================================
+    // TASK 3: Poll Firebase for commands from website
+    // ========================================================================
+    if (wifiConnected) {
+        unsigned long pollInterval = (realTimeMode == RT_ON) ?
+                                      FIREBASE_POLL_FAST_MS :
+                                      FIREBASE_POLL_INTERVAL_MS;
+
+        if ((nowMs - lastFirebasePollMs) >= pollInterval) {
+            lastFirebasePollMs = nowMs;
+            pollFirebaseCommands();
+        }
+    }
+
+    // ========================================================================
+    // TASK 4: If new config received from Firebase, forward to S3
+    // ========================================================================
+    if (cfgDirty && s3Active) {
+        sendConfigToS3();
+        cfgDirty = false;
+    }
+
+    // ========================================================================
+    // TASK 5: If diagnostic requested from Firebase, trigger on S3
+    // ========================================================================
+    if (diagPending && s3Active) {
+        sendDiagRunToS3();
+        diagPending = false;
+    }
+
+    // ========================================================================
+    // TASK 6: Flush SD buffer to Firebase when WiFi is available
+    //         (only when NOT in real-time mode)
+    // ========================================================================
+    if (wifiConnected && sdAvailable && sdBufferedCount > 0 &&
+        realTimeMode == RT_OFF && currentState != STATE_OTA_DOWNLOAD &&
+        currentState != STATE_OTA_FLASH) {
+
+        if ((nowMs - lastFlushMs) >= SD_FLUSH_INTERVAL_MS) {
+            lastFlushMs = nowMs;
+            flushSDOneBatch();
+        }
+    }
+
+    // ========================================================================
+    // TASK 7: OTA process
+    // ========================================================================
+    if (otaPending && wifiConnected) {
+        otaPending = false;
+        startOTAProcess();
+    }
+
+    // ========================================================================
+    // TASK 8: Small yield to prevent watchdog
+    // ========================================================================
+    yield();
+    delay(1);
 }
 
-void sdCreateDirectories() {
-    if (!sd_state.available) return;
-    if (!SD.exists(SD_DATA_DIR)) SD.mkdir(SD_DATA_DIR);
-    if (!SD.exists(SD_OTA_DIR)) SD.mkdir(SD_OTA_DIR);
-}
 
-void initWiFi() {
-    wifi_state.connected = false;
-    wifi_state.wasConnected = false;
-    wifi_state.lastReconnectAttempt = 0;
-    wifi_state.currentCredentialIdx = 0;
-    wifi_state.rssi = 0;
-    memset(wifi_state.ipAddress, 0, sizeof(wifi_state.ipAddress));
+// ============================================================================
+// ============================================================================
+//                       WiFi MANAGEMENT
+// ============================================================================
+// ============================================================================
+
+void wifiConnect() {
+    logMsg("INFO", "Connecting to WiFi...");
 
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    logMessage("INFO", "WiFi initialized in STA mode");
-}
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-void initFirebase() {
-    fb_state.authenticated = false;
-    fb_state.lastPollMs = 0;
-    fb_state.lastPushMs = 0;
-    fb_state.lastHeartbeatMs = 0;
-    fb_state.consecutiveFailures = 0;
-    fb_state.pushInProgress = false;
-    logMessage("INFO", "Firebase state initialized");
-}
+    unsigned long startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs < 15000)) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
 
-void initConfig() {
-    config.normalRateSec = 900;
-    config.highRateSec = 60;
-    config.hMaxCm = 200.0f;
-    config.realtimeMode = false;
-    config.pendingConfigChange = false;
-    config.configSentToS3 = false;
-    config.s3NormalRateSec = 900;
-    config.s3HighRateSec = 60;
-    config.s3HMaxCm = 200.0f;
-    logMessage("INFO", "Config initialized — normal=900s, high=60s, L=200cm");
-}
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "WiFi connected — IP: %s  RSSI: %d dBm",
+                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        logMsg("INFO", msg);
 
-void initOTA() {
-    ota_state.phase = OTA_IDLE;
-    memset(ota_state.firmwareURL, 0, sizeof(ota_state.firmwareURL));
-    memset(ota_state.firmwareVersion, 0, sizeof(ota_state.firmwareVersion));
-    ota_state.firmwareSize = 0;
-    ota_state.downloadedBytes = 0;
-    ota_state.writtenBytes = 0;
-    ota_state.s3WasActive = true;
-    ota_state.retryCount = 0;
-    memset(ota_state.errorMsg, 0, sizeof(ota_state.errorMsg));
-    ota_state.phaseStartMs = 0;
-    logMessage("INFO", "OTA state initialized");
-}
-
-// ============================================================================
-// SOFTWARE UART RECEIVER (GPIO 3, 9600 baud)
-// ============================================================================
-
-void initSoftwareUARTReceiver() {
-    softRxHead = 0;
-    softRxTail = 0;
-    softRxBusy = false;
-
-    attachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN), softUartStartBitISR, FALLING);
-
-    softUartTimer = timerBegin(0, 80, true);  // 1µs per tick
-    timerAttachInterrupt(softUartTimer, &softUartBitSampleISR, true);
-
-    logMessage("INFO", "Software UART receiver on GPIO 3 initialized");
-}
-
-void IRAM_ATTR softUartStartBitISR() {
-    if (softRxBusy) return;
-
-    softRxBusy = true;
-    softRxBitCount = 0;
-    softRxByte = 0;
-
-    detachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN));
-
-    timerAlarmWrite(softUartTimer, 156, true);  // 1.5 bit periods
-    timerAlarmEnable(softUartTimer);
-    timerRestart(softUartTimer);
-}
-
-void IRAM_ATTR softUartBitSampleISR() {
-    if (softRxBitCount < 8) {
-        int bitVal = digitalRead(S3_DATA_RX_PIN);
-        if (bitVal) {
-            softRxByte |= (1 << softRxBitCount);
-        }
-        softRxBitCount++;
-
-        if (softRxBitCount == 1) {
-            timerAlarmWrite(softUartTimer, SOFTWARE_UART_BIT_TIME_US, true);
+        // If we were buffering, switch to flushing
+        if (currentState == STATE_BUFFERING) {
+            currentState = STATE_NORMAL;
+            logMsg("INFO", "WiFi restored — will flush SD buffer");
         }
     } else {
-        timerAlarmDisable(softUartTimer);
-
-        uint16_t nextHead = (softRxHead + 1) % SOFT_RX_BUFFER_SIZE;
-        if (nextHead != softRxTail) {
-            softRxBuffer[softRxHead] = (char)softRxByte;
-            softRxHead = nextHead;
-        }
-
-        softRxBusy = false;
-        attachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN), softUartStartBitISR, FALLING);
+        wifiConnected = false;
+        logMsg("WARN", "WiFi connection failed — will buffer to SD");
+        currentState = STATE_BUFFERING;
     }
+
+    lastWifiAttemptMs = millis();
 }
 
-void softUartProcessReceived() {
-    while (softRxTail != softRxHead) {
-        char c = softRxBuffer[softRxTail];
-        softRxTail = (softRxTail + 1) % SOFT_RX_BUFFER_SIZE;
+void wifiCheck() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiConnected) {
+            wifiConnected = true;
+            logMsg("INFO", "WiFi reconnected");
+            if (currentState == STATE_BUFFERING) {
+                currentState = STATE_NORMAL;
+            }
+        }
+    } else {
+        if (wifiConnected) {
+            wifiConnected = false;
+            logMsg("WARN", "WiFi connection lost — switching to SD buffering");
+            currentState = STATE_BUFFERING;
+        }
 
-        if (c == '\n' || c == '\r') {
-            if (csvLineIdx > 10) {
-                csvLineBuf[csvLineIdx] = '\0';
+        // Attempt reconnection periodically
+        if ((millis() - lastWifiAttemptMs) >= WIFI_RECONNECT_INTERVAL_MS) {
+            lastWifiAttemptMs = millis();
+            logMsg("INFO", "Attempting WiFi reconnection...");
+            WiFi.disconnect();
+            delay(100);
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-                if (parseCSVLine(csvLineBuf, sensorData)) {
-                    sensorData.valid = true;
-                    sensorData.receivedMs = millis();
-                    strncpy(sensorData.rawCSV, csvLineBuf, sizeof(sensorData.rawCSV) - 1);
-                    sensorData.rawCSV[sizeof(sensorData.rawCSV) - 1] = '\0';
+            unsigned long start = millis();
+            while (WiFi.status() != WL_CONNECTED && (millis() - start < 10000)) {
+                delay(250);
+            }
 
-                    s3_comm.lastDataReceived = millis();
-                    s3_comm.s3Active = true;
-
-                    handleNewSensorData();
+            if (WiFi.status() == WL_CONNECTED) {
+                wifiConnected = true;
+                logMsg("INFO", "WiFi reconnected successfully");
+                if (currentState == STATE_BUFFERING) {
+                    currentState = STATE_NORMAL;
                 }
             }
-            csvLineIdx = 0;
-        } else if (csvLineIdx < sizeof(csvLineBuf) - 1) {
-            csvLineBuf[csvLineIdx++] = c;
         }
     }
 }
 
-// ============================================================================
-// CSV PARSER (39 Fields) — No library needed
-// ============================================================================
-
-int csvSplitFields(const char* csv, char fields[][32], int maxFields) {
-    int fieldIdx = 0;
-    int charIdx = 0;
-
-    for (int i = 0; csv[i] != '\0' && fieldIdx < maxFields; i++) {
-        if (csv[i] == ',') {
-            fields[fieldIdx][charIdx] = '\0';
-            fieldIdx++;
-            charIdx = 0;
-        } else if (charIdx < 31) {
-            fields[fieldIdx][charIdx++] = csv[i];
-        }
-    }
-    if (fieldIdx < maxFields) {
-        fields[fieldIdx][charIdx] = '\0';
-        fieldIdx++;
-    }
-    return fieldIdx;
-}
-
-bool parseCSVLine(const char* csv, SensorData& data) {
-    char fields[40][32];
-    memset(fields, 0, sizeof(fields));
-
-    int numFields = csvSplitFields(csv, fields, 40);
-
-    if (numFields < 39) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "CSV parse: only %d fields (need 39)", numFields);
-        logMessage("WARN", msg);
-        return false;
-    }
-
-    data.theta              = atof(fields[0]);
-    data.waterHeight        = atof(fields[1]);
-    data.correctedTiltX     = atof(fields[2]);
-    data.correctedTiltY     = atof(fields[3]);
-    data.olpLength          = atof(fields[4]);
-    data.horizontalDist     = atof(fields[5]);
-    data.currentPressure    = atof(fields[6]);
-    data.currentTemperature = atof(fields[7]);
-    data.baselinePressure   = atof(fields[8]);
-    data.pressureDeviation  = atof(fields[9]);
-    data.submersionState    = atoi(fields[10]);
-    data.estimatedDepth     = atof(fields[11]);
-    data.bmpAvailable       = atoi(fields[12]);
-    data.unixTime           = strtoul(fields[13], NULL, 10);
-    strncpy(data.dateTimeString, fields[14], sizeof(data.dateTimeString) - 1);
-    data.dateTimeString[sizeof(data.dateTimeString) - 1] = '\0';
-    data.rtcValid           = atoi(fields[15]);
-    data.ratePer15Min       = atof(fields[16]);
-    data.floodAlertLevel    = atoi(fields[17]);
-    data.sessionDuration    = strtoul(fields[18], NULL, 10);
-    data.peakHeight         = atof(fields[19]);
-    data.minHeight          = atof(fields[20]);
-    data.latitude           = atof(fields[21]);
-    data.longitude          = atof(fields[22]);
-    data.altitude           = atof(fields[23]);
-    data.gpsSatellites      = atoi(fields[24]);
-    data.gpsFixValid        = atoi(fields[25]);
-    data.simSignalRSSI      = atoi(fields[26]);
-    data.simRegistered      = atoi(fields[27]);
-    data.simAvailable       = atoi(fields[28]);
-    data.currentZone        = atoi(fields[29]);
-    data.currentResponseLevel = atoi(fields[30]);
-    data.sustainedRise      = atoi(fields[31]);
-    data.batteryPercent     = atof(fields[32]);
-    data.sampleInterval     = strtoul(fields[33], NULL, 10);
-    data.transmitInterval   = strtoul(fields[34], NULL, 10);
-    data.obLightEnabled     = atoi(fields[35]);
-    data.algorithmEnabled   = atoi(fields[36]);
-    data.currentMode        = atoi(fields[37]);
-    data.healthScore        = atoi(fields[38]);
-
-    // Populate C3-known fields
-    data.simSignalRSSI = wifi_state.rssi;
-    data.simRegistered = wifi_state.connected ? 1 : 0;
-    data.simAvailable  = 1;
-
-    return true;
-}
 
 // ============================================================================
-// WIFI
 // ============================================================================
-
-void wifiConnectLoop() {
-    if (wifi_state.connected) return;
-
-    unsigned long now = millis();
-    if (now - wifi_state.lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
-    wifi_state.lastReconnectAttempt = now;
-
-    for (int i = 0; i < NUM_WIFI_CREDENTIALS; i++) {
-        int idx = (wifi_state.currentCredentialIdx + i) % NUM_WIFI_CREDENTIALS;
-        char msg[80];
-        snprintf(msg, sizeof(msg), "Trying WiFi: %s", wifiCredentials[idx].ssid);
-        logMessage("INFO", msg);
-
-        if (wifiTryConnect(wifiCredentials[idx].ssid, wifiCredentials[idx].password)) {
-            wifi_state.currentCredentialIdx = idx;
-            return;
-        }
-    }
-    logMessage("WARN", "All WiFi credentials failed");
-}
-
-bool wifiTryConnect(const char* ssid, const char* password) {
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.begin(ssid, password);
-
-    unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - startAttempt >= WIFI_CONNECT_TIMEOUT_MS) return false;
-        delay(500);
-    }
-
-    wifi_state.connected = true;
-    wifi_state.rssi = WiFi.RSSI();
-    IPAddress ip = WiFi.localIP();
-    snprintf(wifi_state.ipAddress, sizeof(wifi_state.ipAddress),
-             "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "WiFi connected: %s IP=%s RSSI=%d",
-             ssid, wifi_state.ipAddress, wifi_state.rssi);
-    logMessage("INFO", msg);
-
-    fb_state.authenticated = true;
-    return true;
-}
-
-void wifiCheckConnection() {
-    bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
-
-    if (currentlyConnected) {
-        wifi_state.rssi = WiFi.RSSI();
-    }
-
-    if (wifi_state.wasConnected && !currentlyConnected) {
-        wifi_state.connected = false;
-        logMessage("WARN", "WiFi connection LOST");
-    }
-
-    if (!wifi_state.wasConnected && currentlyConnected) {
-        wifi_state.connected = true;
-        logMessage("INFO", "WiFi connection RESTORED");
-
-        if (sd_state.bufferHasData && sd_state.bufferedRecordCount > 0) {
-            char msg[80];
-            snprintf(msg, sizeof(msg), "WiFi back — %lu records buffered",
-                     (unsigned long)sd_state.bufferedRecordCount);
-            logMessage("INFO", msg);
-        }
-    }
-
-    wifi_state.wasConnected = currentlyConnected;
-    wifi_state.connected = currentlyConnected;
-}
-
+//                       SOFTWARE SERIAL RX (GPIO 10)
 // ============================================================================
-// FIREBASE HTTP OPERATIONS — Manual JSON, no libraries
 // ============================================================================
+//
+// The S3 sends the 39-field CSV on GPIO 14 via software UART at 9600 baud.
+// The C3 receives it on GPIO 10 using interrupt-driven bit-banging.
+//
+// When a falling edge (start bit) is detected on GPIO 10, an ISR fires.
+// The ISR samples 8 data bits at the correct timing, assembles the byte,
+// and pushes it into a ring buffer.
+//
+// The main loop reads from this ring buffer to assemble CSV lines.
+//
 
-void buildFirebaseURL(char* buf, size_t bufSize, const char* path) {
-    snprintf(buf, bufSize, "https://%s%s.json?auth=%s",
-             FIREBASE_HOST, path, FIREBASE_AUTH);
+// Timer handle for bit sampling
+hw_timer_t* swSerialTimer = NULL;
+volatile uint8_t swBitCount = 0;
+volatile uint8_t swCurrentByte = 0;
+volatile bool swReceiving = false;
+
+void initSoftwareSerialRx() {
+    pinMode(S3_DATA_RX_PIN, INPUT_PULLUP);
+
+    // Attach interrupt on falling edge (start bit)
+    attachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN),
+                    swSerialStartBitISR, FALLING);
+
+    // Initialize hardware timer for bit sampling
+    // Timer 0, prescaler 80 (1MHz tick = 1µs per tick)
+    swSerialTimer = timerBegin(0, 80, true);
+    timerAttachInterrupt(swSerialTimer, &swSerialBitTimerISR, true);
+    // Don't start the timer yet — it starts on each start bit
+    timerAlarmWrite(swSerialTimer, SW_SERIAL_BIT_US, true);
+    timerAlarmDisable(swSerialTimer);
+
+    swRxWriteIdx = 0;
+    swRxReadIdx = 0;
+    swRxOverflow = false;
 }
 
-bool firebaseHTTPPut(const char* path, const char* json) {
-    if (!wifi_state.connected) return false;
+void IRAM_ATTR swSerialStartBitISR() {
+    if (swReceiving) return;  // Already receiving a byte
 
-    char fullPath[256];
-    snprintf(fullPath, sizeof(fullPath), "/devices/%s%s", DEVICE_ID, path);
-    buildFirebaseURL(urlBuffer, sizeof(urlBuffer), fullPath);
+    // Disable the falling edge interrupt while receiving
+    detachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN));
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    swReceiving = true;
+    swBitCount = 0;
+    swCurrentByte = 0;
 
-    HTTPClient http;
-    http.begin(client, urlBuffer);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(FIREBASE_PUSH_TIMEOUT_MS);
-
-    int httpCode = http.PUT(json);
-    http.end();
-
-    if (httpCode == 200) {
-        fb_state.consecutiveFailures = 0;
-        return true;
-    } else {
-        fb_state.consecutiveFailures++;
-        char msg[80];
-        snprintf(msg, sizeof(msg), "Firebase PUT failed: HTTP %d", httpCode);
-        logMessage("ERROR", msg);
-        return false;
-    }
+    // Start timer — first alarm at 1.5 bit times to sample middle of first data bit
+    timerRestart(swSerialTimer);
+    timerAlarmWrite(swSerialTimer, SW_SERIAL_BIT_US + (SW_SERIAL_BIT_US / 2), false);
+    timerAlarmEnable(swSerialTimer);
 }
 
-bool firebaseHTTPPatch(const char* path, const char* json) {
-    if (!wifi_state.connected) return false;
-
-    char fullPath[256];
-    snprintf(fullPath, sizeof(fullPath), "/devices/%s%s", DEVICE_ID, path);
-    buildFirebaseURL(urlBuffer, sizeof(urlBuffer), fullPath);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, urlBuffer);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-HTTP-Method-Override", "PATCH");
-    http.setTimeout(FIREBASE_PUSH_TIMEOUT_MS);
-
-    int httpCode = http.PATCH(json);
-    http.end();
-
-    if (httpCode == 200) {
-        fb_state.consecutiveFailures = 0;
-        return true;
-    } else {
-        fb_state.consecutiveFailures++;
-        char msg[80];
-        snprintf(msg, sizeof(msg), "Firebase PATCH failed: HTTP %d", httpCode);
-        logMessage("ERROR", msg);
-        return false;
-    }
-}
-
-bool firebaseHTTPPost(const char* path, const char* json) {
-    if (!wifi_state.connected) return false;
-
-    char fullPath[256];
-    snprintf(fullPath, sizeof(fullPath), "/devices/%s%s", DEVICE_ID, path);
-    buildFirebaseURL(urlBuffer, sizeof(urlBuffer), fullPath);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, urlBuffer);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(FIREBASE_PUSH_TIMEOUT_MS);
-
-    int httpCode = http.POST(json);
-    http.end();
-
-    if (httpCode == 200) {
-        fb_state.consecutiveFailures = 0;
-        fb_state.lastPushMs = millis();
-        return true;
-    } else {
-        fb_state.consecutiveFailures++;
-        char msg[80];
-        snprintf(msg, sizeof(msg), "Firebase POST failed: HTTP %d", httpCode);
-        logMessage("ERROR", msg);
-        return false;
-    }
-}
-
-bool firebaseHTTPGet(const char* path, char* responseBuffer, size_t responseSize) {
-    if (!wifi_state.connected) {
-        responseBuffer[0] = '\0';
-        return false;
-    }
-
-    char fullPath[256];
-    snprintf(fullPath, sizeof(fullPath), "/devices/%s%s", DEVICE_ID, path);
-    buildFirebaseURL(urlBuffer, sizeof(urlBuffer), fullPath);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, urlBuffer);
-    http.setTimeout(FIREBASE_PUSH_TIMEOUT_MS);
-
-    int httpCode = http.GET();
-
-    if (httpCode == 200) {
-        String payload = http.getString();
-        strncpy(responseBuffer, payload.c_str(), responseSize - 1);
-        responseBuffer[responseSize - 1] = '\0';
-        fb_state.consecutiveFailures = 0;
-        http.end();
-        return true;
-    } else {
-        fb_state.consecutiveFailures++;
-        responseBuffer[0] = '\0';
-        http.end();
-        return false;
-    }
-}
-
-// ============================================================================
-// JSON BUILDER — Manual string construction
-// ============================================================================
-
-void buildSensorJSON(char* buf, size_t bufSize, const SensorData& data) {
-    snprintf(buf, bufSize,
-        "{"
-        "\"theta\":%.2f,"
-        "\"waterHeight\":%.2f,"
-        "\"correctedTiltX\":%.2f,"
-        "\"correctedTiltY\":%.2f,"
-        "\"olpLength\":%.2f,"
-        "\"horizontalDist\":%.2f,"
-        "\"currentPressure\":%.2f,"
-        "\"currentTemperature\":%.2f,"
-        "\"baselinePressure\":%.2f,"
-        "\"pressureDeviation\":%.2f,"
-        "\"submersionState\":%d,"
-        "\"estimatedDepth\":%.2f,"
-        "\"bmpAvailable\":%d,"
-        "\"unixTime\":%lu,"
-        "\"dateTimeString\":\"%s\","
-        "\"rtcValid\":%d,"
-        "\"ratePer15Min\":%.3f,"
-        "\"floodAlertLevel\":%d,"
-        "\"sessionDuration\":%lu,"
-        "\"peakHeight\":%.2f,"
-        "\"minHeight\":%.2f,"
-        "\"latitude\":%.6f,"
-        "\"longitude\":%.6f,"
-        "\"altitude\":%.1f,"
-        "\"gpsSatellites\":%d,"
-        "\"gpsFixValid\":%d,"
-        "\"simSignalRSSI\":%d,"
-        "\"simRegistered\":%d,"
-        "\"simAvailable\":%d,"
-        "\"currentZone\":%d,"
-        "\"currentResponseLevel\":%d,"
-        "\"sustainedRise\":%d,"
-        "\"batteryPercent\":%.1f,"
-        "\"sampleInterval\":%lu,"
-        "\"transmitInterval\":%lu,"
-        "\"obLightEnabled\":%d,"
-        "\"algorithmEnabled\":%d,"
-        "\"currentMode\":%d,"
-        "\"healthScore\":%d,"
-        "\"deviceId\":\"%s\","
-        "\"wifiRSSI\":%d,"
-        "\"c3Timestamp\":%lu"
-        "}",
-        data.theta,
-        data.waterHeight,
-        data.correctedTiltX,
-        data.correctedTiltY,
-        data.olpLength,
-        data.horizontalDist,
-        data.currentPressure,
-        data.currentTemperature,
-        data.baselinePressure,
-        data.pressureDeviation,
-        data.submersionState,
-        data.estimatedDepth,
-        data.bmpAvailable,
-        (unsigned long)data.unixTime,
-        data.dateTimeString,
-        data.rtcValid,
-        data.ratePer15Min,
-        data.floodAlertLevel,
-        (unsigned long)data.sessionDuration,
-        data.peakHeight,
-        data.minHeight,
-        data.latitude,
-        data.longitude,
-        data.altitude,
-        data.gpsSatellites,
-        data.gpsFixValid,
-        data.simSignalRSSI,
-        data.simRegistered,
-        data.simAvailable,
-        data.currentZone,
-        data.currentResponseLevel,
-        data.sustainedRise,
-        data.batteryPercent,
-        (unsigned long)data.sampleInterval,
-        (unsigned long)data.transmitInterval,
-        data.obLightEnabled,
-        data.algorithmEnabled,
-        data.currentMode,
-        data.healthScore,
-        DEVICE_ID,
-        wifi_state.rssi,
-        (unsigned long)millis()
-    );
-}
-
-void buildBufferedSensorJSON(char* buf, size_t bufSize, const SensorData& data, unsigned long bufferTimestamp) {
-    // Same as buildSensorJSON but with buffered flag
-    int len = 0;
-
-    // Build main JSON
-    buildSensorJSON(buf, bufSize, data);
-
-    // Find the closing brace and insert buffered fields before it
-    len = strlen(buf);
-    if (len > 1 && buf[len - 1] == '}') {
-        buf[len - 1] = '\0';  // Remove closing brace
-        snprintf(buf + len - 1, bufSize - len + 1,
-                 ",\"buffered\":true,\"bufferTimestamp\":%lu}",
-                 bufferTimestamp);
-    }
-}
-
-// ============================================================================
-// FIREBASE DATA PUSH
-// ============================================================================
-
-void firebasePushSensorData(const SensorData& data) {
-    if (!wifi_state.connected || !fb_state.authenticated) return;
-
-    fb_state.pushInProgress = true;
-
-    buildSensorJSON(jsonBuffer, sizeof(jsonBuffer), data);
-
-    // POST to sensorData (creates unique keys)
-    firebaseHTTPPost("/sensorData", jsonBuffer);
-
-    // PUT to latest (overwrites)
-    firebasePushLatest(data);
-
-    fb_state.pushInProgress = false;
-}
-
-void firebasePushLatest(const SensorData& data) {
-    buildSensorJSON(jsonBuffer, sizeof(jsonBuffer), data);
-    firebaseHTTPPut("/latest", jsonBuffer);
-}
-
-// ============================================================================
-// FIREBASE CONFIG POLLING
-// ============================================================================
-
-void firebasePollConfig() {
-    if (!wifi_state.connected || !fb_state.authenticated) return;
-
-    unsigned long now = millis();
-    if (now - fb_state.lastPollMs < FIREBASE_POLL_INTERVAL_MS) return;
-    fb_state.lastPollMs = now;
-
-    // Poll pending config
-    char response[512];
-    if (!firebaseHTTPGet("/config/pending", response, sizeof(response))) return;
-
-    if (!jsonIsNull(response) && strlen(response) > 5) {
-        long val;
-        float fval;
-        bool changed = false;
-
-        if (jsonExtractLong(response, "normalRateSec", &val)) {
-            if ((uint32_t)val != config.normalRateSec && val >= 10 && val <= 3600) {
-                config.normalRateSec = (uint32_t)val;
-                changed = true;
-            }
-        }
-
-        if (jsonExtractLong(response, "highRateSec", &val)) {
-            if ((uint32_t)val != config.highRateSec && val >= 5 && val <= 3600) {
-                config.highRateSec = (uint32_t)val;
-                changed = true;
-            }
-        }
-
-        if (jsonExtractFloat(response, "hMaxCm", &fval)) {
-            if (fval != config.hMaxCm && fval >= 10.0f && fval <= 10000.0f) {
-                config.hMaxCm = fval;
-                changed = true;
-            }
-        }
-
-        if (changed) {
-            config.pendingConfigChange = true;
-            config.configSentToS3 = false;
-
-            char msg[128];
-            snprintf(msg, sizeof(msg), "New config: normal=%lus, high=%lus, hMax=%.1fcm",
-                     (unsigned long)config.normalRateSec,
-                     (unsigned long)config.highRateSec,
-                     config.hMaxCm);
-            logMessage("INFO", msg);
-
-            // Clear pending
-            firebaseHTTPPut("/config/pending", "null");
-        }
-    }
-
-    // Poll real-time mode
-    firebasePollRealtimeMode();
-}
-
-void firebasePollRealtimeMode() {
-    char response[32];
-    if (!firebaseHTTPGet("/config/realtimeMode", response, sizeof(response))) return;
-
-    if (!jsonIsNull(response)) {
-        bool newMode = (strstr(response, "true") != NULL);
-        if (newMode != config.realtimeMode) {
-            config.realtimeMode = newMode;
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Real-time mode: %s",
-                     config.realtimeMode ? "ENABLED" : "DISABLED");
-            logMessage("INFO", msg);
-        }
-    }
-}
-
-// ============================================================================
-// FIREBASE OTA POLLING
-// ============================================================================
-
-void firebasePollOTA() {
-    if (!wifi_state.connected || !fb_state.authenticated) return;
-    if (ota_state.phase != OTA_IDLE) return;
-
-    char response[512];
-    if (!firebaseHTTPGet("/ota", response, sizeof(response))) return;
-
-    if (jsonIsNull(response) || strlen(response) < 10) return;
-
-    bool trigger = false;
-    if (!jsonExtractBool(response, "trigger", &trigger)) return;
-    if (!trigger) return;
-
-    // OTA triggered
-    jsonExtractString(response, "url", ota_state.firmwareURL, sizeof(ota_state.firmwareURL));
-    jsonExtractString(response, "version", ota_state.firmwareVersion, sizeof(ota_state.firmwareVersion));
-
-    long size = 0;
-    if (jsonExtractLong(response, "size", &size)) {
-        ota_state.firmwareSize = (uint32_t)size;
-    }
-
-    char msg[256];
-    snprintf(msg, sizeof(msg), "OTA triggered — version: %s, size: %lu",
-             ota_state.firmwareVersion, (unsigned long)ota_state.firmwareSize);
-    logMessage("INFO", msg);
-
-    ota_state.phase = OTA_DOWNLOAD_PENDING;
-    ota_state.phaseStartMs = millis();
-    ota_state.downloadedBytes = 0;
-    ota_state.writtenBytes = 0;
-    ota_state.retryCount = 0;
-    ota_state.s3WasActive = s3_comm.s3Active;
-
-    // Clear trigger
-    firebaseHTTPPatch("/ota", "{\"trigger\":false}");
-    firebaseUpdateOTAStatus("DOWNLOAD_PENDING", 0);
-}
-
-void firebaseUpdateOTAStatus(const char* status, int progress) {
-    char json[256];
-    snprintf(json, sizeof(json),
-             "{\"status\":\"%s\",\"progress\":%d,\"phase\":%d,\"version\":\"%s\",\"timestamp\":%lu}",
-             status, progress, (int)ota_state.phase,
-             ota_state.firmwareVersion, (unsigned long)millis());
-
-    firebaseHTTPPatch("/ota/status", json);
-}
-
-void firebasePushDiagnostic(const char* diagFrame) {
-    if (!wifi_state.connected) return;
-
-    int vals[12];
-    int parsed = sscanf(diagFrame, "$DIAG,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-                        &vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5],
-                        &vals[6], &vals[7], &vals[8], &vals[9], &vals[10], &vals[11]);
-
-    if (parsed == 12) {
-        snprintf(jsonBuffer, sizeof(jsonBuffer),
-            "{\"mpuWhoAmI\":%d,\"mpuAccel\":%d,\"mpuGyro\":%d,"
-            "\"bmpChipId\":%d,\"bmpPressure\":%d,\"bmpTemp\":%d,"
-            "\"rtcOsc\":%d,\"rtcTime\":%d,\"gpsUart\":%d,"
-            "\"battery\":%d,\"c3Pong\":%d,\"totalFaults\":%d,"
-            "\"timestamp\":%lu,\"deviceId\":\"%s\"}",
-            vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
-            vals[6], vals[7], vals[8], vals[9], vals[10], vals[11],
-            (unsigned long)millis(), DEVICE_ID);
-
-        firebaseHTTPPost("/diagnostics", jsonBuffer);
-        logMessage("INFO", "Diagnostic report pushed to Firebase");
-    }
-}
-
-void firebaseUpdateDeviceStatus() {
-    if (!wifi_state.connected) return;
-
-    unsigned long now = millis();
-    if (now - fb_state.lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
-    fb_state.lastHeartbeatMs = now;
-
-    snprintf(jsonBuffer, sizeof(jsonBuffer),
-        "{\"online\":true,\"wifiRSSI\":%d,\"ip\":\"%s\","
-        "\"s3Active\":%s,\"sdAvailable\":%s,"
-        "\"sdBuffered\":%lu,\"otaPhase\":%d,"
-        "\"uptime\":%lu,\"realtimeMode\":%s,"
-        "\"configNormal\":%lu,\"configHigh\":%lu,"
-        "\"configHMax\":%.1f,\"freeHeap\":%lu,"
-        "\"timestamp\":%lu}",
-        wifi_state.rssi,
-        wifi_state.ipAddress,
-        s3_comm.s3Active ? "true" : "false",
-        sd_state.available ? "true" : "false",
-        (unsigned long)sd_state.bufferedRecordCount,
-        (int)ota_state.phase,
-        (unsigned long)(millis() / 1000),
-        config.realtimeMode ? "true" : "false",
-        (unsigned long)config.normalRateSec,
-        (unsigned long)config.highRateSec,
-        config.hMaxCm,
-        (unsigned long)ESP.getFreeHeap(),
-        (unsigned long)millis());
-
-    firebaseHTTPPut("/status", jsonBuffer);
-}
-
-void firebaseUpdateSDFlushStatus(uint32_t flushed, uint32_t remaining) {
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"totalFlushed\":%lu,\"remaining\":%lu,\"timestamp\":%lu}",
-             (unsigned long)flushed, (unsigned long)remaining, (unsigned long)millis());
-
-    firebaseHTTPPatch("/sdFlushStatus", json);
-}
-
-// ============================================================================
-// SD CARD OPERATIONS
-// ============================================================================
-
-void sdWriteBufferRecord(const char* csvLine) {
-    if (!sd_state.available) return;
-
-    File f = SD.open(SD_BUFFER_FILE, FILE_APPEND);
-    if (f) {
-        unsigned long ts = millis();
-        f.print(ts);
-        f.print("|");
-        f.println(csvLine);
-        f.close();
-
-        sd_state.bufferedRecordCount++;
-        sd_state.totalRecordsWritten++;
-        sd_state.bufferHasData = true;
-
-        if (sd_state.bufferedRecordCount % 100 == 0) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "SD buffer: %lu records",
-                     (unsigned long)sd_state.bufferedRecordCount);
-            logMessage("INFO", msg);
-        }
-    } else {
-        logMessage("ERROR", "Failed to open SD buffer file");
-    }
-}
-
-void sdFlushToFirebase() {
-    if (!sd_state.available || !sd_state.bufferHasData) return;
-    if (!wifi_state.connected || !fb_state.authenticated) return;
-    if (config.realtimeMode) return;
-    if (ota_state.phase != OTA_IDLE) return;
-
-    unsigned long now = millis();
-    if (now - sd_state.lastFlushBatchMs < SD_FLUSH_INTERVAL_MS) return;
-    sd_state.lastFlushBatchMs = now;
-
-    File readFile = SD.open(SD_BUFFER_FILE, FILE_READ);
-    if (!readFile) {
-        logMessage("ERROR", "Cannot open SD buffer for flush");
+void IRAM_ATTR swSerialBitTimerISR() {
+    if (!swReceiving) {
+        timerAlarmDisable(swSerialTimer);
         return;
     }
 
-    String remainingLines = "";
-    int flushedThisBatch = 0;
-    bool errorOccurred = false;
+    if (swBitCount < 8) {
+        // Sample data bit
+        int bitVal = digitalRead(S3_DATA_RX_PIN);
+        if (bitVal) {
+            swCurrentByte |= (1 << swBitCount);
+        }
+        swBitCount++;
 
-    while (readFile.available() && !errorOccurred) {
-        String line = readFile.readStringUntil('\n');
-        line.trim();
-        if (line.length() < 10) continue;
+        if (swBitCount < 8) {
+            // Set timer for next bit (1 bit time from now)
+            timerAlarmWrite(swSerialTimer, SW_SERIAL_BIT_US, false);
+            timerAlarmEnable(swSerialTimer);
+        } else {
+            // All 8 bits received — wait for stop bit duration then finish
+            timerAlarmWrite(swSerialTimer, SW_SERIAL_BIT_US, false);
+            timerAlarmEnable(swSerialTimer);
+        }
+    } else {
+        // Stop bit period — byte is complete
+        timerAlarmDisable(swSerialTimer);
+        swReceiving = false;
 
-        if (flushedThisBatch < SD_FLUSH_BATCH_SIZE) {
-            int separatorIdx = line.indexOf('|');
-            if (separatorIdx > 0) {
-                String csvPart = line.substring(separatorIdx + 1);
-                unsigned long bufTs = line.substring(0, separatorIdx).toInt();
+        // Push byte into ring buffer
+        int nextWriteIdx = (swRxWriteIdx + 1) % SW_RX_BUFFER_SIZE;
+        if (nextWriteIdx != swRxReadIdx) {
+            swRxBuffer[swRxWriteIdx] = swCurrentByte;
+            swRxWriteIdx = nextWriteIdx;
+        } else {
+            swRxOverflow = true;
+        }
 
-                SensorData bufferedData;
-                memset(&bufferedData, 0, sizeof(bufferedData));
+        // Re-attach falling edge interrupt for next byte
+        attachInterrupt(digitalPinToInterrupt(S3_DATA_RX_PIN),
+                        swSerialStartBitISR, FALLING);
+    }
+}
 
-                if (parseCSVLine(csvPart.c_str(), bufferedData)) {
-                    bufferedData.valid = true;
+// Read one byte from the software serial ring buffer
+// Returns -1 if no data available
+int swSerialRead() {
+    if (swRxReadIdx == swRxWriteIdx) return -1;
 
-                    buildBufferedSensorJSON(jsonBuffer, sizeof(jsonBuffer), bufferedData, bufTs);
+    char c = swRxBuffer[swRxReadIdx];
+    swRxReadIdx = (swRxReadIdx + 1) % SW_RX_BUFFER_SIZE;
+    return (int)(uint8_t)c;
+}
 
-                    if (firebaseHTTPPost("/sensorData", jsonBuffer)) {
-                        flushedThisBatch++;
-                        sd_state.totalRecordsFlushed++;
-                    } else {
-                        errorOccurred = true;
-                        remainingLines += line + "\n";
-                    }
+int swSerialAvailable() {
+    int avail = swRxWriteIdx - swRxReadIdx;
+    if (avail < 0) avail += SW_RX_BUFFER_SIZE;
+    return avail;
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       CSV DATA PROCESSING
+// ============================================================================
+// ============================================================================
+
+void processIncomingCSVData() {
+    // Read bytes from software serial and assemble into lines
+    while (swSerialAvailable() > 0) {
+        int c = swSerialRead();
+        if (c < 0) break;
+
+        assembleCSVLine((char)c);
+    }
+
+    // If a complete CSV line is ready, process it
+    if (csvLineReady) {
+        csvLineReady = false;
+        handleCompleteCSVLine(lastCSVLine);
+    }
+}
+
+void assembleCSVLine(char c) {
+    if (c == '\n' || c == '\r') {
+        if (csvLineBufIdx > 0) {
+            csvLineBuffer[csvLineBufIdx] = '\0';
+
+            // Copy to lastCSVLine
+            strncpy(lastCSVLine, csvLineBuffer, sizeof(lastCSVLine) - 1);
+            lastCSVLine[sizeof(lastCSVLine) - 1] = '\0';
+
+            csvLineReady = true;
+            csvLineBufIdx = 0;
+        }
+    } else {
+        if (csvLineBufIdx < (int)sizeof(csvLineBuffer) - 1) {
+            csvLineBuffer[csvLineBufIdx++] = c;
+        } else {
+            // Buffer overflow — reset
+            csvLineBufIdx = 0;
+        }
+    }
+}
+
+void handleCompleteCSVLine(const char* line) {
+    s3LastDataMs = millis();
+
+    // Check if it's a diagnostic frame
+    if (strncmp(line, "$DIAG,", 6) == 0) {
+        // Forward diagnostic to Firebase
+        if (wifiConnected) {
+            pushDiagToFirebase(line);
+        }
+        logMsg("INFO", "Received diagnostic frame from S3");
+        return;
+    }
+
+    // It's a normal CSV data line — validate it has enough commas (38 for 39 fields)
+    int commaCount = 0;
+    for (int i = 0; line[i] != '\0'; i++) {
+        if (line[i] == ',') commaCount++;
+    }
+
+    if (commaCount < 30) {
+        // Not enough fields — likely corrupted
+        char msg[64];
+        snprintf(msg, sizeof(msg), "CSV rejected: only %d commas (need 38)", commaCount);
+        logMsg("WARN", msg);
+        return;
+    }
+
+    // Decide what to do with the CSV based on current state
+    if (realTimeMode == RT_ON && wifiConnected) {
+        // REAL-TIME MODE: push directly to Firebase, skip SD
+        pushCSVToFirebase(line);
+    }
+    else if (wifiConnected && currentState == STATE_NORMAL) {
+        // Normal mode with WiFi: push to Firebase
+        pushCSVToFirebase(line);
+
+        // Also save to SD for local backup if SD is available
+        if (sdAvailable) {
+            bufferToSD(line);
+        }
+    }
+    else {
+        // WiFi is down or we're in a non-normal state: buffer to SD
+        if (sdAvailable) {
+            bufferToSD(line);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Buffered to SD (total: %lu)", sdBufferedCount);
+            logMsg("INFO", msg);
+        } else {
+            logMsg("ERROR", "WiFi down AND SD unavailable — DATA LOST");
+        }
+    }
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       FIREBASE REST API
+// ============================================================================
+// ============================================================================
+//
+// We use raw HTTP REST calls to Firebase RTDB instead of any library.
+// Firebase RTDB REST API:
+//   PUT    https://<host>/<path>.json?auth=<secret>  — Set value
+//   POST   https://<host>/<path>.json?auth=<secret>  — Push (auto-key)
+//   GET    https://<host>/<path>.json?auth=<secret>  — Read value
+//   DELETE https://<host>/<path>.json?auth=<secret>  — Delete
+//
+// All payloads are raw JSON strings built manually (no ArduinoJson).
+//
+
+bool firebasePush(const char* path, const char* jsonPayload) {
+    if (!wifiConnected) return false;
+
+    HTTPClient http;
+    String url = String("https://") + FIREBASE_HOST + "/" + path +
+                 ".json?auth=" + FIREBASE_AUTH;
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(10000);
+
+    int httpCode = http.POST(jsonPayload);
+    bool success = (httpCode >= 200 && httpCode < 300);
+
+    if (!success) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Firebase POST failed: HTTP %d at %s", httpCode, path);
+        logMsg("ERROR", msg);
+    }
+
+    http.end();
+    return success;
+}
+
+bool firebasePut(const char* path, const char* jsonPayload) {
+    if (!wifiConnected) return false;
+
+    HTTPClient http;
+    String url = String("https://") + FIREBASE_HOST + "/" + path +
+                 ".json?auth=" + FIREBASE_AUTH;
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(10000);
+
+    int httpCode = http.PUT(jsonPayload);
+    bool success = (httpCode >= 200 && httpCode < 300);
+
+    if (!success) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Firebase PUT failed: HTTP %d at %s", httpCode, path);
+        logMsg("ERROR", msg);
+    }
+
+    http.end();
+    return success;
+}
+
+String firebaseGet(const char* path) {
+    if (!wifiConnected) return "";
+
+    HTTPClient http;
+    String url = String("https://") + FIREBASE_HOST + "/" + path +
+                 ".json?auth=" + FIREBASE_AUTH;
+
+    http.begin(url);
+    http.setTimeout(10000);
+
+    int httpCode = http.GET();
+    String payload = "";
+
+    if (httpCode >= 200 && httpCode < 300) {
+        payload = http.getString();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Firebase GET failed: HTTP %d at %s", httpCode, path);
+        logMsg("ERROR", msg);
+    }
+
+    http.end();
+    return payload;
+}
+
+bool firebaseDelete(const char* path) {
+    if (!wifiConnected) return false;
+
+    HTTPClient http;
+    String url = String("https://") + FIREBASE_HOST + "/" + path +
+                 ".json?auth=" + FIREBASE_AUTH;
+
+    http.begin(url);
+    http.setTimeout(10000);
+
+    int httpCode = http.sendRequest("DELETE");
+    bool success = (httpCode >= 200 && httpCode < 300);
+
+    http.end();
+    return success;
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       CSV → FIREBASE JSON CONVERSION
+// ============================================================================
+// ============================================================================
+//
+// Convert the 39-field CSV into a JSON string manually.
+// No ArduinoJson used — pure string formatting.
+//
+
+void pushCSVToFirebase(const char* csvLine) {
+    String json = csvToFirebaseJson(csvLine);
+
+    if (json.length() == 0) {
+        logMsg("ERROR", "Failed to convert CSV to JSON");
+        return;
+    }
+
+    // Push to devices/<DEVICE_ID>/data (auto-generated key)
+    char path[128];
+    snprintf(path, sizeof(path), "devices/%s/data", DEVICE_ID);
+
+    bool success = firebasePush(path, json.c_str());
+
+    if (success) {
+        // Also update the "latest" node for real-time dashboard
+        char latestPath[128];
+        snprintf(latestPath, sizeof(latestPath), "devices/%s/latest", DEVICE_ID);
+        firebasePut(latestPath, json.c_str());
+    }
+}
+
+void pushDiagToFirebase(const char* diagLine) {
+    // Push diagnostic frame as-is (or convert to JSON)
+    char json[1024];
+    snprintf(json, sizeof(json),
+             "{\"raw\":\"%s\",\"timestamp\":{\".sv\":\"timestamp\"}}",
+             diagLine);
+
+    char path[128];
+    snprintf(path, sizeof(path), "devices/%s/diagnostics", DEVICE_ID);
+    firebasePush(path, json);
+}
+
+String csvToFirebaseJson(const char* csvLine) {
+    // Parse the 39 CSV fields into separate values
+    // Field names match the documentation
+    char fields[40][32];
+    int fieldCount = 0;
+
+    // Split by comma
+    int charIdx = 0;
+    for (int i = 0; csvLine[i] != '\0' && fieldCount < 40; i++) {
+        if (csvLine[i] == ',') {
+            fields[fieldCount][charIdx] = '\0';
+            fieldCount++;
+            charIdx = 0;
+        } else {
+            if (charIdx < 31) {
+                fields[fieldCount][charIdx++] = csvLine[i];
+            }
+        }
+    }
+    // Terminate last field
+    if (fieldCount < 40) {
+        fields[fieldCount][charIdx] = '\0';
+        fieldCount++;
+    }
+
+    if (fieldCount < 39) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "CSV parse: only %d fields (need 39)", fieldCount);
+        logMsg("WARN", msg);
+        return "";
+    }
+
+    // Build JSON manually
+    // Field 15 (dateTimeString) needs to be quoted as a string
+    // All others are numeric
+
+    // Use a large buffer
+    char json[2048];
+    int pos = 0;
+
+    pos += snprintf(json + pos, sizeof(json) - pos, "{");
+
+    // Field 1-14 (numeric)
+    pos += snprintf(json + pos, sizeof(json) - pos,
+        "\"theta\":%s,"           // 1
+        "\"waterHeight\":%s,"     // 2
+        "\"corrTiltX\":%s,"       // 3
+        "\"corrTiltY\":%s,"       // 4
+        "\"olpLength\":%s,"       // 5
+        "\"horizDist\":%s,"       // 6
+        "\"pressure\":%s,"        // 7
+        "\"temperature\":%s,"     // 8
+        "\"baselinePressure\":%s," // 9
+        "\"pressureDev\":%s,"     // 10
+        "\"submersionState\":%s," // 11
+        "\"estDepth\":%s,"        // 12
+        "\"bmpAvail\":%s,"        // 13
+        "\"unixTime\":%s,",       // 14
+        fields[0],  fields[1],  fields[2],  fields[3],
+        fields[4],  fields[5],  fields[6],  fields[7],
+        fields[8],  fields[9],  fields[10], fields[11],
+        fields[12], fields[13]
+    );
+
+    // Field 15: dateTimeString (string — needs quotes)
+    pos += snprintf(json + pos, sizeof(json) - pos,
+        "\"dateTime\":\"%s\",", fields[14]);
+
+    // Field 16-39 (numeric)
+    pos += snprintf(json + pos, sizeof(json) - pos,
+        "\"rtcValid\":%s,"       // 16
+        "\"rateOfRise\":%s,"     // 17
+        "\"alertLevel\":%s,"     // 18
+        "\"sessionDur\":%s,"     // 19
+        "\"peakHeight\":%s,"     // 20
+        "\"minHeight\":%s,"      // 21
+        "\"latitude\":%s,"       // 22
+        "\"longitude\":%s,"      // 23
+        "\"altitude\":%s,"       // 24
+        "\"satellites\":%s,"     // 25
+        "\"gpsFix\":%s,"         // 26
+        "\"simRSSI\":%s,"        // 27
+        "\"simReg\":%s,"         // 28
+        "\"simAvail\":%s,"       // 29
+        "\"zone\":%s,"           // 30
+        "\"responseLevel\":%s,"  // 31
+        "\"sustainedRise\":%s,"  // 32
+        "\"battery\":%s,"        // 33
+        "\"sampleInterval\":%s," // 34
+        "\"txInterval\":%s,"     // 35
+        "\"obLight\":%s,"        // 36
+        "\"algoEnabled\":%s,"    // 37
+        "\"mode\":%s,"           // 38
+        "\"healthScore\":%s,",   // 39
+        fields[15], fields[16], fields[17], fields[18],
+        fields[19], fields[20], fields[21], fields[22],
+        fields[23], fields[24], fields[25], fields[26],
+        fields[27], fields[28], fields[29], fields[30],
+        fields[31], fields[32], fields[33], fields[34],
+        fields[35], fields[36], fields[37], fields[38]
+    );
+
+    // Add server timestamp
+    pos += snprintf(json + pos, sizeof(json) - pos,
+        "\"serverTimestamp\":{\".sv\":\"timestamp\"}"
+    );
+
+    pos += snprintf(json + pos, sizeof(json) - pos, "}");
+
+    return String(json);
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       FIREBASE COMMAND POLLING
+// ============================================================================
+// ============================================================================
+//
+// The C3 periodically polls Firebase for commands from the website:
+//
+//   devices/<DEVICE_ID>/commands/config
+//     → { normalRate: 300, highRate: 30, hMaxCm: 250 }
+//
+//   devices/<DEVICE_ID>/commands/ota
+//     → { url: "https://storage.../firmware.bin", size: 123456, pending: true }
+//
+//   devices/<DEVICE_ID>/commands/realtime
+//     → { enabled: true }
+//
+//   devices/<DEVICE_ID>/commands/diagnostic
+//     → { run: true }
+//
+
+void pollFirebaseCommands() {
+    // ---- 1. Check for config updates ----
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/config", DEVICE_ID);
+        String response = firebaseGet(path);
+        if (response.length() > 2 && response != "null") {
+            parseFirebaseConfig(response);
+        }
+    }
+
+    // ---- 2. Check for OTA command ----
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/ota", DEVICE_ID);
+        String response = firebaseGet(path);
+        if (response.length() > 2 && response != "null") {
+            parseFirebaseOTACommand(response);
+        }
+    }
+
+    // ---- 3. Check for real-time mode flag ----
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/realtime", DEVICE_ID);
+        String response = firebaseGet(path);
+        if (response.length() > 2 && response != "null") {
+            parseFirebaseRealtimeFlag(response);
+        }
+    }
+
+    // ---- 4. Check for diagnostic request ----
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/diagnostic", DEVICE_ID);
+        String response = firebaseGet(path);
+        if (response.length() > 2 && response != "null") {
+            parseFirebaseDiagRequest(response);
+        }
+    }
+
+    // ---- 5. Update device status in Firebase ----
+    {
+        char statusJson[512];
+        snprintf(statusJson, sizeof(statusJson),
+                 "{"
+                 "\"online\":true,"
+                 "\"wifiRSSI\":%d,"
+                 "\"sdAvail\":%s,"
+                 "\"sdBuffered\":%lu,"
+                 "\"s3Active\":%s,"
+                 "\"realTimeMode\":%s,"
+                 "\"freeHeap\":%lu,"
+                 "\"uptime\":%lu,"
+                 "\"lastUpdate\":{\".sv\":\"timestamp\"}"
+                 "}",
+                 WiFi.RSSI(),
+                 sdAvailable ? "true" : "false",
+                 sdBufferedCount,
+                 s3Active ? "true" : "false",
+                 realTimeMode == RT_ON ? "true" : "false",
+                 (unsigned long)ESP.getFreeHeap(),
+                 millis() / 1000UL
+        );
+
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/status", DEVICE_ID);
+        firebasePut(path, statusJson);
+    }
+}
+
+void parseFirebaseConfig(const String& response) {
+    // Response format: {"normalRate":300,"highRate":30,"hMaxCm":250.0}
+    // Parse without ArduinoJson using manual string extraction
+
+    int newNormal = extractJsonIntValue(response, "normalRate", -1);
+    int newHigh   = extractJsonIntValue(response, "highRate", -1);
+    float newHMax = extractJsonFloatValue(response, "hMaxCm", -1.0f);
+
+    bool changed = false;
+
+    if (newNormal > 0 && newNormal != cfgNormalRateSec) {
+        cfgNormalRateSec = newNormal;
+        changed = true;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Config: normalRate = %d sec", cfgNormalRateSec);
+        logMsg("INFO", msg);
+    }
+
+    if (newHigh > 0 && newHigh != cfgHighRateSec) {
+        cfgHighRateSec = newHigh;
+        changed = true;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Config: highRate = %d sec", cfgHighRateSec);
+        logMsg("INFO", msg);
+    }
+
+    if (newHMax > 0 && fabsf(newHMax - cfgHMaxCm) > 0.01f) {
+        cfgHMaxCm = newHMax;
+        changed = true;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Config: hMaxCm = %.2f", cfgHMaxCm);
+        logMsg("INFO", msg);
+    }
+
+    if (changed) {
+        cfgDirty = true;
+
+        // Clear the config command from Firebase so it doesn't re-trigger
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/config", DEVICE_ID);
+        firebaseDelete(path);
+    }
+}
+
+void parseFirebaseOTACommand(const String& response) {
+    // Response format: {"url":"https://...","size":123456,"pending":true}
+
+    bool pending = extractJsonBoolValue(response, "pending", false);
+
+    if (!pending) return;  // Not a new OTA request
+
+    extractJsonStringValue(response, "url", otaUrl, sizeof(otaUrl));
+    otaExpectedSize = (uint32_t)extractJsonIntValue(response, "size", 0);
+
+    if (strlen(otaUrl) > 10 && otaExpectedSize > 0) {
+        logMsg("INFO", "OTA command received from Firebase");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "OTA URL: %s  Size: %lu bytes", otaUrl, otaExpectedSize);
+        logMsg("INFO", msg);
+
+        otaPending = true;
+
+        // Mark OTA as acknowledged in Firebase
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/ota", DEVICE_ID);
+        firebasePut(path, "{\"pending\":false,\"status\":\"downloading\"}");
+    }
+}
+
+void parseFirebaseRealtimeFlag(const String& response) {
+    bool enabled = extractJsonBoolValue(response, "enabled", false);
+
+    RealTimeMode newMode = enabled ? RT_ON : RT_OFF;
+
+    if (newMode != realTimeMode) {
+        realTimeMode = newMode;
+
+        if (realTimeMode == RT_ON) {
+            logMsg("INFO", "REAL-TIME MODE ENABLED — bypassing SD buffer");
+        } else {
+            logMsg("INFO", "REAL-TIME MODE DISABLED — normal buffered operation");
+            // Note: SD buffered data stays on SD, will be flushed normally
+        }
+    }
+}
+
+void parseFirebaseDiagRequest(const String& response) {
+    bool run = extractJsonBoolValue(response, "run", false);
+
+    if (run) {
+        logMsg("INFO", "Diagnostic request received from Firebase");
+        diagPending = true;
+
+        // Clear the command
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/diagnostic", DEVICE_ID);
+        firebaseDelete(path);
+    }
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       SD CARD OPERATIONS
+// ============================================================================
+// ============================================================================
+
+void initSDCard() {
+    logMsg("INFO", "Initializing SD card...");
+
+    if (!SD.begin(SD_CS_PIN)) {
+        logMsg("ERROR", "SD card initialization failed");
+        sdAvailable = false;
+        return;
+    }
+
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        logMsg("ERROR", "No SD card inserted");
+        sdAvailable = false;
+        return;
+    }
+
+    sdAvailable = true;
+
+    // Count existing buffered lines
+    sdBufferedCount = countSDBufferedLines();
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "SD card initialized — Type: %s  Size: %lluMB  Buffered: %lu lines",
+             (cardType == CARD_SD) ? "SD" :
+             (cardType == CARD_SDHC) ? "SDHC" : "Unknown",
+             SD.cardSize() / (1024 * 1024),
+             sdBufferedCount);
+    logMsg("INFO", msg);
+}
+
+void bufferToSD(const char* csvLine) {
+    if (!sdAvailable) return;
+
+    File f = SD.open(SD_BUFFER_FILE, FILE_APPEND);
+    if (!f) {
+        logMsg("ERROR", "Failed to open SD buffer file for writing");
+        return;
+    }
+
+    f.println(csvLine);
+    f.close();
+
+    sdBufferedCount++;
+}
+
+unsigned long countSDBufferedLines() {
+    if (!sdAvailable) return 0;
+
+    File f = SD.open(SD_BUFFER_FILE, FILE_READ);
+    if (!f) return 0;
+
+    unsigned long count = 0;
+    while (f.available()) {
+        char c = f.read();
+        if (c == '\n') count++;
+    }
+    f.close();
+    return count;
+}
+
+void flushSDOneBatch() {
+    if (!sdAvailable || sdBufferedCount == 0 || !wifiConnected) return;
+
+    // Open the buffer file for reading
+    File f = SD.open(SD_BUFFER_FILE, FILE_READ);
+    if (!f) {
+        logMsg("ERROR", "Failed to open SD buffer file for flushing");
+        return;
+    }
+
+    // Read and push up to SD_FLUSH_BATCH_SIZE lines
+    int flushed = 0;
+    char lineBuf[SW_RX_BUFFER_SIZE];
+    int lineIdx = 0;
+    long lastGoodPos = 0;  // Track position of last successfully flushed line
+
+    // We need to track lines to skip (already flushed ones)
+    // Strategy: read the flush index file to know where we left off
+    long startPos = 0;
+    File idxFile = SD.open(SD_BUFFER_INDEX, FILE_READ);
+    if (idxFile) {
+        char idxBuf[32];
+        int idxLen = idxFile.readBytesUntil('\n', idxBuf, sizeof(idxBuf) - 1);
+        idxBuf[idxLen] = '\0';
+        startPos = atol(idxBuf);
+        idxFile.close();
+    }
+
+    f.seek(startPos);
+
+    while (f.available() && flushed < SD_FLUSH_BATCH_SIZE) {
+        char c = f.read();
+
+        if (c == '\n' || c == '\r') {
+            if (lineIdx > 0) {
+                lineBuf[lineIdx] = '\0';
+
+                // Push to Firebase
+                bool success = false;
+
+                // Skip diagnostic frames during flush
+                if (strncmp(lineBuf, "$DIAG,", 6) == 0) {
+                    pushDiagToFirebase(lineBuf);
+                    success = true;
                 } else {
-                    flushedThisBatch++;  // Skip bad records
+                    String json = csvToFirebaseJson(lineBuf);
+                    if (json.length() > 0) {
+                        char path[128];
+                        snprintf(path, sizeof(path),
+                                 "devices/%s/buffered_data", DEVICE_ID);
+                        success = firebasePush(path, json.c_str());
+                    }
                 }
+
+                if (success) {
+                    flushed++;
+                    lastGoodPos = f.position();
+                } else {
+                    // Firebase push failed — stop flushing, try again later
+                    logMsg("WARN", "SD flush: Firebase push failed, will retry");
+                    break;
+                }
+
+                lineIdx = 0;
             }
         } else {
-            remainingLines += line + "\n";
+            if (lineIdx < (int)sizeof(lineBuf) - 1) {
+                lineBuf[lineIdx++] = c;
+            }
         }
     }
 
-    // Collect remaining unprocessed lines
-    while (readFile.available()) {
-        String line = readFile.readStringUntil('\n');
-        line.trim();
-        if (line.length() > 10) {
-            remainingLines += line + "\n";
+    bool reachedEnd = !f.available();
+    f.close();
+
+    // Update the flush index
+    if (flushed > 0) {
+        File idxW = SD.open(SD_BUFFER_INDEX, FILE_WRITE);
+        if (idxW) {
+            idxW.println(lastGoodPos);
+            idxW.close();
         }
+
+        if (sdBufferedCount >= (unsigned long)flushed) {
+            sdBufferedCount -= flushed;
+        } else {
+            sdBufferedCount = 0;
+        }
+
+        char msg[64];
+        snprintf(msg, sizeof(msg), "SD flush: pushed %d lines, %lu remaining",
+                 flushed, sdBufferedCount);
+        logMsg("INFO", msg);
     }
 
-    readFile.close();
-
-    // Rewrite buffer file
-    if (remainingLines.length() > 10) {
-        File writeFile = SD.open(SD_BUFFER_FILE, FILE_WRITE);
-        if (writeFile) {
-            writeFile.print(remainingLines);
-            writeFile.close();
-        }
-
-        uint32_t remaining = 0;
-        for (unsigned int i = 0; i < remainingLines.length(); i++) {
-            if (remainingLines[i] == '\n') remaining++;
-        }
-        sd_state.bufferedRecordCount = remaining;
-        sd_state.bufferHasData = (remaining > 0);
-    } else {
+    // If we've flushed everything, clean up the files
+    if (reachedEnd && sdBufferedCount == 0) {
         SD.remove(SD_BUFFER_FILE);
-        sd_state.bufferedRecordCount = 0;
-        sd_state.bufferHasData = false;
-        logMessage("INFO", "SD buffer fully flushed");
-    }
-
-    if (flushedThisBatch > 0) {
-        char msg[100];
-        snprintf(msg, sizeof(msg), "SD flush: %d records pushed, %lu remaining",
-                 flushedThisBatch, (unsigned long)sd_state.bufferedRecordCount);
-        logMessage("INFO", msg);
-
-        firebaseUpdateSDFlushStatus(sd_state.totalRecordsFlushed, sd_state.bufferedRecordCount);
+        SD.remove(SD_BUFFER_INDEX);
+        sdBufferedCount = 0;
+        logMsg("INFO", "SD buffer fully flushed — files cleaned up");
     }
 }
 
-bool sdSaveOTABinary(uint8_t* data, size_t len, bool append) {
-    if (!sd_state.available) return false;
-
-    File f = SD.open(SD_OTA_FILE, append ? FILE_APPEND : FILE_WRITE);
-    if (!f) {
-        logMessage("ERROR", "Cannot open OTA file on SD");
-        return false;
-    }
-
-    size_t written = f.write(data, len);
-    f.close();
-    return (written == len);
-}
-
-void sdDeleteOTABinary() {
-    if (sd_state.available && SD.exists(SD_OTA_FILE)) {
-        SD.remove(SD_OTA_FILE);
-    }
-}
-
-size_t sdGetOTABinarySize() {
-    if (!sd_state.available || !SD.exists(SD_OTA_FILE)) return 0;
-    File f = SD.open(SD_OTA_FILE, FILE_READ);
-    if (!f) return 0;
-    size_t sz = f.size();
-    f.close();
-    return sz;
-}
 
 // ============================================================================
-// S3 COMMUNICATION
+// ============================================================================
+//                       S3 COMMAND CHANNEL (HW Serial1)
+// ============================================================================
 // ============================================================================
 
-void sendConfigToS3(uint32_t normalSec, uint32_t highSec, float hMaxCm) {
-    char cmd[80];
-    snprintf(cmd, sizeof(cmd), "$CFG,%lu,%lu,%.1f",
-             (unsigned long)normalSec, (unsigned long)highSec, hMaxCm);
+void processS3Commands() {
+    while (Serial1.available()) {
+        char c = Serial1.read();
+
+        if (c == '\n' || c == '\r') {
+            if (cmdRxBufIdx > 0) {
+                cmdRxBuffer[cmdRxBufIdx] = '\0';
+                handleS3Message(cmdRxBuffer);
+                cmdRxBufIdx = 0;
+            }
+        } else {
+            if (cmdRxBufIdx < (int)sizeof(cmdRxBuffer) - 1) {
+                cmdRxBuffer[cmdRxBufIdx++] = c;
+            } else {
+                cmdRxBufIdx = 0;
+            }
+        }
+    }
+}
+
+void handleS3Message(const char* msg) {
+    // Messages from S3 on the command channel:
+    //   $PONG          — Response to our $PING
+    //   $CFG_ACK       — Config update acknowledged
+    //   $DIAG_ACK      — Diagnostic trigger acknowledged
+    //   $FLAG_ACK      — Flag set acknowledged
+    //   $DIAG,...      — Diagnostic results (also comes via GPIO14)
+    //   $SETAPN        — Forwarded SIM command from debugger
+    //   $REINITSIM     — Forwarded SIM command from debugger
+    //   $TESTGPRS      — Forwarded SIM command from debugger
+
+    if (strcmp(msg, "$PONG") == 0) {
+        logMsg("INFO", "S3 PONG received — communication OK");
+    }
+    else if (strcmp(msg, "$CFG_ACK") == 0) {
+        logMsg("INFO", "S3 acknowledged config update");
+    }
+    else if (strcmp(msg, "$DIAG_ACK") == 0) {
+        logMsg("INFO", "S3 acknowledged diagnostic request");
+    }
+    else if (strcmp(msg, "$FLAG_ACK") == 0) {
+        logMsg("INFO", "S3 acknowledged flag update");
+    }
+    else if (strncmp(msg, "$DIAG,", 6) == 0) {
+        // Diagnostic frame on command channel — push to Firebase
+        if (wifiConnected) {
+            pushDiagToFirebase(msg);
+        }
+    }
+    else if (strcmp(msg, "$SETAPN") == 0 || strcmp(msg, "$REINITSIM") == 0 ||
+             strcmp(msg, "$TESTGPRS") == 0) {
+        // SIM commands forwarded from debugger via S3
+        // Handle locally (C3 could have SIM in future)
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf), "SIM command from debugger (via S3): %s", msg);
+        logMsg("INFO", logBuf);
+    }
+    else {
+        char logBuf[128];
+        snprintf(logBuf, sizeof(logBuf), "Unknown S3 message: %s", msg);
+        logMsg("WARN", logBuf);
+    }
+}
+
+void sendConfigToS3() {
+    // Send $CFG,normalRate,highRate,hMaxCm to S3
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "$CFG,%d,%d,%.2f",
+             cfgNormalRateSec, cfgHighRateSec, cfgHMaxCm);
 
     Serial1.println(cmd);
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Sent to S3: %s", cmd);
-    logMessage("INFO", msg);
-
-    config.configSentToS3 = true;
+    logMsg("INFO", msg);
 }
 
 void sendPingToS3() {
     Serial1.println("$PING");
-    s3_comm.lastPingSent = millis();
-    s3_comm.pongReceived = false;
+    logMsg("INFO", "Sent $PING to S3");
 }
 
 void sendDiagRunToS3() {
     Serial1.println("$DIAGRUN");
-    logMessage("INFO", "Sent $DIAGRUN to S3");
+    logMsg("INFO", "Sent $DIAGRUN to S3");
 }
 
-void processS3Commands() {
-    while (Serial1.available()) {
-        char c = Serial1.read();
-        if (c == '\n' || c == '\r') {
-            if (s3CmdIdx > 0) {
-                s3CmdBuf[s3CmdIdx] = '\0';
-                handleS3Response(s3CmdBuf);
-                s3CmdIdx = 0;
-            }
-        } else if (s3CmdIdx < sizeof(s3CmdBuf) - 1) {
-            s3CmdBuf[s3CmdIdx++] = c;
-        }
-    }
+void sendSimStatusToS3() {
+    // Forward SIM status to S3 so it can include in CSV
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "$SIMSTAT,%d,%d,%d",
+             simRSSI, simRegistered ? 1 : 0, simAvailable ? 1 : 0);
+    Serial1.println(cmd);
 }
 
-void handleS3Response(const char* response) {
-    if (strcmp(response, "$PONG") == 0) {
-        s3_comm.pongReceived = true;
-        logMessage("INFO", "S3 PONG received — link OK");
-        return;
-    }
-
-    if (strcmp(response, "$CFG_ACK") == 0) {
-        config.s3NormalRateSec = config.normalRateSec;
-        config.s3HighRateSec = config.highRateSec;
-        config.s3HMaxCm = config.hMaxCm;
-        config.pendingConfigChange = false;
-        logMessage("INFO", "S3 acknowledged config change");
-        return;
-    }
-
-    if (strncmp(response, "$CFG_ERR", 8) == 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "S3 config error: %s", response);
-        logMessage("ERROR", msg);
-        return;
-    }
-
-    if (strncmp(response, "$DIAG,", 6) == 0) {
-        logMessage("INFO", "Diagnostic frame received from S3");
-        firebasePushDiagnostic(response);
-        return;
-    }
-
-    if (strcmp(response, "$DIAGRUN_ACK") == 0) {
-        logMessage("INFO", "S3 acknowledged diagnostic run");
-        return;
-    }
-
-    char msg[256];
-    snprintf(msg, sizeof(msg), "S3 response: %s", response);
-    logMessage("DEBUG", msg);
-}
 
 // ============================================================================
-// DATA FLOW HANDLER
 // ============================================================================
+//                       OTA FIRMWARE UPDATE — S3 PROGRAMMING
+// ============================================================================
+// ============================================================================
+//
+// The OTA process:
+//
+// 1. Website uploads new firmware .bin to Firebase Storage
+// 2. Website writes OTA command to Firebase RTDB with download URL + size
+// 3. C3 polls Firebase, detects OTA command
+// 4. C3 downloads .bin from Firebase Storage to SD card
+// 5. C3 puts S3 into bootloader mode:
+//    a. Pull S3 GPIO0 (BOOT) LOW via C3 GPIO2
+//    b. Pulse S3 EN (RESET) LOW then HIGH via C3 GPIO3
+//    c. S3 enters UART bootloader (ROM boot mode)
+// 6. C3 switches Serial1 to 115200 baud (bootloader speed)
+// 7. C3 uses ESP32 serial bootloader protocol (SLIP framing):
+//    a. Sync with bootloader
+//    b. SPI_FLASH_BEGIN
+//    c. SPI_FLASH_DATA (send firmware in blocks)
+//    d. SPI_FLASH_END (with reboot flag)
+// 8. C3 releases BOOT pin (HIGH)
+// 9. S3 resets and boots new firmware
+// 10. C3 switches Serial1 back to 9600 baud
+// 11. C3 verifies S3 responds to $PING
+// 12. C3 reports OTA result to Firebase
+//
 
-void handleNewSensorData() {
-    if (config.realtimeMode) {
-        handleRealtimeData();
+void startOTAProcess() {
+    logMsg("INFO", "========== OTA UPDATE STARTING ==========");
+
+    currentState = STATE_OTA_DOWNLOAD;
+    s3Active = false;  // S3 will be inactive during OTA
+
+    // Update Firebase status
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/ota", DEVICE_ID);
+        firebasePut(path, "{\"pending\":false,\"status\":\"downloading\"}");
+    }
+
+    // ---- Step 1: Download firmware binary to SD card ----
+    logMsg("INFO", "OTA Step 1: Downloading firmware binary...");
+
+    if (!sdAvailable) {
+        logMsg("ERROR", "OTA ABORTED: SD card not available for firmware storage");
+        reportOTAResult(false, "SD card not available");
+        currentState = STATE_NORMAL;
+        s3Active = true;
+        return;
+    }
+
+    bool downloadOk = downloadOTABinaryToSD("/ota_firmware.bin");
+
+    if (!downloadOk) {
+        logMsg("ERROR", "OTA ABORTED: Firmware download failed");
+        reportOTAResult(false, "Download failed");
+        currentState = STATE_NORMAL;
+        s3Active = true;
+        return;
+    }
+
+    logMsg("INFO", "OTA Step 1 complete: Firmware downloaded to SD");
+
+    // ---- Step 2: Verify file size ----
+    File fwFile = SD.open("/ota_firmware.bin", FILE_READ);
+    if (!fwFile) {
+        logMsg("ERROR", "OTA ABORTED: Cannot open downloaded firmware file");
+        reportOTAResult(false, "File open failed");
+        currentState = STATE_NORMAL;
+        s3Active = true;
+        return;
+    }
+
+    uint32_t actualSize = fwFile.size();
+    fwFile.close();
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "OTA firmware size: %lu bytes (expected %lu)",
+             actualSize, otaExpectedSize);
+    logMsg("INFO", msg);
+
+    if (otaExpectedSize > 0 && actualSize != otaExpectedSize) {
+        logMsg("ERROR", "OTA ABORTED: Size mismatch");
+        reportOTAResult(false, "Size mismatch");
+        SD.remove("/ota_firmware.bin");
+        currentState = STATE_NORMAL;
+        s3Active = true;
+        return;
+    }
+
+    // ---- Step 3: Enter S3 bootloader mode ----
+    logMsg("INFO", "OTA Step 3: Entering S3 bootloader mode...");
+    currentState = STATE_OTA_FLASH;
+
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/ota", DEVICE_ID);
+        firebasePut(path, "{\"pending\":false,\"status\":\"flashing\"}");
+    }
+
+    enterS3BootloadMode();
+
+    // ---- Step 4: Flash the firmware ----
+    logMsg("INFO", "OTA Step 4: Flashing firmware to S3...");
+    flashS3WithBinary("/ota_firmware.bin", actualSize);
+
+    // ---- Step 5: Exit bootloader mode ----
+    logMsg("INFO", "OTA Step 5: Exiting bootloader mode...");
+    exitS3BootloadMode();
+
+    // ---- Step 6: Verify S3 is running ----
+    logMsg("INFO", "OTA Step 6: Verifying S3 response...");
+    currentState = STATE_OTA_VERIFY;
+
+    delay(3000);  // Wait for S3 to boot new firmware
+
+    bool verified = verifyS3Running();
+
+    if (verified) {
+        logMsg("INFO", "========== OTA UPDATE SUCCESSFUL ==========");
+        reportOTAResult(true, "Success");
     } else {
-        handleBufferedData();
-    }
-}
-
-void handleRealtimeData() {
-    if (wifi_state.connected && fb_state.authenticated) {
-        firebasePushSensorData(sensorData);
-        logMessage("DEBUG", "Real-time data pushed");
-    } else {
-        logMessage("WARN", "Real-time mode but WiFi down — buffering");
-        sdWriteBufferRecord(sensorData.rawCSV);
-    }
-}
-
-void handleBufferedData() {
-    if (wifi_state.connected && fb_state.authenticated) {
-        firebasePushSensorData(sensorData);
-    } else {
-        sdWriteBufferRecord(sensorData.rawCSV);
-        logMessage("DEBUG", "Data buffered to SD");
-    }
-}
-
-// ============================================================================
-// CONFIG PIPELINE
-// ============================================================================
-
-static unsigned long configSentTime = 0;
-
-void processConfigPipeline() {
-    if (config.pendingConfigChange && !config.configSentToS3) {
-        if (s3_comm.s3Active) {
-            sendConfigToS3(config.normalRateSec, config.highRateSec, config.hMaxCm);
-            configSentTime = millis();
-        } else {
-            logMessage("WARN", "Config pending but S3 not active");
-        }
+        logMsg("ERROR", "========== OTA UPDATE FAILED — S3 NOT RESPONDING ==========");
+        reportOTAResult(false, "S3 not responding after flash");
     }
 
-    if (config.configSentToS3 && config.pendingConfigChange) {
-        if (millis() - configSentTime > 10000) {
-            logMessage("WARN", "S3 config ACK timeout — resending");
-            config.configSentToS3 = false;
-            configSentTime = 0;
-        }
+    // Clean up
+    SD.remove("/ota_firmware.bin");
+    currentState = STATE_NORMAL;
+    s3Active = true;  // Assume S3 is active (or will be)
+}
+
+bool downloadOTABinaryToSD(const char* sdPath) {
+    // Remove old file if exists
+    if (SD.exists(sdPath)) {
+        SD.remove(sdPath);
     }
-}
-
-// ============================================================================
-// OTA PIPELINE
-// ============================================================================
-
-// SLIP framing
-#define SLIP_END        0xC0
-#define SLIP_ESC        0xDB
-#define SLIP_ESC_END    0xDC
-#define SLIP_ESC_ESC    0xDD
-
-#define ESP_SYNC        0x08
-#define ESP_FLASH_BEGIN 0x0B
-#define ESP_FLASH_DATA  0x0C
-#define ESP_FLASH_END   0x0D
-
-#define FLASH_WRITE_SIZE      0x400
-#define ESP_BOOTLOADER_BAUD   115200
-
-void slipSendByte(uint8_t b) {
-    if (b == SLIP_END) {
-        Serial1.write(SLIP_ESC);
-        Serial1.write(SLIP_ESC_END);
-    } else if (b == SLIP_ESC) {
-        Serial1.write(SLIP_ESC);
-        Serial1.write(SLIP_ESC_ESC);
-    } else {
-        Serial1.write(b);
-    }
-}
-
-void slipSendFrame(uint8_t* data, size_t len) {
-    Serial1.write(SLIP_END);
-    for (size_t i = 0; i < len; i++) {
-        slipSendByte(data[i]);
-    }
-    Serial1.write(SLIP_END);
-}
-
-int slipReceiveFrame(uint8_t* buf, size_t maxLen, unsigned long timeoutMs) {
-    unsigned long start = millis();
-    bool inFrame = false;
-    size_t idx = 0;
-    bool escaped = false;
-
-    while (millis() - start < timeoutMs) {
-        if (!Serial1.available()) { delay(1); continue; }
-
-        uint8_t b = Serial1.read();
-
-        if (b == SLIP_END) {
-            if (inFrame && idx > 0) return idx;
-            inFrame = true;
-            idx = 0;
-            continue;
-        }
-
-        if (!inFrame) continue;
-
-        if (escaped) {
-            if (b == SLIP_ESC_END) b = SLIP_END;
-            else if (b == SLIP_ESC_ESC) b = SLIP_ESC;
-            escaped = false;
-        } else if (b == SLIP_ESC) {
-            escaped = true;
-            continue;
-        }
-
-        if (idx < maxLen) buf[idx++] = b;
-    }
-    return -1;
-}
-
-void espSendCommand(uint8_t op, uint8_t* data, uint16_t dataLen, uint32_t checksum) {
-    uint16_t frameLen = 8 + dataLen;
-    uint8_t* frame = (uint8_t*)malloc(frameLen);
-    if (!frame) return;
-
-    frame[0] = 0x00;
-    frame[1] = op;
-    frame[2] = dataLen & 0xFF;
-    frame[3] = (dataLen >> 8) & 0xFF;
-    frame[4] = checksum & 0xFF;
-    frame[5] = (checksum >> 8) & 0xFF;
-    frame[6] = (checksum >> 16) & 0xFF;
-    frame[7] = (checksum >> 24) & 0xFF;
-
-    if (data && dataLen > 0) memcpy(frame + 8, data, dataLen);
-
-    slipSendFrame(frame, frameLen);
-    free(frame);
-}
-
-bool espReceiveResponse(uint8_t expectedOp, unsigned long timeoutMs) {
-    uint8_t respBuf[256];
-    int len = slipReceiveFrame(respBuf, sizeof(respBuf), timeoutMs);
-
-    if (len < 8) return false;
-    if (respBuf[0] != 0x01) return false;
-    if (respBuf[1] != expectedOp) return false;
-    if (len > 8 && respBuf[8] != 0) return false;
-
-    return true;
-}
-
-void s3EnterBootloader() {
-    logMessage("INFO", "Putting S3 into bootloader mode...");
-    s3_comm.s3Active = false;
-
-    digitalWrite(S3_BOOT_PIN, LOW);
-    delay(100);
-    digitalWrite(S3_RESET_PIN, LOW);
-    delay(S3_RESET_PULSE_MS);
-    digitalWrite(S3_RESET_PIN, HIGH);
-    delay(S3_BOOT_WAIT_MS);
-    digitalWrite(S3_BOOT_PIN, HIGH);
-
-    Serial1.end();
-    Serial1.begin(ESP_BOOTLOADER_BAUD, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
-
-    logMessage("INFO", "S3 in bootloader mode — Serial1 at 115200");
-}
-
-void s3ExitBootloader() {
-    logMessage("INFO", "Exiting S3 bootloader mode...");
-    digitalWrite(S3_BOOT_PIN, HIGH);
-    s3HardReset();
-
-    Serial1.end();
-    Serial1.begin(S3_CMD_BAUD, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
-
-    delay(2000);
-    s3_comm.s3Active = true;
-    logMessage("INFO", "S3 back to normal mode");
-}
-
-void s3HardReset() {
-    digitalWrite(S3_RESET_PIN, LOW);
-    delay(S3_RESET_PULSE_MS);
-    digitalWrite(S3_RESET_PIN, HIGH);
-    delay(1000);
-    logMessage("INFO", "S3 hard reset performed");
-}
-
-bool s3BootloaderSync() {
-    logMessage("INFO", "Syncing with S3 bootloader...");
-
-    uint8_t syncPayload[36];
-    syncPayload[0] = 0x07;
-    syncPayload[1] = 0x07;
-    syncPayload[2] = 0x12;
-    syncPayload[3] = 0x20;
-    for (int i = 4; i < 36; i++) syncPayload[i] = 0x55;
-
-    for (int attempt = 0; attempt < 10; attempt++) {
-        while (Serial1.available()) Serial1.read();
-
-        espSendCommand(ESP_SYNC, syncPayload, sizeof(syncPayload), 0);
-
-        if (espReceiveResponse(ESP_SYNC, 1000)) {
-            for (int i = 0; i < 7; i++) espReceiveResponse(ESP_SYNC, 200);
-            logMessage("INFO", "Bootloader sync successful");
-            return true;
-        }
-        delay(100);
-    }
-    logMessage("ERROR", "Bootloader sync FAILED");
-    return false;
-}
-
-bool s3BootloaderFlashBegin(uint32_t totalSize, uint32_t blockSize,
-                             uint32_t blockCount, uint32_t offset) {
-    uint8_t payload[16];
-    payload[0]  = totalSize & 0xFF;  payload[1]  = (totalSize >> 8) & 0xFF;
-    payload[2]  = (totalSize >> 16) & 0xFF; payload[3]  = (totalSize >> 24) & 0xFF;
-    payload[4]  = blockCount & 0xFF; payload[5]  = (blockCount >> 8) & 0xFF;
-    payload[6]  = (blockCount >> 16) & 0xFF; payload[7]  = (blockCount >> 24) & 0xFF;
-    payload[8]  = blockSize & 0xFF;  payload[9]  = (blockSize >> 8) & 0xFF;
-    payload[10] = (blockSize >> 16) & 0xFF; payload[11] = (blockSize >> 24) & 0xFF;
-    payload[12] = offset & 0xFF;     payload[13] = (offset >> 8) & 0xFF;
-    payload[14] = (offset >> 16) & 0xFF; payload[15] = (offset >> 24) & 0xFF;
-
-    espSendCommand(ESP_FLASH_BEGIN, payload, sizeof(payload), 0);
-
-    if (espReceiveResponse(ESP_FLASH_BEGIN, 10000)) {
-        logMessage("INFO", "Flash begin accepted");
-        return true;
-    }
-    logMessage("ERROR", "Flash begin failed");
-    return false;
-}
-
-bool s3BootloaderFlashData(uint8_t* data, size_t dataLen, uint32_t seqNum) {
-    size_t payloadLen = 16 + dataLen;
-    uint8_t* payload = (uint8_t*)malloc(payloadLen);
-    if (!payload) return false;
-
-    payload[0]  = dataLen & 0xFF;  payload[1]  = (dataLen >> 8) & 0xFF;
-    payload[2]  = (dataLen >> 16) & 0xFF; payload[3]  = (dataLen >> 24) & 0xFF;
-    payload[4]  = seqNum & 0xFF;   payload[5]  = (seqNum >> 8) & 0xFF;
-    payload[6]  = (seqNum >> 16) & 0xFF; payload[7]  = (seqNum >> 24) & 0xFF;
-    memset(payload + 8, 0, 8);
-    memcpy(payload + 16, data, dataLen);
-
-    uint32_t checksum = 0xEF;
-    for (size_t i = 0; i < dataLen; i++) checksum ^= data[i];
-
-    espSendCommand(ESP_FLASH_DATA, payload, payloadLen, checksum);
-    free(payload);
-
-    return espReceiveResponse(ESP_FLASH_DATA, 5000);
-}
-
-bool s3BootloaderFlashEnd(bool reboot) {
-    uint8_t payload[4] = { (uint8_t)(reboot ? 0 : 1), 0, 0, 0 };
-    espSendCommand(ESP_FLASH_END, payload, sizeof(payload), 0);
-
-    if (reboot) { delay(100); return true; }
-    return espReceiveResponse(ESP_FLASH_END, 3000);
-}
-
-void startOTADownload() {
-    logMessage("INFO", "Starting OTA firmware download...");
-    ota_state.phase = OTA_DOWNLOADING;
-    firebaseUpdateOTAStatus("DOWNLOADING", 10);
-
-    sdDeleteOTABinary();
-
-    if (strlen(ota_state.firmwareURL) == 0) {
-        logMessage("ERROR", "No firmware URL");
-        ota_state.phase = OTA_FAILED;
-        strncpy(ota_state.errorMsg, "No firmware URL", sizeof(ota_state.errorMsg) - 1);
-        return;
-    }
-
-    WiFiClientSecure client;
-    client.setInsecure();
 
     HTTPClient http;
-    http.begin(client, ota_state.firmwareURL);
-    http.setTimeout(30000);
+    http.begin(String(otaUrl));
+    http.setTimeout(60000);  // 60 second timeout for large files
 
     int httpCode = http.GET();
 
     if (httpCode != 200) {
-        char msg[80];
-        snprintf(msg, sizeof(msg), "OTA download failed: HTTP %d", httpCode);
-        logMessage("ERROR", msg);
-        strncpy(ota_state.errorMsg, msg, sizeof(ota_state.errorMsg) - 1);
-        ota_state.phase = OTA_FAILED;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "OTA download HTTP error: %d", httpCode);
+        logMsg("ERROR", msg);
         http.end();
-        return;
+        return false;
     }
 
-    int contentLength = http.getSize();
-    if (contentLength <= 0) {
-        logMessage("ERROR", "No content length");
-        ota_state.phase = OTA_FAILED;
+    int totalSize = http.getSize();
+    if (totalSize <= 0) {
+        logMsg("ERROR", "OTA download: Content-Length unknown or zero");
         http.end();
-        return;
+        return false;
     }
 
-    if (ota_state.firmwareSize == 0) ota_state.firmwareSize = contentLength;
+    File outFile = SD.open(sdPath, FILE_WRITE);
+    if (!outFile) {
+        logMsg("ERROR", "OTA download: Failed to create file on SD");
+        http.end();
+        return false;
+    }
 
     WiFiClient* stream = http.getStreamPtr();
-    uint8_t downloadBuf[1024];
-    size_t totalDownloaded = 0;
-    bool firstChunk = true;
-    int lastPercent = 0;
+    uint8_t dlBuf[1024];
+    int downloaded = 0;
+    int lastPercent = -1;
 
-    while (http.connected() && totalDownloaded < (size_t)contentLength) {
+    while (http.connected() && downloaded < totalSize) {
         size_t avail = stream->available();
-        if (avail == 0) { delay(10); continue; }
+        if (avail > 0) {
+            size_t toRead = (avail > sizeof(dlBuf)) ? sizeof(dlBuf) : avail;
+            size_t bytesRead = stream->readBytes(dlBuf, toRead);
 
-        size_t toRead = (avail > sizeof(downloadBuf)) ? sizeof(downloadBuf) : avail;
-        size_t bytesRead = stream->readBytes(downloadBuf, toRead);
+            outFile.write(dlBuf, bytesRead);
+            downloaded += bytesRead;
 
-        if (bytesRead > 0) {
-            if (!sdSaveOTABinary(downloadBuf, bytesRead, !firstChunk)) {
-                logMessage("ERROR", "SD write failed during OTA download");
-                ota_state.phase = OTA_FAILED;
-                http.end();
-                return;
-            }
-            firstChunk = false;
-            totalDownloaded += bytesRead;
-            ota_state.downloadedBytes = totalDownloaded;
-
-            int pct = (totalDownloaded * 100) / contentLength;
-            if (pct >= lastPercent + 10) {
-                lastPercent = pct;
+            int percent = (downloaded * 100) / totalSize;
+            if (percent != lastPercent && percent % 10 == 0) {
+                lastPercent = percent;
                 char msg[64];
-                snprintf(msg, sizeof(msg), "OTA download: %d%%", pct);
-                logMessage("INFO", msg);
-                firebaseUpdateOTAStatus("DOWNLOADING", 10 + (pct * 40 / 100));
+                snprintf(msg, sizeof(msg), "OTA download: %d%%", percent);
+                logMsg("INFO", msg);
             }
         }
+        delay(1);
     }
 
+    outFile.close();
     http.end();
 
-    if (totalDownloaded == (size_t)contentLength) {
-        logMessage("INFO", "OTA download complete");
-        ota_state.phase = OTA_DOWNLOAD_COMPLETE;
-        firebaseUpdateOTAStatus("DOWNLOAD_COMPLETE", 50);
-    } else {
-        char msg[80];
-        snprintf(msg, sizeof(msg), "OTA incomplete: %lu/%d",
-                 (unsigned long)totalDownloaded, contentLength);
-        logMessage("ERROR", msg);
-        ota_state.phase = OTA_FAILED;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "OTA download complete: %d / %d bytes", downloaded, totalSize);
+    logMsg("INFO", msg);
+
+    return (downloaded == totalSize);
+}
+
+void enterS3BootloadMode() {
+    // ESP32-S3 enters UART download mode when:
+    //   GPIO0 is held LOW during reset
+    //
+    // Sequence:
+    //   1. Pull GPIO0 (BOOT) LOW
+    //   2. Pulse EN (RESET) LOW for 100ms then HIGH
+    //   3. S3 resets and enters ROM bootloader because GPIO0 is LOW
+    //   4. Wait 500ms for bootloader to initialize
+
+    logMsg("INFO", "Entering S3 bootloader: BOOT=LOW, RESET pulse");
+
+    // Step 1: Pull BOOT low
+    digitalWrite(S3_BOOT_PIN, LOW);
+    delay(50);
+
+    // Step 2: Reset pulse
+    digitalWrite(S3_RESET_PIN, LOW);
+    delay(100);
+    digitalWrite(S3_RESET_PIN, HIGH);
+
+    // Step 3: Wait for bootloader to start
+    delay(500);
+
+    // Step 4: Switch command serial to bootloader baud rate
+    Serial1.end();
+    delay(50);
+    Serial1.begin(S3_BOOTLOADER_BAUD, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
+    delay(100);
+
+    logMsg("INFO", "S3 should now be in ROM bootloader mode (115200 baud)");
+}
+
+void exitS3BootloadMode() {
+    // Release BOOT pin and reset S3 to boot normally
+    logMsg("INFO", "Exiting bootloader: BOOT=HIGH, RESET pulse");
+
+    // Release BOOT
+    digitalWrite(S3_BOOT_PIN, HIGH);
+    delay(50);
+
+    // Reset S3 to boot normally
+    digitalWrite(S3_RESET_PIN, LOW);
+    delay(100);
+    digitalWrite(S3_RESET_PIN, HIGH);
+
+    // Switch serial back to normal baud rate
+    delay(500);
+    Serial1.end();
+    delay(50);
+    Serial1.begin(9600, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
+    delay(100);
+
+    logMsg("INFO", "S3 reset to normal boot mode (9600 baud)");
+}
+
+bool verifyS3Running() {
+    // Send $PING and wait for $PONG
+    int attempts = 5;
+
+    for (int i = 0; i < attempts; i++) {
+        // Clear serial buffer
+        while (Serial1.available()) Serial1.read();
+
+        Serial1.println("$PING");
+
+        unsigned long start = millis();
+        char pongBuf[32];
+        int pongIdx = 0;
+
+        while (millis() - start < 3000) {
+            if (Serial1.available()) {
+                char c = Serial1.read();
+                if (c == '\n' || c == '\r') {
+                    pongBuf[pongIdx] = '\0';
+                    if (strcmp(pongBuf, "$PONG") == 0) {
+                        logMsg("INFO", "S3 verified — $PONG received");
+                        return true;
+                    }
+                    pongIdx = 0;
+                } else if (pongIdx < 30) {
+                    pongBuf[pongIdx++] = c;
+                }
+            }
+        }
+
+        char msg[64];
+        snprintf(msg, sizeof(msg), "S3 verify attempt %d/%d — no PONG", i + 1, attempts);
+        logMsg("WARN", msg);
+        delay(2000);
+    }
+
+    return false;
+}
+
+void reportOTAResult(bool success, const char* message) {
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{\"pending\":false,\"status\":\"%s\",\"message\":\"%s\","
+             "\"timestamp\":{\".sv\":\"timestamp\"}}",
+             success ? "success" : "failed", message);
+
+    char path[128];
+    snprintf(path, sizeof(path), "devices/%s/commands/ota", DEVICE_ID);
+
+    if (wifiConnected) {
+        firebasePut(path, json);
     }
 }
 
-void startS3OTA() {
-    logMessage("INFO", "=== S3 OTA PROGRAMMING START ===");
 
-    s3EnterBootloader();
+// ============================================================================
+// ============================================================================
+//                       ESP32 ROM BOOTLOADER PROTOCOL
+// ============================================================================
+// ============================================================================
+//
+// The ESP32-S3 ROM bootloader uses a SLIP-framed protocol.
+// Reference: esptool.py source code and ESP32 technical reference.
+//
+// SLIP framing:
+//   0xC0 [payload] 0xC0
+//   Escape: 0xDB 0xDC = 0xC0 in data
+//           0xDB 0xDD = 0xDB in data
+//
+// Command packet format:
+//   [0]    = 0x00 (direction: request)
+//   [1]    = command opcode
+//   [2-3]  = data length (little-endian)
+//   [4-7]  = checksum (for data commands) or 0
+//   [8..]  = data
+//
+// Response packet format:
+//   [0]    = 0x01 (direction: response)
+//   [1]    = command opcode
+//   [2-3]  = data length
+//   [4-7]  = value
+//   [8]    = status (0 = success)
+//   [9]    = error code
+//
 
-    if (!s3BootloaderSync()) {
-        strncpy(ota_state.errorMsg, "Bootloader sync failed", sizeof(ota_state.errorMsg) - 1);
-        ota_state.phase = OTA_FAILED;
-        s3ExitBootloader();
+#define ESP_CMD_SYNC            0x08
+#define ESP_CMD_FLASH_BEGIN     0x02
+#define ESP_CMD_FLASH_DATA      0x03
+#define ESP_CMD_FLASH_END       0x04
+#define ESP_FLASH_BLOCK_SIZE    0x4000  // 16KB blocks (for flash begin)
+#define ESP_CHECKSUM_MAGIC      0xEF
+
+void flashS3WithBinary(const char* filePath, uint32_t fileSize) {
+    // Step 1: Sync with bootloader
+    logMsg("INFO", "Bootloader: Syncing...");
+
+    bool synced = false;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (s3BootloaderSync()) {
+            synced = true;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Bootloader sync OK (attempt %d)", attempt + 1);
+            logMsg("INFO", msg);
+            break;
+        }
+        delay(100);
+    }
+
+    if (!synced) {
+        logMsg("ERROR", "Bootloader sync FAILED after 10 attempts");
         return;
     }
 
-    if (!SD.exists(SD_OTA_FILE)) {
-        logMessage("ERROR", "OTA file not found");
-        ota_state.phase = OTA_FAILED;
-        s3ExitBootloader();
+    // Step 2: Calculate flash parameters
+    uint32_t numBlocks = (fileSize + ESP_FLASH_BLOCK_SIZE - 1) / ESP_FLASH_BLOCK_SIZE;
+    uint32_t eraseSize = fileSize;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Flash: %lu bytes in %lu blocks", fileSize, numBlocks);
+    logMsg("INFO", msg);
+
+    // Step 3: FLASH_BEGIN
+    logMsg("INFO", "Bootloader: FLASH_BEGIN...");
+    if (!s3BootloaderBeginFlash(eraseSize, numBlocks, ESP_FLASH_BLOCK_SIZE, 0x0000)) {
+        logMsg("ERROR", "FLASH_BEGIN failed");
         return;
     }
+    logMsg("INFO", "FLASH_BEGIN OK");
 
-    File fwFile = SD.open(SD_OTA_FILE, FILE_READ);
+    // Step 4: FLASH_DATA — send file in blocks
+    File fwFile = SD.open(filePath, FILE_READ);
     if (!fwFile) {
-        logMessage("ERROR", "Cannot open OTA file");
-        ota_state.phase = OTA_FAILED;
-        s3ExitBootloader();
+        logMsg("ERROR", "Cannot open firmware file for flashing");
         return;
     }
 
-    size_t fileSize = fwFile.size();
-    uint32_t blockCount = (fileSize + FLASH_WRITE_SIZE - 1) / FLASH_WRITE_SIZE;
-    uint32_t flashOffset = 0x10000;
-
-    char msg[80];
-    snprintf(msg, sizeof(msg), "Firmware: %lu bytes, %lu blocks",
-             (unsigned long)fileSize, (unsigned long)blockCount);
-    logMessage("INFO", msg);
-
-    if (!s3BootloaderFlashBegin(fileSize, FLASH_WRITE_SIZE, blockCount, flashOffset)) {
-        ota_state.phase = OTA_FAILED;
-        fwFile.close();
-        s3ExitBootloader();
-        return;
-    }
-
-    firebaseUpdateOTAStatus("FLASHING", 55);
-
-    uint8_t blockBuf[FLASH_WRITE_SIZE];
+    uint8_t blockBuf[ESP_FLASH_BLOCK_SIZE];
     uint32_t seqNum = 0;
-    size_t totalWritten = 0;
-    int lastPct = 0;
-    bool flashError = false;
+    uint32_t remaining = fileSize;
+    int lastPercent = -1;
 
-    while (fwFile.available() && !flashError) {
-        size_t bytesRead = fwFile.read(blockBuf, FLASH_WRITE_SIZE);
-        if (bytesRead < FLASH_WRITE_SIZE) {
-            memset(blockBuf + bytesRead, 0xFF, FLASH_WRITE_SIZE - bytesRead);
-        }
+    while (remaining > 0 && fwFile.available()) {
+        uint32_t toRead = (remaining > ESP_FLASH_BLOCK_SIZE) ?
+                           ESP_FLASH_BLOCK_SIZE : remaining;
+        size_t bytesRead = fwFile.read(blockBuf, toRead);
 
-        bool written = false;
-        for (int retry = 0; retry < 3; retry++) {
-            if (s3BootloaderFlashData(blockBuf, FLASH_WRITE_SIZE, seqNum)) {
-                written = true;
-                break;
-            }
-            delay(100);
-        }
-
-        if (!written) {
-            snprintf(msg, sizeof(msg), "Flash failed at block %lu", (unsigned long)seqNum);
-            logMessage("ERROR", msg);
-            flashError = true;
+        if (bytesRead == 0) {
+            logMsg("ERROR", "File read returned 0 bytes");
             break;
         }
 
-        seqNum++;
-        totalWritten += bytesRead;
-        ota_state.writtenBytes = totalWritten;
-
-        int pct = (totalWritten * 100) / fileSize;
-        if (pct >= lastPct + 5) {
-            lastPct = pct;
-            snprintf(msg, sizeof(msg), "Flashing: %d%%", pct);
-            logMessage("INFO", msg);
-            firebaseUpdateOTAStatus("FLASHING", 55 + (pct * 40 / 100));
+        // Pad last block with 0xFF if needed
+        if (bytesRead < ESP_FLASH_BLOCK_SIZE) {
+            memset(blockBuf + bytesRead, 0xFF, ESP_FLASH_BLOCK_SIZE - bytesRead);
         }
+
+        if (!s3BootloaderWriteBlock(blockBuf, ESP_FLASH_BLOCK_SIZE, seqNum)) {
+            char errMsg[64];
+            snprintf(errMsg, sizeof(errMsg), "FLASH_DATA failed at block %lu", seqNum);
+            logMsg("ERROR", errMsg);
+            fwFile.close();
+            return;
+        }
+
+        remaining -= bytesRead;
+        seqNum++;
+
+        int percent = ((fileSize - remaining) * 100) / fileSize;
+        if (percent != lastPercent && percent % 10 == 0) {
+            lastPercent = percent;
+            char progMsg[64];
+            snprintf(progMsg, sizeof(progMsg), "Flashing: %d%%", percent);
+            logMsg("INFO", progMsg);
+        }
+
+        yield();  // Prevent watchdog timeout
     }
 
     fwFile.close();
 
-    if (flashError) {
-        ota_state.phase = OTA_FAILED;
-        s3ExitBootloader();
-        return;
-    }
-
-    s3BootloaderFlashEnd(true);
-
-    digitalWrite(S3_BOOT_PIN, HIGH);
-    Serial1.end();
-    Serial1.begin(S3_CMD_BAUD, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
-
-    logMessage("INFO", "Flash complete — verifying");
-    ota_state.phase = OTA_VERIFY;
-    ota_state.phaseStartMs = millis();
-    firebaseUpdateOTAStatus("VERIFYING", 95);
-}
-
-void processOTAPipeline() {
-    char msg[192];
-
-    switch (ota_state.phase) {
-        case OTA_IDLE:
-            break;
-
-        case OTA_DOWNLOAD_PENDING:
-            startOTADownload();
-            break;
-
-        case OTA_DOWNLOADING:
-            break;
-
-        case OTA_DOWNLOAD_COMPLETE: {
-            size_t fileSize = sdGetOTABinarySize();
-            if (fileSize > 0 && (ota_state.firmwareSize == 0 || fileSize == ota_state.firmwareSize)) {
-                logMessage("INFO", "OTA binary verified — starting S3 programming");
-                ota_state.phase = OTA_PROGRAMMING_S3;
-                ota_state.phaseStartMs = millis();
-                firebaseUpdateOTAStatus("PROGRAMMING_S3", 50);
-                startS3OTA();
-            } else {
-                snprintf(msg, sizeof(msg), "Size mismatch: expected %lu, got %lu",
-                         (unsigned long)ota_state.firmwareSize, (unsigned long)fileSize);
-                logMessage("ERROR", msg);
-                ota_state.phase = OTA_FAILED;
-                firebaseUpdateOTAStatus("FAILED_SIZE_MISMATCH", 0);
-            }
-            break;
-        }
-
-        case OTA_PROGRAMMING_S3:
-            break;
-
-        case OTA_VERIFY: {
-            logMessage("INFO", "Verifying S3 after OTA...");
-            delay(3000);
-            sendPingToS3();
-
-            unsigned long verifyStart = millis();
-            while (millis() - verifyStart < 5000) {
-                processS3Commands();
-                if (s3_comm.pongReceived) break;
-                delay(100);
-            }
-
-            if (s3_comm.pongReceived) {
-                logMessage("INFO", "S3 responds — OTA SUCCESSFUL");
-                ota_state.phase = OTA_COMPLETE;
-                ota_state.phaseStartMs = millis();
-                firebaseUpdateOTAStatus("COMPLETE", 100);
-                s3_comm.s3Active = true;
-
-                delay(2000);
-                sendConfigToS3(config.normalRateSec, config.highRateSec, config.hMaxCm);
-                sdDeleteOTABinary();
-            } else {
-                logMessage("ERROR", "S3 not responding after OTA");
-                ota_state.phase = OTA_FAILED;
-                strncpy(ota_state.errorMsg, "S3 no response after flash",
-                        sizeof(ota_state.errorMsg) - 1);
-                firebaseUpdateOTAStatus("FAILED_NO_RESPONSE", 0);
-                s3HardReset();
-            }
-            break;
-        }
-
-        case OTA_COMPLETE:
-            if (millis() - ota_state.phaseStartMs > 5000) {
-                ota_state.phase = OTA_IDLE;
-                logMessage("INFO", "OTA process complete — idle");
-            }
-            break;
-
-        case OTA_FAILED:
-            snprintf(msg, sizeof(msg), "OTA FAILED: %s (retry %d)",
-                     ota_state.errorMsg, ota_state.retryCount);
-            logMessage("ERROR", msg);
-
-            if (ota_state.retryCount < 3) {
-                ota_state.retryCount++;
-                ota_state.phase = OTA_DOWNLOAD_PENDING;
-                logMessage("INFO", "Retrying OTA...");
-            } else {
-                logMessage("ERROR", "OTA failed after 3 retries — giving up");
-                s3ExitBootloader();
-                s3HardReset();
-                s3_comm.s3Active = true;
-                ota_state.phase = OTA_IDLE;
-                sdDeleteOTABinary();
-                firebaseUpdateOTAStatus("FAILED_FINAL", 0);
-            }
-            break;
-    }
-}
-
-// ============================================================================
-// LOGGING
-// ============================================================================
-
-void logMessage(const char* level, const char* msg) {
-    unsigned long uptime = millis() / 1000;
-    Serial.printf("[%lu][C3][%s] %s\n", uptime, level, msg);
-}
-
-// ============================================================================
-// SETUP
-// ============================================================================
-
-void setup() {
-    Serial.begin(115200);
-    unsigned long serialWait = millis();
-    while (!Serial && millis() - serialWait < 3000) delay(10);
-
-    Serial.println();
-    Serial.println("================================================================");
-    Serial.println("  VARUNA BUOY — ESP32-C3 COMMUNICATION BRIDGE");
-    Serial.println("  Firmware v1.0.0 (No external libraries)");
-    Serial.println("================================================================");
-    Serial.println();
-
-    initPins();
-
-    Serial1.begin(S3_CMD_BAUD, SERIAL_8N1, S3_CMD_RX_PIN, S3_CMD_TX_PIN);
-    logMessage("INFO", "Serial1 initialized — GPIO 0(TX)/1(RX) at 9600");
-
-    s3_comm.s3Active = true;
-    s3_comm.pongReceived = false;
-    s3_comm.lastDataReceived = 0;
-    s3_comm.lastPingSent = 0;
-
-    initSoftwareUARTReceiver();
-    logMessage("INFO", "Initializing SD card...");
-    initSDCard();
-    initConfig();
-    initOTA();
-
-    logMessage("INFO", "Initializing WiFi...");
-    initWiFi();
-
-    for (int i = 0; i < NUM_WIFI_CREDENTIALS; i++) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "Trying WiFi: %s", wifiCredentials[i].ssid);
-        logMessage("INFO", msg);
-        if (wifiTryConnect(wifiCredentials[i].ssid, wifiCredentials[i].password)) break;
-    }
-
-    if (wifi_state.connected) {
-        initFirebase();
-        firebaseUpdateDeviceStatus();
-
-        logMessage("INFO", "Reading initial config from Firebase...");
-        firebasePollConfig();
-
-        delay(2000);
-        sendConfigToS3(config.normalRateSec, config.highRateSec, config.hMaxCm);
-
-        firebasePollOTA();
+    // Step 5: FLASH_END
+    logMsg("INFO", "Bootloader: FLASH_END...");
+    if (!s3BootloaderEndFlash(true)) {  // true = reboot after flash
+        logMsg("WARN", "FLASH_END response not received (S3 may have rebooted)");
     } else {
-        logMessage("WARN", "WiFi not connected at startup");
+        logMsg("INFO", "FLASH_END OK — S3 rebooting with new firmware");
     }
-
-    logMessage("INFO", "Pinging S3...");
-    sendPingToS3();
-
-    unsigned long pingWait = millis();
-    while (millis() - pingWait < 3000) {
-        processS3Commands();
-        if (s3_comm.pongReceived) {
-            logMessage("INFO", "S3 is alive");
-            break;
-        }
-        delay(50);
-    }
-
-    if (!s3_comm.pongReceived) {
-        logMessage("WARN", "S3 did not respond to initial PING");
-    }
-
-    Serial.println();
-    logMessage("INFO", "======== INITIALIZATION COMPLETE ========");
-    Serial.println();
 }
 
+bool s3BootloaderSync() {
+    // Sync command: opcode 0x08
+    // Data: 0x07 0x07 0x12 0x20 followed by 32 bytes of 0x55
+
+    uint8_t syncData[36];
+    syncData[0] = 0x07;
+    syncData[1] = 0x07;
+    syncData[2] = 0x12;
+    syncData[3] = 0x20;
+    for (int i = 4; i < 36; i++) {
+        syncData[i] = 0x55;
+    }
+
+    // Build command packet
+    uint8_t cmdPacket[44];  // 8 header + 36 data
+    cmdPacket[0] = 0x00;    // Direction: request
+    cmdPacket[1] = ESP_CMD_SYNC;
+    cmdPacket[2] = 36;      // Data length low
+    cmdPacket[3] = 0;       // Data length high
+    cmdPacket[4] = 0;       // Checksum (not used for sync)
+    cmdPacket[5] = 0;
+    cmdPacket[6] = 0;
+    cmdPacket[7] = 0;
+    memcpy(cmdPacket + 8, syncData, 36);
+
+    slipSend(cmdPacket, 44);
+
+    // Read response
+    uint8_t respBuf[128];
+    uint32_t respLen = 0;
+
+    // Bootloader sends multiple sync responses — read until we get one
+    for (int i = 0; i < 8; i++) {
+        if (slipReceive(respBuf, sizeof(respBuf), &respLen, 500)) {
+            if (respLen >= 10 && respBuf[0] == 0x01 && respBuf[1] == ESP_CMD_SYNC) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool s3BootloaderBeginFlash(uint32_t size, uint32_t numBlocks,
+                             uint32_t blockSize, uint32_t offset) {
+    // FLASH_BEGIN command: opcode 0x02
+    // Data: [size(4)] [numBlocks(4)] [blockSize(4)] [offset(4)]
+
+    uint8_t cmdPacket[8 + 16];
+    cmdPacket[0] = 0x00;  // Request
+    cmdPacket[1] = ESP_CMD_FLASH_BEGIN;
+    cmdPacket[2] = 16;    // Data length
+    cmdPacket[3] = 0;
+    cmdPacket[4] = 0;     // Checksum (not used for begin)
+    cmdPacket[5] = 0;
+    cmdPacket[6] = 0;
+    cmdPacket[7] = 0;
+
+    // Data payload (little-endian)
+    cmdPacket[8]  = (size >> 0)  & 0xFF;
+    cmdPacket[9]  = (size >> 8)  & 0xFF;
+    cmdPacket[10] = (size >> 16) & 0xFF;
+    cmdPacket[11] = (size >> 24) & 0xFF;
+
+    cmdPacket[12] = (numBlocks >> 0)  & 0xFF;
+    cmdPacket[13] = (numBlocks >> 8)  & 0xFF;
+    cmdPacket[14] = (numBlocks >> 16) & 0xFF;
+    cmdPacket[15] = (numBlocks >> 24) & 0xFF;
+
+    cmdPacket[16] = (blockSize >> 0)  & 0xFF;
+    cmdPacket[17] = (blockSize >> 8)  & 0xFF;
+    cmdPacket[18] = (blockSize >> 16) & 0xFF;
+    cmdPacket[19] = (blockSize >> 24) & 0xFF;
+
+    cmdPacket[20] = (offset >> 0)  & 0xFF;
+    cmdPacket[21] = (offset >> 8)  & 0xFF;
+    cmdPacket[22] = (offset >> 16) & 0xFF;
+    cmdPacket[23] = (offset >> 24) & 0xFF;
+
+    slipSend(cmdPacket, 24);
+
+    // Read response
+    uint8_t respBuf[64];
+    uint32_t respLen = 0;
+    if (slipReceive(respBuf, sizeof(respBuf), &respLen, 10000)) {
+        if (respLen >= 10 && respBuf[0] == 0x01 && respBuf[1] == ESP_CMD_FLASH_BEGIN) {
+            // Check status byte
+            if (respBuf[8] == 0x00) return true;
+        }
+    }
+
+    return false;
+}
+
+bool s3BootloaderWriteBlock(const uint8_t* data, uint32_t dataLen,
+                             uint32_t seqNum) {
+    // FLASH_DATA command: opcode 0x03
+    // Data: [dataLen(4)] [seqNum(4)] [0(4)] [0(4)] [data...]
+    // Checksum covers the data portion
+
+    uint32_t totalDataLen = 16 + dataLen;  // 16-byte header + actual data
+
+    // Allocate command packet
+    // Header: 8 bytes + data payload
+    uint32_t packetLen = 8 + totalDataLen;
+    uint8_t* cmdPacket = (uint8_t*)malloc(packetLen);
+    if (!cmdPacket) {
+        logMsg("ERROR", "OTA: malloc failed for flash data packet");
+        return false;
+    }
+
+    cmdPacket[0] = 0x00;  // Request
+    cmdPacket[1] = ESP_CMD_FLASH_DATA;
+    cmdPacket[2] = (totalDataLen >> 0) & 0xFF;
+    cmdPacket[3] = (totalDataLen >> 8) & 0xFF;
+
+    // Checksum of the data payload
+    uint8_t checksum = ESP_CHECKSUM_MAGIC;
+    for (uint32_t i = 0; i < dataLen; i++) {
+        checksum ^= data[i];
+    }
+    cmdPacket[4] = checksum;
+    cmdPacket[5] = 0;
+    cmdPacket[6] = 0;
+    cmdPacket[7] = 0;
+
+    // Data header
+    cmdPacket[8]  = (dataLen >> 0)  & 0xFF;
+    cmdPacket[9]  = (dataLen >> 8)  & 0xFF;
+    cmdPacket[10] = (dataLen >> 16) & 0xFF;
+    cmdPacket[11] = (dataLen >> 24) & 0xFF;
+
+    cmdPacket[12] = (seqNum >> 0)  & 0xFF;
+    cmdPacket[13] = (seqNum >> 8)  & 0xFF;
+    cmdPacket[14] = (seqNum >> 16) & 0xFF;
+    cmdPacket[15] = (seqNum >> 24) & 0xFF;
+
+    cmdPacket[16] = 0; cmdPacket[17] = 0; cmdPacket[18] = 0; cmdPacket[19] = 0;
+    cmdPacket[20] = 0; cmdPacket[21] = 0; cmdPacket[22] = 0; cmdPacket[23] = 0;
+
+    // Copy actual data
+    memcpy(cmdPacket + 24, data, dataLen);
+
+    slipSend(cmdPacket, packetLen);
+    free(cmdPacket);
+
+    // Read response
+    uint8_t respBuf[64];
+    uint32_t respLen = 0;
+    if (slipReceive(respBuf, sizeof(respBuf), &respLen, 10000)) {
+        if (respLen >= 10 && respBuf[0] == 0x01 && respBuf[1] == ESP_CMD_FLASH_DATA) {
+            if (respBuf[8] == 0x00) return true;
+        }
+    }
+
+    return false;
+}
+
+bool s3BootloaderEndFlash(bool reboot) {
+    // FLASH_END command: opcode 0x04
+    // Data: [flag(4)] — 0=reboot, 1=don't reboot
+
+    uint8_t cmdPacket[12];
+    cmdPacket[0] = 0x00;
+    cmdPacket[1] = ESP_CMD_FLASH_END;
+    cmdPacket[2] = 4;    // Data length
+    cmdPacket[3] = 0;
+    cmdPacket[4] = 0;    // No checksum
+    cmdPacket[5] = 0;
+    cmdPacket[6] = 0;
+    cmdPacket[7] = 0;
+
+    uint32_t flag = reboot ? 0 : 1;  // 0 = reboot after flash
+    cmdPacket[8]  = (flag >> 0) & 0xFF;
+    cmdPacket[9]  = (flag >> 8) & 0xFF;
+    cmdPacket[10] = (flag >> 16) & 0xFF;
+    cmdPacket[11] = (flag >> 24) & 0xFF;
+
+    slipSend(cmdPacket, 12);
+
+    // If rebooting, we may not get a response
+    uint8_t respBuf[64];
+    uint32_t respLen = 0;
+    if (slipReceive(respBuf, sizeof(respBuf), &respLen, 2000)) {
+        if (respLen >= 10 && respBuf[0] == 0x01 && respBuf[1] == ESP_CMD_FLASH_END) {
+            return true;
+        }
+    }
+
+    // It's OK if we don't get a response — S3 may have already rebooted
+    return true;
+}
+
+void slipSend(const uint8_t* data, uint32_t len) {
+    // SLIP framing: 0xC0 [escaped data] 0xC0
+
+    Serial1.write(SLIP_END);
+
+    for (uint32_t i = 0; i < len; i++) {
+        if (data[i] == SLIP_END) {
+            Serial1.write(SLIP_ESC);
+            Serial1.write(SLIP_ESC_END);
+        } else if (data[i] == SLIP_ESC) {
+            Serial1.write(SLIP_ESC);
+            Serial1.write(SLIP_ESC_ESC);
+        } else {
+            Serial1.write(data[i]);
+        }
+    }
+
+    Serial1.write(SLIP_END);
+    Serial1.flush();
+}
+
+bool slipReceive(uint8_t* buf, uint32_t maxLen, uint32_t* receivedLen,
+                  uint32_t timeoutMs) {
+    // Read a SLIP frame from Serial1
+    *receivedLen = 0;
+    unsigned long startMs = millis();
+    bool inFrame = false;
+    bool escaped = false;
+    uint32_t idx = 0;
+
+    while ((millis() - startMs) < timeoutMs) {
+        if (Serial1.available()) {
+            uint8_t c = Serial1.read();
+
+            if (!inFrame) {
+                if (c == SLIP_END) {
+                    inFrame = true;
+                    idx = 0;
+                }
+                continue;
+            }
+
+            if (escaped) {
+                escaped = false;
+                if (c == SLIP_ESC_END) {
+                    if (idx < maxLen) buf[idx++] = SLIP_END;
+                } else if (c == SLIP_ESC_ESC) {
+                    if (idx < maxLen) buf[idx++] = SLIP_ESC;
+                } else {
+                    if (idx < maxLen) buf[idx++] = c;  // Malformed, but accept
+                }
+                continue;
+            }
+
+            if (c == SLIP_END) {
+                // End of frame
+                if (idx > 0) {
+                    *receivedLen = idx;
+                    return true;
+                }
+                // Empty frame — ignore and continue waiting
+                continue;
+            }
+
+            if (c == SLIP_ESC) {
+                escaped = true;
+                continue;
+            }
+
+            if (idx < maxLen) {
+                buf[idx++] = c;
+            }
+        }
+
+        yield();
+    }
+
+    return false;  // Timeout
+}
+
+
 // ============================================================================
-// MAIN LOOP
+// ============================================================================
+//                       JSON PARSING UTILITIES (No ArduinoJson)
+// ============================================================================
+// ============================================================================
+//
+// Simple JSON value extractors that search for "key": and parse the value.
+// These handle the simple flat JSON objects returned by Firebase.
+// They DO NOT handle nested objects, arrays, or escaped strings.
+//
+
+void extractJsonStringValue(const String& json, const char* key,
+                             char* outBuf, int outBufSize) {
+    outBuf[0] = '\0';
+
+    // Search for "key":"value"
+    String searchKey = String("\"") + key + "\":\"";
+    int keyPos = json.indexOf(searchKey);
+    if (keyPos < 0) return;
+
+    int valStart = keyPos + searchKey.length();
+    int valEnd = json.indexOf('"', valStart);
+    if (valEnd < 0) return;
+
+    String value = json.substring(valStart, valEnd);
+    strncpy(outBuf, value.c_str(), outBufSize - 1);
+    outBuf[outBufSize - 1] = '\0';
+}
+
+int extractJsonIntValue(const String& json, const char* key, int defaultVal) {
+    // Search for "key":123 or "key": 123
+    String searchKey = String("\"") + key + "\":";
+    int keyPos = json.indexOf(searchKey);
+    if (keyPos < 0) return defaultVal;
+
+    int valStart = keyPos + searchKey.length();
+
+    // Skip whitespace
+    while (valStart < (int)json.length() &&
+           (json[valStart] == ' ' || json[valStart] == '\t')) {
+        valStart++;
+    }
+
+    // Check if it's a string-quoted number "key":"123"
+    if (valStart < (int)json.length() && json[valStart] == '"') {
+        valStart++;
+        int valEnd = json.indexOf('"', valStart);
+        if (valEnd < 0) return defaultVal;
+        return json.substring(valStart, valEnd).toInt();
+    }
+
+    // Extract numeric value
+    String numStr = "";
+    while (valStart < (int)json.length()) {
+        char c = json[valStart];
+        if (c == ',' || c == '}' || c == ' ' || c == '\n' || c == '\r') break;
+        numStr += c;
+        valStart++;
+    }
+
+    if (numStr.length() == 0) return defaultVal;
+    return numStr.toInt();
+}
+
+float extractJsonFloatValue(const String& json, const char* key, float defaultVal) {
+    String searchKey = String("\"") + key + "\":";
+    int keyPos = json.indexOf(searchKey);
+    if (keyPos < 0) return defaultVal;
+
+    int valStart = keyPos + searchKey.length();
+
+    while (valStart < (int)json.length() &&
+           (json[valStart] == ' ' || json[valStart] == '\t')) {
+        valStart++;
+    }
+
+    if (valStart < (int)json.length() && json[valStart] == '"') {
+        valStart++;
+        int valEnd = json.indexOf('"', valStart);
+        if (valEnd < 0) return defaultVal;
+        return json.substring(valStart, valEnd).toFloat();
+    }
+
+    String numStr = "";
+    while (valStart < (int)json.length()) {
+        char c = json[valStart];
+        if (c == ',' || c == '}' || c == ' ' || c == '\n' || c == '\r') break;
+        numStr += c;
+        valStart++;
+    }
+
+    if (numStr.length() == 0) return defaultVal;
+    return numStr.toFloat();
+}
+
+bool extractJsonBoolValue(const String& json, const char* key, bool defaultVal) {
+    String searchKey = String("\"") + key + "\":";
+    int keyPos = json.indexOf(searchKey);
+    if (keyPos < 0) return defaultVal;
+
+    int valStart = keyPos + searchKey.length();
+
+    while (valStart < (int)json.length() &&
+           (json[valStart] == ' ' || json[valStart] == '\t')) {
+        valStart++;
+    }
+
+    if (json.substring(valStart, valStart + 4) == "true") return true;
+    if (json.substring(valStart, valStart + 5) == "false") return false;
+
+    // Also handle "true" / "false" as strings
+    if (valStart < (int)json.length() && json[valStart] == '"') {
+        valStart++;
+        if (json.substring(valStart, valStart + 4) == "true") return true;
+        if (json.substring(valStart, valStart + 5) == "false") return false;
+    }
+
+    return defaultVal;
+}
+
+
+// ============================================================================
+// ============================================================================
+//                       LOGGING UTILITY
+// ============================================================================
 // ============================================================================
 
-void loop() {
-    // Phase 1: WiFi
-    wifiCheckConnection();
-    if (!wifi_state.connected) wifiConnectLoop();
-
-    // Phase 2: Receive data from S3
-    softUartProcessReceived();
-
-    // Phase 3: S3 command responses
-    processS3Commands();
-
-    // Phase 4: Firebase operations
-    if (wifi_state.connected) {
-        firebasePollConfig();
-
-        if (ota_state.phase == OTA_IDLE) {
-            static unsigned long lastOTAPoll = 0;
-            if (millis() - lastOTAPoll > 30000) {
-                firebasePollOTA();
-                lastOTAPoll = millis();
-            }
-        }
-
-        if (!config.realtimeMode && sd_state.bufferHasData) {
-            sdFlushToFirebase();
-        }
-
-        firebaseUpdateDeviceStatus();
-    }
-
-    // Phase 5: Config pipeline
-    processConfigPipeline();
-
-    // Phase 6: OTA pipeline
-    processOTAPipeline();
-
-    // Phase 7: S3 liveness
-    if (s3_comm.s3Active && ota_state.phase == OTA_IDLE) {
-        unsigned long timeSinceData = millis() - s3_comm.lastDataReceived;
-        unsigned long maxExpected = (config.normalRateSec + 60) * 1000UL;
-
-        if (s3_comm.lastDataReceived > 0 && timeSinceData > maxExpected) {
-            unsigned long timeSincePing = millis() - s3_comm.lastPingSent;
-            if (timeSincePing > 60000) {
-                logMessage("WARN", "No data from S3 — sending PING");
-                sendPingToS3();
-            }
-        }
-    }
-
-    // Phase 8: Diagnostic trigger check
-    static unsigned long lastDiagCheck = 0;
-    if (wifi_state.connected && millis() - lastDiagCheck > 60000) {
-        lastDiagCheck = millis();
-
-        char response[32];
-        if (firebaseHTTPGet("/diagnostics/trigger", response, sizeof(response))) {
-            if (strstr(response, "true") != NULL) {
-                logMessage("INFO", "Diagnostic trigger from website");
-                sendDiagRunToS3();
-                firebaseHTTPPut("/diagnostics/trigger", "false");
-            }
-        }
-    }
-
-    delay(1);
+void logMsg(const char* level, const char* msg) {
+    unsigned long t = millis() / 1000;
+    Serial.printf("[%lu][%s] %s\n", t, level, msg);
 }
