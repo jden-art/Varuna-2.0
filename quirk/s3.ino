@@ -121,6 +121,11 @@
 #define RATE_INTERP_HIGH             0.80f  // Above 80% H_max → high rate
 
 // ============================================================================
+// CONTINUOUS MONITORING INTERVAL
+// ============================================================================
+#define MONITOR_INTERVAL_MS          2000   // 2 seconds — continuous flood monitoring
+
+// ============================================================================
 // DIAGNOSTIC CONSTANTS
 // ============================================================================
 #define DIAG_INTERVAL_MS       86400000UL  // 24 hours
@@ -370,6 +375,7 @@ int          normalRateSec      = DEFAULT_NORMAL_RATE_SEC;
 int          highRateSec        = DEFAULT_HIGH_RATE_SEC;
 int          currentIntervalSec = DEFAULT_NORMAL_RATE_SEC;
 unsigned long lastTransmitMs    = 0;
+unsigned long lastMonitorMs     = 0;
 
 // ============================================================================
 // GLOBAL STATE — SESSION STATISTICS
@@ -582,6 +588,7 @@ void setup() {
     // ========================================================================
     sessionStartMs   = millis();
     lastTransmitMs   = millis();
+    lastMonitorMs    = millis();
     lastDiagMs       = millis();
     lastFusionUs     = micros();
     prevHeightTimeMs = millis();
@@ -642,21 +649,24 @@ void loop() {
     processDebuggerCommands();
 
     // ========================================================================
-    // TASK 5: Transmit data at dynamic interval
+    // TASK 5A: Continuous Flood Monitoring (every 2 seconds, always)
+    //
+    // This runs on a short fixed interval regardless of flood state.
+    // It evaluates the current sensor fusion output, updates all flood
+    // state variables, and adjusts the dynamic sampling rate in real time.
+    // This ensures the system is never blind to rapid water rise between
+    // transmissions.
     // ========================================================================
-    unsigned long intervalMs = (unsigned long)currentIntervalSec * 1000UL;
-    if ((nowMs - lastTransmitMs) >= intervalMs) {
-        lastTransmitMs = nowMs;
+    if ((nowMs - lastMonitorMs) >= MONITOR_INTERVAL_MS) {
+        lastMonitorMs = nowMs;
 
-        // Update slower sensors before transmit
+        // Update pressure sensor for submersion detection
         if (bmpAvailable) {
             bmpUpdate();
         }
-        if (rtcAvailable) {
-            rtcReadTime();
-            rtcFormatDateTime();
-        }
-        readBattery();
+
+        // Store previous mode to detect escalation
+        FloodMode previousMode = currentMode;
 
         // Compute water height and flood classification
         computeWaterHeight();
@@ -665,8 +675,56 @@ void loop() {
         computeAlertLevel();
         computeZone();
         computeResponseLevel();
-        updateSessionStats();
         computeDynamicSamplingRate();
+
+        // Emergency immediate transmission on mode escalation
+        // If the mode transitioned to a MORE dangerous state, transmit
+        // immediately without waiting for the regular transmit timer.
+        if (currentMode > previousMode) {
+            char escMsg[128];
+            snprintf(escMsg, sizeof(escMsg),
+                     "EMERGENCY TRANSMIT: Mode escalated %d → %d",
+                     previousMode, currentMode);
+            statusPrint(escMsg);
+
+            // Refresh supporting data for the emergency packet
+            if (rtcAvailable) {
+                rtcReadTime();
+                rtcFormatDateTime();
+            }
+            readBattery();
+            updateSessionStats();
+            healthScore = computeHealthScore();
+
+            // Transmit immediately on both channels
+            transmitData();
+
+            // Reset transmit timer so next regular transmit is one full
+            // interval from now (avoids double-send moments later)
+            lastTransmitMs = nowMs;
+        }
+    }
+
+    // ========================================================================
+    // TASK 5B: Data Transmission at dynamic interval
+    //
+    // This only packages and sends the current state. All flood detection,
+    // classification, alert levels, zone, response level, and dynamic
+    // sampling rate are already current from Task 5A.
+    // ========================================================================
+    unsigned long intervalMs = (unsigned long)currentIntervalSec * 1000UL;
+    if ((nowMs - lastTransmitMs) >= intervalMs) {
+        lastTransmitMs = nowMs;
+
+        // Update slower sensors before transmit
+        if (rtcAvailable) {
+            rtcReadTime();
+            rtcFormatDateTime();
+        }
+        readBattery();
+
+        // Update session statistics
+        updateSessionStats();
 
         // Update health score
         healthScore = computeHealthScore();
