@@ -14,6 +14,7 @@
 // 8. PROGRAMMING the S3 via its UART bootloader (BOOT/EN pins)
 // 9. RESPONDING to S3 diagnostic pings ($PING → $PONG)
 // 10. REAL-TIME MODE: bypassing SD buffer when server requests it
+// 11. CONSOLE COMMAND CHANNEL: remote commands from website via Firebase
 //
 // The C3 NEVER processes sensor data. It is a dumb pipe + OTA programmer.
 // All intelligence is on the S3.
@@ -22,6 +23,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>  // *** NEW: CHANGE 3 — HTTPS support ***
 #include <SPI.h>
 #include <SD.h>
 
@@ -214,6 +216,13 @@ void parseFirebaseConfig(const String& response);
 void parseFirebaseOTACommand(const String& response);
 void parseFirebaseRealtimeFlag(const String& response);
 void parseFirebaseDiagRequest(const String& response);
+
+// *** NEW: CHANGE 1 — Console command forward declarations ***
+void parseFirebaseConsoleCommand(const String& response);
+String waitForS3Response(unsigned long timeoutMs);
+String executeLocalCommand(const String& command);
+void writeConsoleResponse(const String& command, const String& response);
+// *** END NEW ***
 
 // SD Card operations
 void initSDCard();
@@ -730,11 +739,14 @@ void handleCompleteCSVLine(const char* line) {
 bool firebasePush(const char* path, const char* jsonPayload) {
     if (!wifiConnected) return false;
 
+    // *** MODIFIED: CHANGE 3 — Use WiFiClientSecure with setInsecure() ***
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     HTTPClient http;
     String url = String("https://") + FIREBASE_HOST + "/" + path +
                  ".json?auth=" + FIREBASE_AUTH;
 
-    http.begin(url);
+    http.begin(secureClient, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
 
@@ -754,11 +766,14 @@ bool firebasePush(const char* path, const char* jsonPayload) {
 bool firebasePut(const char* path, const char* jsonPayload) {
     if (!wifiConnected) return false;
 
+    // *** MODIFIED: CHANGE 3 — Use WiFiClientSecure with setInsecure() ***
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     HTTPClient http;
     String url = String("https://") + FIREBASE_HOST + "/" + path +
                  ".json?auth=" + FIREBASE_AUTH;
 
-    http.begin(url);
+    http.begin(secureClient, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
 
@@ -778,11 +793,14 @@ bool firebasePut(const char* path, const char* jsonPayload) {
 String firebaseGet(const char* path) {
     if (!wifiConnected) return "";
 
+    // *** MODIFIED: CHANGE 3 — Use WiFiClientSecure with setInsecure() ***
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     HTTPClient http;
     String url = String("https://") + FIREBASE_HOST + "/" + path +
                  ".json?auth=" + FIREBASE_AUTH;
 
-    http.begin(url);
+    http.begin(secureClient, url);
     http.setTimeout(10000);
 
     int httpCode = http.GET();
@@ -803,11 +821,14 @@ String firebaseGet(const char* path) {
 bool firebaseDelete(const char* path) {
     if (!wifiConnected) return false;
 
+    // *** MODIFIED: CHANGE 3 — Use WiFiClientSecure with setInsecure() ***
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     HTTPClient http;
     String url = String("https://") + FIREBASE_HOST + "/" + path +
                  ".json?auth=" + FIREBASE_AUTH;
 
-    http.begin(url);
+    http.begin(secureClient, url);
     http.setTimeout(10000);
 
     int httpCode = http.sendRequest("DELETE");
@@ -995,6 +1016,9 @@ String csvToFirebaseJson(const char* csvLine) {
 //   devices/<DEVICE_ID>/commands/diagnostic
 //     → { run: true }
 //
+//   devices/<DEVICE_ID>/commands/console         *** NEW: CHANGE 1 ***
+//     → "STATUS" or "$DBG,GET_STATUS" etc.
+//
 
 void pollFirebaseCommands() {
     // ---- 1. Check for config updates ----
@@ -1037,7 +1061,19 @@ void pollFirebaseCommands() {
         }
     }
 
-    // ---- 5. Update device status in Firebase ----
+    // *** NEW: CHANGE 1 — Check for console command ***
+    // ---- 5. Check for console command ----
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "devices/%s/commands/console", DEVICE_ID);
+        String response = firebaseGet(path);
+        if (response.length() > 2 && response != "null") {
+            parseFirebaseConsoleCommand(response);
+        }
+    }
+    // *** END NEW ***
+
+    // ---- 6. Update device status in Firebase ----
     {
         char statusJson[512];
         snprintf(statusJson, sizeof(statusJson),
@@ -1166,6 +1202,396 @@ void parseFirebaseDiagRequest(const String& response) {
         firebaseDelete(path);
     }
 }
+
+
+// ============================================================================
+// ============================================================================
+// *** NEW: CHANGE 1 + CHANGE 2 — CONSOLE COMMAND HANDLING ***
+// ============================================================================
+// ============================================================================
+//
+// The website writes a command string to:
+//   devices/<DEVICE_ID>/commands/console
+//
+// The C3 reads it, routes it by prefix, executes or forwards, writes the
+// response to devices/<DEVICE_ID>/responses/console, and deletes the command.
+//
+
+// ----------------------------------------------------------------------------
+// waitForS3Response — wait for S3 to respond on Serial1
+// ----------------------------------------------------------------------------
+String waitForS3Response(unsigned long timeoutMs) {
+    // Clear any pending data on Serial1 first
+    while (Serial1.available()) {
+        Serial1.read();
+    }
+
+    String collected = "";
+    unsigned long startMs = millis();
+    char lineBuf[256];
+    int lineIdx = 0;
+    bool gotData = false;
+
+    while ((millis() - startMs) < timeoutMs) {
+        if (Serial1.available()) {
+            char c = Serial1.read();
+            gotData = true;
+
+            if (c == '\n' || c == '\r') {
+                if (lineIdx > 0) {
+                    lineBuf[lineIdx] = '\0';
+                    if (collected.length() > 0) {
+                        collected += "\n";
+                    }
+                    collected += String(lineBuf);
+                    lineIdx = 0;
+                }
+            } else {
+                if (lineIdx < (int)sizeof(lineBuf) - 1) {
+                    lineBuf[lineIdx++] = c;
+                }
+            }
+        }
+        yield();
+        delay(1);
+    }
+
+    // Capture any remaining partial line
+    if (lineIdx > 0) {
+        lineBuf[lineIdx] = '\0';
+        if (collected.length() > 0) {
+            collected += "\n";
+        }
+        collected += String(lineBuf);
+    }
+
+    return collected;
+}
+
+// ----------------------------------------------------------------------------
+// writeConsoleResponse — write response to Firebase and delete command
+// ----------------------------------------------------------------------------
+void writeConsoleResponse(const String& command, const String& response) {
+    // Escape quotes and special characters in the response for JSON
+    String escapedResponse = response;
+    escapedResponse.replace("\\", "\\\\");
+    escapedResponse.replace("\"", "\\\"");
+    escapedResponse.replace("\n", "\\n");
+    escapedResponse.replace("\r", "\\r");
+    escapedResponse.replace("\t", "\\t");
+
+    String escapedCommand = command;
+    escapedCommand.replace("\\", "\\\\");
+    escapedCommand.replace("\"", "\\\"");
+
+    // Build JSON response
+    String json = "{\"command\":\"" + escapedCommand +
+                  "\",\"response\":\"" + escapedResponse +
+                  "\",\"timestamp\":{\".sv\":\"timestamp\"}}";
+
+    // Write response to Firebase
+    char respPath[128];
+    snprintf(respPath, sizeof(respPath), "devices/%s/responses/console", DEVICE_ID);
+    firebasePut(respPath, json.c_str());
+
+    // Delete the command from Firebase
+    char cmdPath[128];
+    snprintf(cmdPath, sizeof(cmdPath), "devices/%s/commands/console", DEVICE_ID);
+    firebaseDelete(cmdPath);
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "Console command '%s' processed, response written",
+             command.c_str());
+    logMsg("INFO", logBuf);
+}
+
+// ----------------------------------------------------------------------------
+// executeLocalCommand — handle commands meant for the C3 itself
+// ----------------------------------------------------------------------------
+String executeLocalCommand(const String& command) {
+
+    // ---- STATUS ----
+    if (command == "STATUS") {
+        // Get state name
+        const char* stateStr = "UNKNOWN";
+        switch (currentState) {
+            case STATE_NORMAL:       stateStr = "NORMAL"; break;
+            case STATE_BUFFERING:    stateStr = "BUFFERING"; break;
+            case STATE_FLUSHING:     stateStr = "FLUSHING"; break;
+            case STATE_OTA_DOWNLOAD: stateStr = "OTA_DOWNLOAD"; break;
+            case STATE_OTA_FLASH:    stateStr = "OTA_FLASH"; break;
+            case STATE_OTA_VERIFY:   stateStr = "OTA_VERIFY"; break;
+        }
+
+        unsigned long timeSinceS3 = (millis() - s3LastDataMs) / 1000;
+
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "WiFi: %s (%d dBm)\n"
+                 "SD: %s (%lu buffered)\n"
+                 "S3: %s (last data %lus ago)\n"
+                 "State: %s\n"
+                 "RT Mode: %s\n"
+                 "Heap: %lu bytes\n"
+                 "Uptime: %lus\n"
+                 "Config: normal=%ds high=%ds hmax=%.2fcm",
+                 wifiConnected ? "Connected" : "Disconnected",
+                 WiFi.RSSI(),
+                 sdAvailable ? "Available" : "Unavailable",
+                 sdBufferedCount,
+                 s3Active ? "Active" : "Inactive",
+                 timeSinceS3,
+                 stateStr,
+                 realTimeMode == RT_ON ? "ON" : "OFF",
+                 (unsigned long)ESP.getFreeHeap(),
+                 millis() / 1000UL,
+                 cfgNormalRateSec, cfgHighRateSec, cfgHMaxCm);
+        return String(buf);
+    }
+
+    // ---- LASTFRAME ----
+    if (command == "LASTFRAME") {
+        if (strlen(lastCSVLine) == 0) {
+            return "No CSV data received yet";
+        }
+        return String(lastCSVLine);
+    }
+
+    // ---- REINITSD ----
+    if (command == "REINITSD") {
+        initSDCard();
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SD reinitialized — available: %s, buffered: %lu lines",
+                 sdAvailable ? "true" : "false", sdBufferedCount);
+        return String(buf);
+    }
+
+    // ---- RESETSIM ----
+    if (command == "RESETSIM") {
+        return "SIM module not connected — placeholder for future integration";
+    }
+
+    // ---- FORCETX ----
+    if (command == "FORCETX") {
+        Serial1.println("$FORCETX");
+        logMsg("INFO", "Sent $FORCETX to S3");
+        String s3resp = waitForS3Response(3000);
+        if (s3resp.length() > 0) {
+            return s3resp;
+        }
+        return "FORCETX sent to S3 — no acknowledgment received";
+    }
+
+    // ---- SETRT1 ----
+    if (command == "SETRT1") {
+        realTimeMode = RT_ON;
+        char rtPath[128];
+        snprintf(rtPath, sizeof(rtPath), "devices/%s/commands/realtime", DEVICE_ID);
+        firebasePut(rtPath, "{\"enabled\":true}");
+        return "Real-time mode ENABLED";
+    }
+
+    // ---- SETRT0 ----
+    if (command == "SETRT0") {
+        realTimeMode = RT_OFF;
+        char rtPath[128];
+        snprintf(rtPath, sizeof(rtPath), "devices/%s/commands/realtime", DEVICE_ID);
+        firebasePut(rtPath, "{\"enabled\":false}");
+        return "Real-time mode DISABLED";
+    }
+
+    // ---- DELBUF ----
+    if (command == "DELBUF") {
+        unsigned long countBefore = sdBufferedCount;
+        SD.remove(SD_BUFFER_FILE);
+        SD.remove(SD_BUFFER_INDEX);
+        sdBufferedCount = 0;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SD buffer deleted — %lu lines removed", countBefore);
+        return String(buf);
+    }
+
+    // ---- READBUF ----
+    if (command == "READBUF") {
+        if (!sdAvailable) {
+            return "SD not available";
+        }
+        File f = SD.open(SD_BUFFER_FILE, FILE_READ);
+        if (!f) {
+            return "No buffer file found";
+        }
+        String contents = "";
+        int charsRead = 0;
+        bool truncated = false;
+        while (f.available() && charsRead < 2000) {
+            char c = f.read();
+            contents += c;
+            charsRead++;
+        }
+        if (f.available()) {
+            truncated = true;
+        }
+        f.close();
+        if (truncated) {
+            char suffix[64];
+            snprintf(suffix, sizeof(suffix), "\n... (truncated, total %lu lines)", sdBufferedCount);
+            contents += String(suffix);
+        }
+        return contents;
+    }
+
+    // ---- SIMSTATE ----
+    if (command == "SIMSTATE") {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "SIM RSSI: %d\n"
+                 "SIM Registered: %s\n"
+                 "SIM Available: %s\n"
+                 "(SIM module not physically connected)",
+                 simRSSI,
+                 simRegistered ? "true" : "false",
+                 simAvailable ? "true" : "false");
+        return String(buf);
+    }
+
+    // Unknown local command
+    return "Unknown C3 command: " + command;
+}
+
+// ----------------------------------------------------------------------------
+// parseFirebaseConsoleCommand — main console command router
+// ----------------------------------------------------------------------------
+void parseFirebaseConsoleCommand(const String& response) {
+    // The response from Firebase is a JSON-quoted string like "STATUS"
+    // or it could be a raw string. Extract the command.
+    String command = response;
+
+    // Remove surrounding quotes if present (Firebase returns strings as "value")
+    command.trim();
+    if (command.startsWith("\"") && command.endsWith("\"")) {
+        command = command.substring(1, command.length() - 1);
+    }
+    command.trim();
+
+    if (command.length() == 0) {
+        // Empty command — just delete it
+        char cmdPath[128];
+        snprintf(cmdPath, sizeof(cmdPath), "devices/%s/commands/console", DEVICE_ID);
+        firebaseDelete(cmdPath);
+        return;
+    }
+
+    char logBuf[256];
+    snprintf(logBuf, sizeof(logBuf), "Console command received: %s", command.c_str());
+    logMsg("INFO", logBuf);
+
+    String result = "";
+
+    // ---- Route 1: $DBG, prefix — forward to S3 ----
+    if (command.startsWith("$DBG,")) {
+        String rawCmd = command.substring(5);  // Strip "$DBG,"
+        String s3Cmd = "$" + rawCmd;           // Prepend "$"
+
+        char s3LogBuf[256];
+        snprintf(s3LogBuf, sizeof(s3LogBuf), "Forwarding to S3: %s", s3Cmd.c_str());
+        logMsg("INFO", s3LogBuf);
+
+        // Clear pending serial data before sending
+        while (Serial1.available()) Serial1.read();
+
+        Serial1.println(s3Cmd);
+
+        // Wait for response from S3
+        // We need to wait AFTER sending, so use a manual wait loop
+        String s3resp = "";
+        unsigned long waitStart = millis();
+        char rLineBuf[256];
+        int rLineIdx = 0;
+
+        while ((millis() - waitStart) < 3000) {
+            if (Serial1.available()) {
+                char c = Serial1.read();
+                if (c == '\n' || c == '\r') {
+                    if (rLineIdx > 0) {
+                        rLineBuf[rLineIdx] = '\0';
+                        if (s3resp.length() > 0) {
+                            s3resp += "\n";
+                        }
+                        s3resp += String(rLineBuf);
+                        rLineIdx = 0;
+                    }
+                } else {
+                    if (rLineIdx < (int)sizeof(rLineBuf) - 1) {
+                        rLineBuf[rLineIdx++] = c;
+                    }
+                }
+            }
+            yield();
+            delay(1);
+        }
+        // Capture any remaining partial line
+        if (rLineIdx > 0) {
+            rLineBuf[rLineIdx] = '\0';
+            if (s3resp.length() > 0) {
+                s3resp += "\n";
+            }
+            s3resp += String(rLineBuf);
+        }
+
+        if (s3resp.length() > 0) {
+            result = s3resp;
+        } else {
+            result = "No response from S3 (timeout)";
+        }
+    }
+    // ---- Route 2: AT commands — SIM placeholder ----
+    else if (command.startsWith("AT ") || command.startsWith("AT+")) {
+        result = "SIM module not connected";
+    }
+    // ---- Route 3: CFG: prefix — config command ----
+    else if (command.startsWith("CFG:")) {
+        String cfgData = command.substring(4);  // Strip "CFG:"
+
+        // Parse as normal,high,hmax
+        int comma1 = cfgData.indexOf(',');
+        int comma2 = cfgData.indexOf(',', comma1 + 1);
+
+        if (comma1 > 0 && comma2 > comma1) {
+            int newNormal = cfgData.substring(0, comma1).toInt();
+            int newHigh = cfgData.substring(comma1 + 1, comma2).toInt();
+            float newHMax = cfgData.substring(comma2 + 1).toFloat();
+
+            if (newNormal > 0) cfgNormalRateSec = newNormal;
+            if (newHigh > 0) cfgHighRateSec = newHigh;
+            if (newHMax > 0) cfgHMaxCm = newHMax;
+
+            cfgDirty = true;
+
+            // Send to S3 immediately
+            char cfgCmd[128];
+            snprintf(cfgCmd, sizeof(cfgCmd), "$CFG,%d,%d,%.2f",
+                     cfgNormalRateSec, cfgHighRateSec, cfgHMaxCm);
+            Serial1.println(cfgCmd);
+
+            char cfgMsg[256];
+            snprintf(cfgMsg, sizeof(cfgMsg),
+                     "Config updated and sent to S3: normal=%d high=%d hmax=%.2f",
+                     cfgNormalRateSec, cfgHighRateSec, cfgHMaxCm);
+            result = String(cfgMsg);
+        } else {
+            result = "Invalid CFG format. Use CFG:normal,high,hmax";
+        }
+    }
+    // ---- Route 4: Local C3 commands ----
+    else {
+        result = executeLocalCommand(command);
+    }
+
+    // Write response to Firebase and delete command
+    writeConsoleResponse(command, result);
+}
+
+// *** END NEW: CHANGE 1 + CHANGE 2 ***
 
 
 // ============================================================================
@@ -1407,6 +1833,24 @@ void handleS3Message(const char* msg) {
         snprintf(logBuf, sizeof(logBuf), "Unknown S3 message: %s", msg);
         logMsg("WARN", logBuf);
     }
+
+    // *** NEW: CHANGE 5 — Forward ALL S3 messages to Firebase for website visibility ***
+    if (wifiConnected) {
+        // Escape the message for JSON
+        String escapedMsg = String(msg);
+        escapedMsg.replace("\\", "\\\\");
+        escapedMsg.replace("\"", "\\\"");
+
+        char s3MsgJson[512];
+        snprintf(s3MsgJson, sizeof(s3MsgJson),
+                 "{\"message\":\"%s\",\"timestamp\":{\".sv\":\"timestamp\"}}",
+                 escapedMsg.c_str());
+
+        char s3MsgPath[128];
+        snprintf(s3MsgPath, sizeof(s3MsgPath), "devices/%s/responses/s3_messages", DEVICE_ID);
+        firebasePut(s3MsgPath, s3MsgJson);
+    }
+    // *** END NEW: CHANGE 5 ***
 }
 
 void sendConfigToS3() {
@@ -1581,9 +2025,14 @@ bool downloadOTABinaryToSD(const char* sdPath) {
         SD.remove(sdPath);
     }
 
+    // *** MODIFIED: CHANGE 3 — Use WiFiClientSecure + setInsecure() + setFollowRedirects() ***
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     HTTPClient http;
-    http.begin(String(otaUrl));
+    http.begin(secureClient, String(otaUrl));
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setTimeout(60000);  // 60 second timeout for large files
+    // *** END MODIFIED ***
 
     int httpCode = http.GET();
 
