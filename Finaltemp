@@ -1,0 +1,2463 @@
+// ============================================================================
+// VARUNA BUOY — ESP32-S3 SENSOR BRAIN FIRMWARE
+// ============================================================================
+// Complete autonomous flood detection system
+// No WiFi, no HTTP, no Firebase — pure edge sensing
+// Outputs 39-field CSV on GPIO 14 (software UART to C3)
+// Receives config commands from C3 on Serial2 (GPIO 43/44)
+// Receives debug commands from USB Serial
+// ============================================================================
+
+#include <Wire.h>
+#include <math.h>
+
+// ============================================================================
+// HARDWARE PIN DEFINITIONS
+// ============================================================================
+
+// I2C Bus 0 — MPU6050 only
+#define I2C0_SDA          8
+#define I2C0_SCL          9
+
+// I2C Bus 1 — BMP280 + DS1307
+#define I2C1_SDA          4
+#define I2C1_SCL          5
+
+// GPS UART
+#define GPS_RX_PIN        6   // S3 RX from GPS TX
+#define GPS_TX_PIN        7   // S3 TX to GPS RX
+#define GPS_BAUD          9600
+
+// Battery ADC
+#define BATTERY_ADC_PIN   2
+#define ADC_SAMPLES       16
+
+// Software UART to C3 — CSV data output
+#define C3_DATA_TX_PIN    14
+#define C3_DATA_BAUD      9600
+
+// Hardware Serial2 to C3 — command channel
+#define C3_CMD_TX_PIN     43
+#define C3_CMD_RX_PIN     44
+#define C3_CMD_BAUD       9600
+
+// USB Serial — debugger
+#define DEBUG_BAUD        115200
+
+// ============================================================================
+// I2C DEVICE ADDRESSES
+// ============================================================================
+
+#define MPU6050_ADDR      0x68
+#define BMP280_ADDR       0x76
+#define DS1307_ADDR       0x68  // Same numeric address, DIFFERENT I2C bus
+
+// ============================================================================
+// MPU6050 REGISTER MAP
+// ============================================================================
+
+#define MPU6050_REG_WHO_AM_I      0x75
+#define MPU6050_REG_PWR_MGMT_1    0x6B
+#define MPU6050_REG_PWR_MGMT_2    0x6C
+#define MPU6050_REG_SMPLRT_DIV    0x19
+#define MPU6050_REG_CONFIG        0x1A
+#define MPU6050_REG_GYRO_CONFIG   0x1B
+#define MPU6050_REG_ACCEL_CONFIG  0x1C
+#define MPU6050_REG_ACCEL_XOUT_H  0x3B
+#define MPU6050_REG_GYRO_XOUT_H   0x43
+#define MPU6050_REG_TEMP_OUT_H    0x41
+
+#define MPU6050_WHO_AM_I_VALUE    0x68
+
+// Sensitivity scale factors
+#define ACCEL_SCALE_2G    16384.0f   // LSB/g for ±2g
+#define GYRO_SCALE_250DPS 131.0f     // LSB/(°/s) for ±250°/s
+#define GRAVITY_MPS2      9.80665f
+
+// ============================================================================
+// BMP280 REGISTER MAP
+// ============================================================================
+
+#define BMP280_REG_CHIP_ID        0xD0
+#define BMP280_REG_RESET          0xE0
+#define BMP280_REG_STATUS         0xF3
+#define BMP280_REG_CTRL_MEAS      0xF4
+#define BMP280_REG_CONFIG_REG     0xF5
+#define BMP280_REG_PRESS_MSB      0xF7
+#define BMP280_REG_TEMP_MSB       0xFA
+#define BMP280_REG_CALIB_START    0x88
+
+#define BMP280_CHIP_ID_VALUE      0x58
+#define BMP280_RESET_VALUE        0xB6
+
+// ============================================================================
+// DS1307 REGISTER MAP
+// ============================================================================
+
+#define DS1307_REG_SECONDS        0x00
+#define DS1307_REG_MINUTES        0x01
+#define DS1307_REG_HOURS          0x02
+#define DS1307_REG_DAY            0x03
+#define DS1307_REG_DATE           0x04
+#define DS1307_REG_MONTH          0x05
+#define DS1307_REG_YEAR           0x06
+#define DS1307_REG_CONTROL        0x07
+
+// ============================================================================
+// COMPLEMENTARY FILTER CONSTANTS
+// ============================================================================
+
+#define ALPHA                     0.98f    // Gyro weight (98%)
+#define FILTER_RATE_HZ            100      // 100 Hz fusion rate
+#define FILTER_PERIOD_US          10000    // 10 ms in microseconds
+
+// ============================================================================
+// FLOOD DETECTION THRESHOLDS
+// ============================================================================
+
+// Tether detection
+#define LATERAL_ACCEL_TAUT_THRESH     0.15f   // m/s² — tether taut trigger
+#define LATERAL_ACCEL_SLACK_THRESH    0.10f   // m/s² — tether slack trigger (hysteresis)
+#define TILT_TAUT_MIN_DEG             3.0f    // Minimum tilt for taut detection
+
+// Flood detection
+#define FLOOD_TILT_MAX_DEG            10.0f   // Below this + high H ratio = flood
+#define FLOOD_H_RATIO_THRESH          0.95f   // H/L ratio threshold for flood mode
+
+// Submersion detection
+#define SUBMERSION_PRESSURE_PA        500.0f  // Gauge pressure threshold (Pa)
+#define SUBMERSION_DEPTH_FACTOR       (1.0f / (1000.0f * GRAVITY_MPS2))  // Pa to meters
+
+// Mode persistence — debounce
+#define MODE_PERSIST_NORMAL           10      // Readings before mode commit
+#define MODE_PERSIST_SUBMERGE         3       // Faster commit for submersion (urgent)
+
+// ============================================================================
+// DYNAMIC SAMPLING CONSTANTS
+// ============================================================================
+
+#define DEFAULT_NORMAL_RATE_SEC       900     // 15 minutes
+#define DEFAULT_HIGH_RATE_SEC         60      // 1 minute
+#define RATE_TRANSITION_LOW           0.50f   // Below 50% H/L → normal rate
+#define RATE_TRANSITION_HIGH          0.80f   // Above 80% H/L → high rate
+
+// ============================================================================
+// CALIBRATION CONSTANTS
+// ============================================================================
+
+#define GYRO_CAL_SAMPLES              1000
+#define ACCEL_CAL_SAMPLES             500
+#define ACCEL_G_MIN                   0.9f    // Valid g magnitude range
+#define ACCEL_G_MAX                   1.1f
+#define BASELINE_PRESSURE_SAMPLES     50
+
+// ============================================================================
+// GPS PARSING CONSTANTS
+// ============================================================================
+
+#define GPS_BUFFER_SIZE               128
+#define NMEA_MAX_FIELDS               20
+
+// ============================================================================
+// DIAGNOSTIC TIMING
+// ============================================================================
+
+#define DIAG_INTERVAL_MS              86400000UL  // 24 hours in ms
+#define DIAG_PING_TIMEOUT_MS          2000         // Wait for PONG
+
+// ============================================================================
+// SOFTWARE UART BIT TIMING
+// ============================================================================
+
+#define SOFT_UART_BIT_TIME_US         104   // 1/9600 ≈ 104.17 µs
+
+// ============================================================================
+// I2C BUS INSTANCES
+// ============================================================================
+
+TwoWire I2C_Bus0 = TwoWire(0);   // MPU6050
+TwoWire I2C_Bus1 = TwoWire(1);   // BMP280 + DS1307
+
+// ============================================================================
+// GLOBAL STATE STRUCTURES
+// ============================================================================
+
+// --- MPU6050 State ---
+struct MPU6050State {
+    // Raw readings (16-bit signed)
+    int16_t rawAccX, rawAccY, rawAccZ;
+    int16_t rawGyroX, rawGyroY, rawGyroZ;
+    int16_t rawTemp;
+
+    // Physical units
+    float accX_g, accY_g, accZ_g;         // in g
+    float accX_mps2, accY_mps2, accZ_mps2; // in m/s²
+    float gyroX_dps, gyroY_dps, gyroZ_dps; // in °/s
+
+    // Calibration offsets
+    float gyroOffsetX, gyroOffsetY, gyroOffsetZ;  // °/s offset
+    float refAccX, refAccY, refAccZ;               // Reference gravity vector (g)
+    float refTiltX, refTiltY;                      // Reference tilt angles (°)
+
+    // Complementary filter output
+    float filtTiltX, filtTiltY;                    // Filtered tilt (°)
+    float correctedTiltX, correctedTiltY;          // After reference subtraction (°)
+    float combinedTheta;                           // sqrt(corrX² + corrY²) (°)
+
+    // Lateral acceleration for tether detection
+    float lateralAccel;  // sqrt(ax² + ay²) in m/s²
+
+    // Sensor status
+    bool online;
+    bool calibrated;
+
+    // Timing
+    unsigned long lastFusionMicros;
+} mpu;
+
+// --- BMP280 State ---
+struct BMP280State {
+    // Calibration coefficients (from chip)
+    uint16_t dig_T1;
+    int16_t  dig_T2, dig_T3;
+    uint16_t dig_P1;
+    int16_t  dig_P2, dig_P3, dig_P4, dig_P5;
+    int16_t  dig_P6, dig_P7, dig_P8, dig_P9;
+    int32_t  t_fine;
+
+    // Current readings
+    float pressure_hPa;      // Current pressure in hPa
+    float temperature_C;     // Current temperature in °C
+
+    // Baseline for submersion
+    float baselinePressure_hPa;
+    bool  baselineSet;
+
+    // Derived
+    float gaugePressure_Pa;  // (current - baseline) in Pa
+    float estimatedDepth_cm; // Submersion depth in cm
+
+    // Sensor status
+    bool online;
+} bmp;
+
+// --- DS1307 RTC State ---
+struct DS1307State {
+    uint8_t seconds, minutes, hours;
+    uint8_t dayOfWeek, date, month;
+    uint16_t year;
+
+    uint32_t unixTime;
+    char dateTimeStr[24];  // "YYYY-MM-DD HH:MM:SS"
+
+    bool online;
+    bool valid;  // Oscillator running, time reasonable
+} rtc;
+
+// --- GPS State ---
+struct GPSState {
+    float latitude;
+    float longitude;
+    float altitude;
+    uint8_t satellites;
+    bool fixValid;
+
+    uint8_t utcHour, utcMin, utcSec;
+    uint8_t utcDay, utcMonth;
+    uint16_t utcYear;
+
+    char nmeaBuffer[GPS_BUFFER_SIZE];
+    uint8_t nmeaBufIdx;
+    bool nmeaReady;
+
+    bool online;
+} gps;
+
+// --- Battery State ---
+struct BatteryState {
+    float voltage;
+    float percent;
+} battery;
+
+// --- Flood Detection State ---
+struct FloodState {
+    // Operating mode
+    uint8_t currentMode;         // 0=SLACK, 1=TAUT, 2=FLOOD, 3=SUBMERGED
+    uint8_t pendingMode;         // Mode being evaluated
+    uint8_t persistCount;        // Consecutive readings for pending mode
+
+    // Tether geometry
+    float olpLength_cm;          // Tether length L in cm (configurable)
+
+    // Computed values
+    float waterHeight_cm;        // H = L × cos(θ) in cm
+    float horizontalDist_cm;     // d = L × sin(θ) in cm
+    float floodRatio;            // H / L (0.0 to 1.0+)
+
+    // Session statistics
+    float peakHeight_cm;
+    float minHeight_cm;
+    unsigned long sessionStartMs;
+
+    // Rate of change
+    float rateOfRise_cm_per_15min;
+    float lastHeight_cm;
+    unsigned long lastRateCalcMs;
+
+    // Alert classification
+    uint8_t alertLevel;          // 0=GREEN, 1=YELLOW, 2=RED, 3=BLACK
+    bool sustainedRise;          // Rising continuously
+
+    // Zone classification (for output)
+    uint8_t currentZone;         // 0-3 matching mode
+    uint8_t responseLevel;       // 0-4 response urgency
+} flood;
+
+// --- Sampling & Transmission State ---
+struct SamplingState {
+    uint32_t normalRateSec;      // Normal transmit interval (seconds)
+    uint32_t highRateSec;        // High-rate transmit interval (seconds)
+    uint32_t currentIntervalSec; // Currently active interval
+    uint32_t sampleIntervalSec;  // For CSV output (same as currentIntervalSec)
+
+    unsigned long lastTransmitMs;
+
+    // Feature flags
+    bool obLightEnabled;         // OB light control (field 36)
+    bool algorithmEnabled;       // Algorithm enable flag (field 37)
+} sampling;
+
+// --- Diagnostic State ---
+struct DiagState {
+    unsigned long lastDiagMs;
+    bool diagRequested;          // Manual diag trigger
+
+    // Results
+    bool mpuWhoAmIOk;
+    bool mpuAccelOk;
+    bool mpuGyroOk;
+    bool bmpChipIdOk;
+    bool bmpPressureOk;
+    bool bmpTempOk;
+    bool rtcOscOk;
+    bool rtcTimeOk;
+    bool gpsUartOk;
+    bool batteryOk;
+    bool c3PongReceived;
+    uint8_t totalFaults;
+
+    // C3 ping state
+    bool waitingForPong;
+    unsigned long pingSentMs;
+} diag;
+
+// --- Health Score ---
+uint8_t healthScore;
+
+// --- Threshold Configuration (settable via debugger) ---
+struct ThresholdConfig {
+    float lateralAccelTaut;
+    float lateralAccelSlack;
+    float tiltTautMin;
+    float floodTiltMax;
+    float floodHRatio;
+    float submersionPressurePa;
+} thresholds;
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+// Initialization
+void initI2CBuses();
+bool initMPU6050();
+bool initBMP280();
+bool initDS1307();
+void initGPS();
+void initBatteryADC();
+void initSoftwareUART();
+void initDefaultConfig();
+void initThresholds();
+
+// MPU6050
+bool mpuWriteReg(uint8_t reg, uint8_t val);
+uint8_t mpuReadReg(uint8_t reg);
+void mpuReadSensorData();
+void mpuConvertUnits();
+void calibrateGyroscope();
+void calibrateAccelerometer();
+void recalibrate();
+
+// BMP280
+bool bmpWriteReg(uint8_t reg, uint8_t val);
+uint8_t bmpReadReg(uint8_t reg);
+void bmpReadCalibration();
+void bmpTriggerMeasurement();
+float bmpCompensateTemp(int32_t rawTemp);
+float bmpCompensatePressure(int32_t rawPress);
+void bmpReadData();
+void bmpEstablishBaseline();
+
+// DS1307
+uint8_t bcdToDec(uint8_t bcd);
+uint8_t decToBcd(uint8_t dec);
+void rtcReadTime();
+uint32_t rtcComputeUnixTime();
+void rtcFormatDateTime();
+
+// GPS
+void gpsProcessByte(uint8_t b);
+void gpsParseSentence(const char* sentence);
+void gpsParseGGA(const char* sentence);
+void gpsParseRMC(const char* sentence);
+float gpsConvertCoord(const char* raw, const char* dir);
+int gpsSplitFields(const char* sentence, char fields[][20], int maxFields);
+
+// Battery
+void readBattery();
+
+// Sensor Fusion
+void runComplementaryFilter();
+
+// Flood Detection
+void computeWaterLevel();
+void classifyMode();
+void updateAlertLevel();
+void updateRateOfRise();
+void updateSessionStats();
+
+// Dynamic Sampling
+void computeTransmitInterval();
+bool isTransmitDue();
+
+// Output
+void buildCSVFrame(char* buffer, size_t bufSize);
+void transmitCSVtoC3(const char* csv);
+void transmitCSVtoDebugger(const char* csv);
+void c3UartSendByte(uint8_t byte);
+void c3UartSendString(const char* str);
+
+// Command Processing
+void processC3Commands();
+void processDebugCommands();
+void handleC3Command(const char* cmd);
+void handleDebugCommand(const char* cmd);
+
+// Diagnostics
+void runDiagnostic();
+void buildDiagFrame(char* buffer, size_t bufSize);
+void sendDiagToC3(const char* diagFrame);
+void checkDiagSchedule();
+
+// Health Score
+void computeHealthScore();
+
+// Utilities
+void sendStatusMsg(const char* msg);
+void sendErrorMsg(const char* msg);
+void sendWarningMsg(const char* msg);
+
+// ============================================================================
+// IMPLEMENTATION — INITIALIZATION
+// ============================================================================
+
+void initI2CBuses() {
+    // Bus 0: MPU6050 at 400kHz (fast mode)
+    I2C_Bus0.begin(I2C0_SDA, I2C0_SCL, 400000);
+
+    // Bus 1: BMP280 + DS1307 at 100kHz (standard, DS1307 max is 100kHz)
+    I2C_Bus1.begin(I2C1_SDA, I2C1_SCL, 100000);
+
+    sendStatusMsg("I2C buses initialized — Bus0(GPIO8/9,400kHz) Bus1(GPIO4/5,100kHz)");
+}
+
+bool initMPU6050() {
+    mpu.online = false;
+    mpu.calibrated = false;
+
+    // Check WHO_AM_I
+    uint8_t whoami = mpuReadReg(MPU6050_REG_WHO_AM_I);
+    if (whoami != MPU6050_WHO_AM_I_VALUE) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "MPU6050 WHO_AM_I failed: got 0x%02X, expected 0x%02X", whoami, MPU6050_WHO_AM_I_VALUE);
+        sendErrorMsg(msg);
+        return false;
+    }
+
+    // Wake up (clear SLEEP bit)
+    mpuWriteReg(MPU6050_REG_PWR_MGMT_1, 0x00);
+    delay(100);
+
+    // Set clock source to PLL with X-axis gyro reference
+    mpuWriteReg(MPU6050_REG_PWR_MGMT_1, 0x01);
+    delay(10);
+
+    // Sample rate divider: 200Hz (8kHz / (1 + 39) = 200Hz)
+    mpuWriteReg(MPU6050_REG_SMPLRT_DIV, 39);
+
+    // Digital low-pass filter: ~44Hz bandwidth (good for buoy application)
+    mpuWriteReg(MPU6050_REG_CONFIG, 0x03);
+
+    // Gyro config: ±250°/s (highest sensitivity)
+    mpuWriteReg(MPU6050_REG_GYRO_CONFIG, 0x00);
+
+    // Accel config: ±2g (highest sensitivity)
+    mpuWriteReg(MPU6050_REG_ACCEL_CONFIG, 0x00);
+
+    // Enable all axes
+    mpuWriteReg(MPU6050_REG_PWR_MGMT_2, 0x00);
+
+    mpu.online = true;
+
+    // Initialize filter state
+    mpu.filtTiltX = 0.0f;
+    mpu.filtTiltY = 0.0f;
+    mpu.correctedTiltX = 0.0f;
+    mpu.correctedTiltY = 0.0f;
+    mpu.combinedTheta = 0.0f;
+    mpu.lateralAccel = 0.0f;
+    mpu.lastFusionMicros = micros();
+
+    sendStatusMsg("MPU6050 initialized — ±2g accel, ±250°/s gyro, 200Hz sample, 44Hz DLPF");
+    return true;
+}
+
+bool initBMP280() {
+    bmp.online = false;
+    bmp.baselineSet = false;
+
+    // Check chip ID
+    uint8_t chipId = bmpReadReg(BMP280_REG_CHIP_ID);
+    if (chipId != BMP280_CHIP_ID_VALUE) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "BMP280 chip ID failed: got 0x%02X, expected 0x%02X", chipId, BMP280_CHIP_ID_VALUE);
+        sendErrorMsg(msg);
+        return false;
+    }
+
+    // Soft reset
+    bmpWriteReg(BMP280_REG_RESET, BMP280_RESET_VALUE);
+    delay(100);
+
+    // Wait for NVM copy
+    uint8_t status;
+    int timeout = 100;
+    do {
+        status = bmpReadReg(BMP280_REG_STATUS);
+        delay(10);
+        timeout--;
+    } while ((status & 0x01) && timeout > 0);
+
+    // Read calibration data
+    bmpReadCalibration();
+
+    // Config register: standby 0.5ms, filter coeff 16, SPI disabled
+    // Bits: t_sb[7:5]=000, filter[4:2]=100, spi3w_en[0]=0
+    bmpWriteReg(BMP280_REG_CONFIG_REG, 0x10);
+
+    // Ctrl_meas: temp oversampling x2, press oversampling x16, normal mode
+    // Bits: osrs_t[7:5]=010, osrs_p[4:2]=101, mode[1:0]=11
+    bmpWriteReg(BMP280_REG_CTRL_MEAS, 0x57);
+
+    delay(100);
+
+    bmp.online = true;
+    sendStatusMsg("BMP280 initialized — x2 temp OS, x16 press OS, filter 16, normal mode");
+
+    return true;
+}
+
+bool initDS1307() {
+    rtc.online = false;
+    rtc.valid = false;
+
+    // Try to read seconds register
+    I2C_Bus1.beginTransmission(DS1307_ADDR);
+    I2C_Bus1.write(DS1307_REG_SECONDS);
+    uint8_t err = I2C_Bus1.endTransmission();
+
+    if (err != 0) {
+        sendErrorMsg("DS1307 not responding on I2C Bus 1");
+        return false;
+    }
+
+    I2C_Bus1.requestFrom((uint8_t)DS1307_ADDR, (uint8_t)1);
+    if (I2C_Bus1.available()) {
+        uint8_t secReg = I2C_Bus1.read();
+        // Check CH bit (bit 7 of seconds register) — if set, oscillator stopped
+        if (secReg & 0x80) {
+            sendWarningMsg("DS1307 oscillator stopped (CH=1) — time may be invalid");
+            // Clear CH bit to start oscillator
+            I2C_Bus1.beginTransmission(DS1307_ADDR);
+            I2C_Bus1.write(DS1307_REG_SECONDS);
+            I2C_Bus1.write(secReg & 0x7F);  // Clear bit 7
+            I2C_Bus1.endTransmission();
+        }
+    }
+
+    rtc.online = true;
+
+    // Read current time to validate
+    rtcReadTime();
+
+    // Basic sanity check
+    if (rtc.year >= 2024 && rtc.year <= 2035 && rtc.month >= 1 && rtc.month <= 12) {
+        rtc.valid = true;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "DS1307 initialized — time: %s", rtc.dateTimeStr);
+        sendStatusMsg(msg);
+    } else {
+        rtc.valid = false;
+        sendWarningMsg("DS1307 time appears invalid — year/month out of range");
+    }
+
+    return true;
+}
+
+void initGPS() {
+    gps.online = false;
+    gps.fixValid = false;
+    gps.latitude = 0.0f;
+    gps.longitude = 0.0f;
+    gps.altitude = 0.0f;
+    gps.satellites = 0;
+    gps.nmeaBufIdx = 0;
+    gps.nmeaReady = false;
+
+    // Initialize UART1 for GPS
+    Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+    sendStatusMsg("GPS UART1 initialized — 9600 baud on GPIO 6(RX)/7(TX)");
+
+    // Give GPS a moment to start transmitting
+    delay(500);
+
+    // Check if any data arrives
+    unsigned long startCheck = millis();
+    bool dataReceived = false;
+    while (millis() - startCheck < 2000) {
+        if (Serial1.available()) {
+            dataReceived = true;
+            break;
+        }
+        delay(10);
+    }
+
+    if (dataReceived) {
+        gps.online = true;
+        sendStatusMsg("GPS module responding — NMEA data detected");
+    } else {
+        sendWarningMsg("GPS module not responding — no NMEA data within 2 seconds");
+    }
+}
+
+void initBatteryADC() {
+    analogSetAttenuation(ADC_11db);  // Full range ~0-3.3V
+    analogReadResolution(12);        // 12-bit ADC
+    pinMode(BATTERY_ADC_PIN, INPUT);
+
+    sendStatusMsg("Battery ADC initialized — GPIO 2, 12-bit, 11dB attenuation");
+}
+
+void initSoftwareUART() {
+    pinMode(C3_DATA_TX_PIN, OUTPUT);
+    digitalWrite(C3_DATA_TX_PIN, HIGH);  // Idle state is HIGH for UART
+
+    sendStatusMsg("Software UART TX initialized — GPIO 14, 9600 baud");
+}
+
+void initDefaultConfig() {
+    // Sampling rates
+    sampling.normalRateSec = DEFAULT_NORMAL_RATE_SEC;
+    sampling.highRateSec = DEFAULT_HIGH_RATE_SEC;
+    sampling.currentIntervalSec = sampling.normalRateSec;
+    sampling.sampleIntervalSec = sampling.normalRateSec;
+    sampling.lastTransmitMs = 0;
+    sampling.obLightEnabled = true;
+    sampling.algorithmEnabled = false;
+
+    // Flood detection
+    flood.currentMode = 0;
+    flood.pendingMode = 0;
+    flood.persistCount = 0;
+    flood.olpLength_cm = 200.0f;  // Default 2 meters, set via config
+    flood.waterHeight_cm = 0.0f;
+    flood.horizontalDist_cm = 0.0f;
+    flood.floodRatio = 0.0f;
+    flood.peakHeight_cm = 0.0f;
+    flood.minHeight_cm = 999.0f;
+    flood.sessionStartMs = millis();
+    flood.rateOfRise_cm_per_15min = 0.0f;
+    flood.lastHeight_cm = 0.0f;
+    flood.lastRateCalcMs = millis();
+    flood.alertLevel = 0;
+    flood.sustainedRise = false;
+    flood.currentZone = 0;
+    flood.responseLevel = 0;
+
+    // Diagnostics
+    diag.lastDiagMs = millis();
+    diag.diagRequested = false;
+    diag.waitingForPong = false;
+
+    sendStatusMsg("Default configuration loaded — L=200cm, normal=900s, high=60s");
+}
+
+void initThresholds() {
+    thresholds.lateralAccelTaut = LATERAL_ACCEL_TAUT_THRESH;
+    thresholds.lateralAccelSlack = LATERAL_ACCEL_SLACK_THRESH;
+    thresholds.tiltTautMin = TILT_TAUT_MIN_DEG;
+    thresholds.floodTiltMax = FLOOD_TILT_MAX_DEG;
+    thresholds.floodHRatio = FLOOD_H_RATIO_THRESH;
+    thresholds.submersionPressurePa = SUBMERSION_PRESSURE_PA;
+
+    sendStatusMsg("Thresholds initialized to defaults");
+}
+
+// ============================================================================
+// IMPLEMENTATION — MPU6050 LOW-LEVEL
+// ============================================================================
+
+bool mpuWriteReg(uint8_t reg, uint8_t val) {
+    I2C_Bus0.beginTransmission(MPU6050_ADDR);
+    I2C_Bus0.write(reg);
+    I2C_Bus0.write(val);
+    return (I2C_Bus0.endTransmission() == 0);
+}
+
+uint8_t mpuReadReg(uint8_t reg) {
+    I2C_Bus0.beginTransmission(MPU6050_ADDR);
+    I2C_Bus0.write(reg);
+    I2C_Bus0.endTransmission(false);
+    I2C_Bus0.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1);
+    if (I2C_Bus0.available()) {
+        return I2C_Bus0.read();
+    }
+    return 0xFF;
+}
+
+void mpuReadSensorData() {
+    if (!mpu.online) return;
+
+    // Read 14 bytes starting from ACCEL_XOUT_H (accel[6] + temp[2] + gyro[6])
+    I2C_Bus0.beginTransmission(MPU6050_ADDR);
+    I2C_Bus0.write(MPU6050_REG_ACCEL_XOUT_H);
+    if (I2C_Bus0.endTransmission(false) != 0) {
+        mpu.online = false;
+        sendErrorMsg("MPU6050 read failed — marking offline");
+        return;
+    }
+
+    uint8_t bytesReceived = I2C_Bus0.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14);
+    if (bytesReceived != 14) {
+        sendWarningMsg("MPU6050 incomplete read");
+        return;
+    }
+
+    // Parse raw values (big-endian)
+    mpu.rawAccX  = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawAccY  = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawAccZ  = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawTemp  = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawGyroX = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawGyroY = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+    mpu.rawGyroZ = (I2C_Bus0.read() << 8) | I2C_Bus0.read();
+}
+
+void mpuConvertUnits() {
+    // Accelerometer: raw to g
+    mpu.accX_g = (float)mpu.rawAccX / ACCEL_SCALE_2G;
+    mpu.accY_g = (float)mpu.rawAccY / ACCEL_SCALE_2G;
+    mpu.accZ_g = (float)mpu.rawAccZ / ACCEL_SCALE_2G;
+
+    // Accelerometer: g to m/s²
+    mpu.accX_mps2 = mpu.accX_g * GRAVITY_MPS2;
+    mpu.accY_mps2 = mpu.accY_g * GRAVITY_MPS2;
+    mpu.accZ_mps2 = mpu.accZ_g * GRAVITY_MPS2;
+
+    // Gyroscope: raw to °/s (with offset correction)
+    mpu.gyroX_dps = ((float)mpu.rawGyroX / GYRO_SCALE_250DPS) - mpu.gyroOffsetX;
+    mpu.gyroY_dps = ((float)mpu.rawGyroY / GYRO_SCALE_250DPS) - mpu.gyroOffsetY;
+    mpu.gyroZ_dps = ((float)mpu.rawGyroZ / GYRO_SCALE_250DPS) - mpu.gyroOffsetZ;
+
+    // Lateral acceleration magnitude (for tether detection)
+    mpu.lateralAccel = sqrtf(mpu.accX_mps2 * mpu.accX_mps2 +
+                             mpu.accY_mps2 * mpu.accY_mps2);
+}
+
+// ============================================================================
+// IMPLEMENTATION — MPU6050 CALIBRATION
+// ============================================================================
+
+void calibrateGyroscope() {
+    sendStatusMsg("Calibrating gyroscope — keep buoy stationary...");
+
+    float sumX = 0, sumY = 0, sumZ = 0;
+    int validSamples = 0;
+
+    for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+        mpuReadSensorData();
+
+        float gx = (float)mpu.rawGyroX / GYRO_SCALE_250DPS;
+        float gy = (float)mpu.rawGyroY / GYRO_SCALE_250DPS;
+        float gz = (float)mpu.rawGyroZ / GYRO_SCALE_250DPS;
+
+        sumX += gx;
+        sumY += gy;
+        sumZ += gz;
+        validSamples++;
+
+        delayMicroseconds(1000);  // 1ms between samples
+    }
+
+    if (validSamples > 0) {
+        mpu.gyroOffsetX = sumX / validSamples;
+        mpu.gyroOffsetY = sumY / validSamples;
+        mpu.gyroOffsetZ = sumZ / validSamples;
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg), "Gyro calibration complete — offsets: X=%.3f Y=%.3f Z=%.3f °/s (%d samples)",
+             mpu.gyroOffsetX, mpu.gyroOffsetY, mpu.gyroOffsetZ, validSamples);
+    sendStatusMsg(msg);
+}
+
+void calibrateAccelerometer() {
+    sendStatusMsg("Calibrating accelerometer — recording gravity reference...");
+
+    float sumX = 0, sumY = 0, sumZ = 0;
+    int validSamples = 0;
+
+    for (int i = 0; i < ACCEL_CAL_SAMPLES; i++) {
+        mpuReadSensorData();
+
+        float ax = (float)mpu.rawAccX / ACCEL_SCALE_2G;
+        float ay = (float)mpu.rawAccY / ACCEL_SCALE_2G;
+        float az = (float)mpu.rawAccZ / ACCEL_SCALE_2G;
+
+        // Validate: magnitude should be ~1g
+        float mag = sqrtf(ax * ax + ay * ay + az * az);
+        if (mag >= ACCEL_G_MIN && mag <= ACCEL_G_MAX) {
+            sumX += ax;
+            sumY += ay;
+            sumZ += az;
+            validSamples++;
+        }
+
+        delayMicroseconds(2000);  // 2ms between samples
+    }
+
+    if (validSamples > 100) {  // Need at least 100 valid samples
+        mpu.refAccX = sumX / validSamples;
+        mpu.refAccY = sumY / validSamples;
+        mpu.refAccZ = sumZ / validSamples;
+
+        // Compute reference tilt angles
+        mpu.refTiltX = atan2f(mpu.refAccY,
+                              sqrtf(mpu.refAccX * mpu.refAccX + mpu.refAccZ * mpu.refAccZ))
+                       * 180.0f / M_PI;
+
+        mpu.refTiltY = atan2f(-mpu.refAccX,
+                              sqrtf(mpu.refAccY * mpu.refAccY + mpu.refAccZ * mpu.refAccZ))
+                       * 180.0f / M_PI;
+
+        mpu.calibrated = true;
+
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "Accel calibration complete — ref: X=%.4f Y=%.4f Z=%.4f g, refTilt: X=%.2f Y=%.2f° (%d samples)",
+                 mpu.refAccX, mpu.refAccY, mpu.refAccZ,
+                 mpu.refTiltX, mpu.refTiltY, validSamples);
+        sendStatusMsg(msg);
+    } else {
+        sendErrorMsg("Accelerometer calibration failed — too few valid samples (excessive vibration?)");
+        mpu.calibrated = false;
+    }
+}
+
+void recalibrate() {
+    sendStatusMsg("Full recalibration starting...");
+    calibrateGyroscope();
+    calibrateAccelerometer();
+
+    // Reset filter state
+    mpu.filtTiltX = 0.0f;
+    mpu.filtTiltY = 0.0f;
+    mpu.lastFusionMicros = micros();
+
+    sendStatusMsg("Recalibration complete — filter state reset");
+}
+
+// ============================================================================
+// IMPLEMENTATION — BMP280 LOW-LEVEL
+// ============================================================================
+
+bool bmpWriteReg(uint8_t reg, uint8_t val) {
+    I2C_Bus1.beginTransmission(BMP280_ADDR);
+    I2C_Bus1.write(reg);
+    I2C_Bus1.write(val);
+    return (I2C_Bus1.endTransmission() == 0);
+}
+
+uint8_t bmpReadReg(uint8_t reg) {
+    I2C_Bus1.beginTransmission(BMP280_ADDR);
+    I2C_Bus1.write(reg);
+    I2C_Bus1.endTransmission(false);
+    I2C_Bus1.requestFrom((uint8_t)BMP280_ADDR, (uint8_t)1);
+    if (I2C_Bus1.available()) {
+        return I2C_Bus1.read();
+    }
+    return 0xFF;
+}
+
+void bmpReadCalibration() {
+    // Read 26 bytes of calibration data starting at 0x88
+    uint8_t calData[26];
+
+    I2C_Bus1.beginTransmission(BMP280_ADDR);
+    I2C_Bus1.write(BMP280_REG_CALIB_START);
+    I2C_Bus1.endTransmission(false);
+    I2C_Bus1.requestFrom((uint8_t)BMP280_ADDR, (uint8_t)26);
+
+    for (int i = 0; i < 26; i++) {
+        calData[i] = I2C_Bus1.available() ? I2C_Bus1.read() : 0;
+    }
+
+    // Parse calibration values (little-endian)
+    bmp.dig_T1 = (uint16_t)(calData[1] << 8 | calData[0]);
+    bmp.dig_T2 = (int16_t)(calData[3] << 8 | calData[2]);
+    bmp.dig_T3 = (int16_t)(calData[5] << 8 | calData[4]);
+    bmp.dig_P1 = (uint16_t)(calData[7] << 8 | calData[6]);
+    bmp.dig_P2 = (int16_t)(calData[9] << 8 | calData[8]);
+    bmp.dig_P3 = (int16_t)(calData[11] << 8 | calData[10]);
+    bmp.dig_P4 = (int16_t)(calData[13] << 8 | calData[12]);
+    bmp.dig_P5 = (int16_t)(calData[15] << 8 | calData[14]);
+    bmp.dig_P6 = (int16_t)(calData[17] << 8 | calData[16]);
+    bmp.dig_P7 = (int16_t)(calData[19] << 8 | calData[18]);
+    bmp.dig_P8 = (int16_t)(calData[21] << 8 | calData[20]);
+    bmp.dig_P9 = (int16_t)(calData[23] << 8 | calData[22]);
+
+    sendStatusMsg("BMP280 calibration coefficients loaded");
+}
+
+float bmpCompensateTemp(int32_t adc_T) {
+    // BMP280 compensation formula from datasheet
+    int32_t var1, var2;
+
+    var1 = ((((adc_T >> 3) - ((int32_t)bmp.dig_T1 << 1))) * ((int32_t)bmp.dig_T2)) >> 11;
+    var2 = (((((adc_T >> 4) - ((int32_t)bmp.dig_T1)) *
+              ((adc_T >> 4) - ((int32_t)bmp.dig_T1))) >> 12) *
+            ((int32_t)bmp.dig_T3)) >> 14;
+
+    bmp.t_fine = var1 + var2;
+    float T = (bmp.t_fine * 5 + 128) >> 8;
+    return T / 100.0f;
+}
+
+float bmpCompensatePressure(int32_t adc_P) {
+    // BMP280 compensation formula from datasheet
+    int64_t var1, var2, p;
+
+    var1 = ((int64_t)bmp.t_fine) - 128000;
+    var2 = var1 * var1 * (int64_t)bmp.dig_P6;
+    var2 = var2 + ((var1 * (int64_t)bmp.dig_P5) << 17);
+    var2 = var2 + (((int64_t)bmp.dig_P4) << 35);
+    var1 = ((var1 * var1 * (int64_t)bmp.dig_P3) >> 8) +
+           ((var1 * (int64_t)bmp.dig_P2) << 12);
+    var1 = (((((int64_t)1) << 47) + var1)) * ((int64_t)bmp.dig_P1) >> 33;
+
+    if (var1 == 0) return 0.0f;  // Avoid division by zero
+
+    p = 1048576 - adc_P;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = (((int64_t)bmp.dig_P9) * (p >> 13) * (p >> 13)) >> 25;
+    var2 = (((int64_t)bmp.dig_P8) * p) >> 19;
+
+    p = ((p + var1 + var2) >> 8) + (((int64_t)bmp.dig_P7) << 4);
+    return (float)p / 25600.0f;  // Result in hPa
+}
+
+void bmpReadData() {
+    if (!bmp.online) return;
+
+    // Read 6 bytes: pressure (3) + temperature (3) starting at 0xF7
+    I2C_Bus1.beginTransmission(BMP280_ADDR);
+    I2C_Bus1.write(BMP280_REG_PRESS_MSB);
+    if (I2C_Bus1.endTransmission(false) != 0) {
+        bmp.online = false;
+        sendErrorMsg("BMP280 read failed — marking offline");
+        return;
+    }
+
+    uint8_t data[6];
+    I2C_Bus1.requestFrom((uint8_t)BMP280_ADDR, (uint8_t)6);
+    for (int i = 0; i < 6; i++) {
+        data[i] = I2C_Bus1.available() ? I2C_Bus1.read() : 0;
+    }
+
+    // Parse 20-bit raw values
+    int32_t rawPress = ((int32_t)data[0] << 12) | ((int32_t)data[1] << 4) | (data[2] >> 4);
+    int32_t rawTemp  = ((int32_t)data[3] << 12) | ((int32_t)data[4] << 4) | (data[5] >> 4);
+
+    // Compensate (temperature must be computed first — sets t_fine)
+    bmp.temperature_C = bmpCompensateTemp(rawTemp);
+    bmp.pressure_hPa = bmpCompensatePressure(rawPress);
+
+    // Compute gauge pressure and depth
+    if (bmp.baselineSet) {
+        bmp.gaugePressure_Pa = (bmp.pressure_hPa - bmp.baselinePressure_hPa) * 100.0f;  // hPa to Pa
+        if (bmp.gaugePressure_Pa > 0.0f) {
+            bmp.estimatedDepth_cm = (bmp.gaugePressure_Pa * SUBMERSION_DEPTH_FACTOR) * 100.0f;  // m to cm
+        } else {
+            bmp.estimatedDepth_cm = 0.0f;
+        }
+    }
+}
+
+void bmpEstablishBaseline() {
+    if (!bmp.online) {
+        sendWarningMsg("Cannot establish pressure baseline — BMP280 offline");
+        return;
+    }
+
+    sendStatusMsg("Establishing atmospheric pressure baseline (50 samples)...");
+
+    float sum = 0.0f;
+    int validCount = 0;
+
+    for (int i = 0; i < BASELINE_PRESSURE_SAMPLES; i++) {
+        bmpReadData();
+
+        // Sanity check: sea level pressure range 870-1084 hPa
+        if (bmp.pressure_hPa > 870.0f && bmp.pressure_hPa < 1084.0f) {
+            sum += bmp.pressure_hPa;
+            validCount++;
+        }
+
+        delay(100);
+    }
+
+    if (validCount >= 30) {
+        bmp.baselinePressure_hPa = sum / validCount;
+        bmp.baselineSet = true;
+
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Baseline pressure set: %.2f hPa (%d valid samples)",
+                 bmp.baselinePressure_hPa, validCount);
+        sendStatusMsg(msg);
+    } else {
+        sendErrorMsg("Pressure baseline failed — insufficient valid samples");
+    }
+}
+
+// ============================================================================
+// IMPLEMENTATION — DS1307 RTC
+// ============================================================================
+
+uint8_t bcdToDec(uint8_t bcd) {
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+uint8_t decToBcd(uint8_t dec) {
+    return ((dec / 10) << 4) | (dec % 10);
+}
+
+void rtcReadTime() {
+    if (!rtc.online) return;
+
+    I2C_Bus1.beginTransmission(DS1307_ADDR);
+    I2C_Bus1.write(DS1307_REG_SECONDS);
+    if (I2C_Bus1.endTransmission() != 0) {
+        rtc.online = false;
+        sendErrorMsg("DS1307 read failed — marking offline");
+        return;
+    }
+
+    I2C_Bus1.requestFrom((uint8_t)DS1307_ADDR, (uint8_t)7);
+    if (I2C_Bus1.available() < 7) {
+        sendWarningMsg("DS1307 incomplete read");
+        return;
+    }
+
+    uint8_t secReg = I2C_Bus1.read();
+    rtc.seconds   = bcdToDec(secReg & 0x7F);  // Mask CH bit
+    rtc.minutes   = bcdToDec(I2C_Bus1.read());
+    uint8_t hourReg = I2C_Bus1.read();
+    // Handle 12/24 hour mode
+    if (hourReg & 0x40) {
+        // 12-hour mode
+        rtc.hours = bcdToDec(hourReg & 0x1F);
+        if (hourReg & 0x20) rtc.hours += 12;  // PM
+    } else {
+        rtc.hours = bcdToDec(hourReg & 0x3F);
+    }
+    rtc.dayOfWeek = bcdToDec(I2C_Bus1.read());
+    rtc.date      = bcdToDec(I2C_Bus1.read());
+    rtc.month     = bcdToDec(I2C_Bus1.read());
+    rtc.year      = 2000 + bcdToDec(I2C_Bus1.read());
+
+    // Validate
+    if (rtc.year >= 2024 && rtc.year <= 2035 &&
+        rtc.month >= 1 && rtc.month <= 12 &&
+        rtc.date >= 1 && rtc.date <= 31 &&
+        rtc.hours <= 23 && rtc.minutes <= 59 && rtc.seconds <= 59) {
+        rtc.valid = true;
+    } else {
+        rtc.valid = false;
+    }
+
+    rtcComputeUnixTime();
+    rtcFormatDateTime();
+}
+
+uint32_t rtcComputeUnixTime() {
+    // Simplified Unix time calculation
+    // Days from 1970-01-01 to current date
+    uint16_t y = rtc.year;
+    uint8_t m = rtc.month;
+    uint8_t d = rtc.date;
+
+    // Days in each month (non-leap)
+    static const uint16_t monthDays[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+
+    uint32_t days = 0;
+
+    // Years since 1970
+    for (uint16_t yr = 1970; yr < y; yr++) {
+        days += 365;
+        if ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0)) {
+            days++;
+        }
+    }
+
+    // Months in current year
+    if (m > 0 && m <= 12) {
+        days += monthDays[m - 1];
+    }
+
+    // Leap year adjustment for current year
+    if (m > 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))) {
+        days++;
+    }
+
+    days += (d - 1);
+
+    rtc.unixTime = days * 86400UL + (uint32_t)rtc.hours * 3600UL +
+                   (uint32_t)rtc.minutes * 60UL + (uint32_t)rtc.seconds;
+
+    return rtc.unixTime;
+}
+
+void rtcFormatDateTime() {
+    snprintf(rtc.dateTimeStr, sizeof(rtc.dateTimeStr),
+             "%04u-%02u-%02u %02u:%02u:%02u",
+             rtc.year, rtc.month, rtc.date,
+             rtc.hours, rtc.minutes, rtc.seconds);
+}
+
+// ============================================================================
+// IMPLEMENTATION — GPS
+// ============================================================================
+
+void gpsProcessByte(uint8_t b) {
+    if (b == '$') {
+        gps.nmeaBufIdx = 0;
+        gps.nmeaBuffer[gps.nmeaBufIdx++] = b;
+    } else if (b == '\n' || b == '\r') {
+        if (gps.nmeaBufIdx > 5) {
+            gps.nmeaBuffer[gps.nmeaBufIdx] = '\0';
+            gpsParseSentence(gps.nmeaBuffer);
+        }
+        gps.nmeaBufIdx = 0;
+    } else if (gps.nmeaBufIdx < GPS_BUFFER_SIZE - 1) {
+        gps.nmeaBuffer[gps.nmeaBufIdx++] = b;
+    }
+}
+
+int gpsSplitFields(const char* sentence, char fields[][20], int maxFields) {
+    int fieldIdx = 0;
+    int charIdx = 0;
+
+    for (int i = 0; sentence[i] != '\0' && fieldIdx < maxFields; i++) {
+        if (sentence[i] == ',' || sentence[i] == '*') {
+            fields[fieldIdx][charIdx] = '\0';
+            fieldIdx++;
+            charIdx = 0;
+        } else if (charIdx < 19) {
+            fields[fieldIdx][charIdx++] = sentence[i];
+        }
+    }
+    // Terminate last field
+    if (fieldIdx < maxFields) {
+        fields[fieldIdx][charIdx] = '\0';
+        fieldIdx++;
+    }
+
+    return fieldIdx;
+}
+
+float gpsConvertCoord(const char* raw, const char* dir) {
+    if (raw[0] == '\0') return 0.0f;
+
+    double val = atof(raw);
+    int degrees = (int)(val / 100);
+    double minutes = val - (degrees * 100.0);
+    double decimal = degrees + (minutes / 60.0);
+
+    if (dir[0] == 'S' || dir[0] == 'W') {
+        decimal = -decimal;
+    }
+
+    return (float)decimal;
+}
+
+void gpsParseSentence(const char* sentence) {
+    char fields[NMEA_MAX_FIELDS][20];
+    memset(fields, 0, sizeof(fields));
+
+    int numFields = gpsSplitFields(sentence, fields, NMEA_MAX_FIELDS);
+
+    // Determine sentence type
+    if (strstr(fields[0], "GGA") != NULL) {
+        gpsParseGGA(sentence);
+    } else if (strstr(fields[0], "RMC") != NULL) {
+        gpsParseRMC(sentence);
+    }
+}
+
+void gpsParseGGA(const char* sentence) {
+    char fields[NMEA_MAX_FIELDS][20];
+    memset(fields, 0, sizeof(fields));
+    int n = gpsSplitFields(sentence, fields, NMEA_MAX_FIELDS);
+
+    if (n < 15) return;
+
+    // Field 1: Time (hhmmss.sss)
+    if (strlen(fields[1]) >= 6) {
+        gps.utcHour = (fields[1][0] - '0') * 10 + (fields[1][1] - '0');
+        gps.utcMin  = (fields[1][2] - '0') * 10 + (fields[1][3] - '0');
+        gps.utcSec  = (fields[1][4] - '0') * 10 + (fields[1][5] - '0');
+    }
+
+    // Field 2,3: Latitude, N/S
+    gps.latitude = gpsConvertCoord(fields[2], fields[3]);
+
+    // Field 4,5: Longitude, E/W
+    gps.longitude = gpsConvertCoord(fields[4], fields[5]);
+
+    // Field 6: Fix quality (0=invalid, 1=GPS, 2=DGPS)
+    int fixQuality = atoi(fields[6]);
+    gps.fixValid = (fixQuality >= 1);
+
+    // Field 7: Number of satellites
+    gps.satellites = (uint8_t)atoi(fields[7]);
+
+    // Field 9: Altitude
+    gps.altitude = atof(fields[9]);
+
+    if (gps.fixValid) {
+        gps.online = true;
+    }
+}
+
+void gpsParseRMC(const char* sentence) {
+    char fields[NMEA_MAX_FIELDS][20];
+    memset(fields, 0, sizeof(fields));
+    int n = gpsSplitFields(sentence, fields, NMEA_MAX_FIELDS);
+
+    if (n < 12) return;
+
+    // Field 1: Time
+    if (strlen(fields[1]) >= 6) {
+        gps.utcHour = (fields[1][0] - '0') * 10 + (fields[1][1] - '0');
+        gps.utcMin  = (fields[1][2] - '0') * 10 + (fields[1][3] - '0');
+        gps.utcSec  = (fields[1][4] - '0') * 10 + (fields[1][5] - '0');
+    }
+
+    // Field 2: Status A=valid, V=void
+    gps.fixValid = (fields[2][0] == 'A');
+
+    // Field 3,4: Latitude
+    gps.latitude = gpsConvertCoord(fields[3], fields[4]);
+
+    // Field 5,6: Longitude
+    gps.longitude = gpsConvertCoord(fields[5], fields[6]);
+
+    // Field 9: Date (ddmmyy)
+    if (strlen(fields[9]) >= 6) {
+        gps.utcDay   = (fields[9][0] - '0') * 10 + (fields[9][1] - '0');
+        gps.utcMonth = (fields[9][2] - '0') * 10 + (fields[9][3] - '0');
+        gps.utcYear  = 2000 + (fields[9][4] - '0') * 10 + (fields[9][5] - '0');
+    }
+
+    if (gps.fixValid) {
+        gps.online = true;
+    }
+}
+
+// ============================================================================
+// IMPLEMENTATION — BATTERY
+// ============================================================================
+
+void readBattery() {
+    uint32_t sum = 0;
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        sum += analogRead(BATTERY_ADC_PIN);
+        delayMicroseconds(100);
+    }
+    uint32_t avgRaw = sum / ADC_SAMPLES;
+
+    // Voltage divider: assuming 2:1 divider (100k/100k)
+    // ADC reads 0-4095 for 0-3.3V
+    // Actual voltage = ADC voltage × 2
+    float adcVoltage = (avgRaw / 4095.0f) * 3.3f;
+    battery.voltage = adcVoltage * 2.0f;  // Through voltage divider
+
+    // LiPo percentage estimation (3.0V = 0%, 4.2V = 100%)
+    float pct = (battery.voltage - 3.0f) / (4.2f - 3.0f) * 100.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    battery.percent = pct;
+}
+
+// ============================================================================
+// IMPLEMENTATION — COMPLEMENTARY FILTER (Sensor Fusion)
+// ============================================================================
+
+void runComplementaryFilter() {
+    if (!mpu.online || !mpu.calibrated) return;
+
+    unsigned long nowMicros = micros();
+    float dt = (nowMicros - mpu.lastFusionMicros) / 1000000.0f;
+    mpu.lastFusionMicros = nowMicros;
+
+    // Guard against unreasonable dt
+    if (dt <= 0.0f || dt > 0.5f) {
+        dt = 0.01f;  // Default to 10ms
+    }
+
+    // ---- Accelerometer-derived angle ----
+    // Tilt X: rotation around X-axis (pitch) — measures Y component against vertical
+    float accelTiltX = atan2f(mpu.accY_g,
+                              sqrtf(mpu.accX_g * mpu.accX_g + mpu.accZ_g * mpu.accZ_g))
+                       * 180.0f / M_PI;
+
+    // Tilt Y: rotation around Y-axis (roll) — measures X component against vertical
+    float accelTiltY = atan2f(-mpu.accX_g,
+                              sqrtf(mpu.accY_g * mpu.accY_g + mpu.accZ_g * mpu.accZ_g))
+                       * 180.0f / M_PI;
+
+    // ---- Complementary filter ----
+    // Gyro integration + accel correction
+    mpu.filtTiltX = ALPHA * (mpu.filtTiltX + mpu.gyroX_dps * dt)
+                  + (1.0f - ALPHA) * accelTiltX;
+
+    mpu.filtTiltY = ALPHA * (mpu.filtTiltY + mpu.gyroY_dps * dt)
+                  + (1.0f - ALPHA) * accelTiltY;
+
+    // ---- Apply reference correction ----
+    mpu.correctedTiltX = mpu.filtTiltX - mpu.refTiltX;
+    mpu.correctedTiltY = mpu.filtTiltY - mpu.refTiltY;
+
+    // ---- Combined angle from vertical ----
+    mpu.combinedTheta = sqrtf(mpu.correctedTiltX * mpu.correctedTiltX +
+                              mpu.correctedTiltY * mpu.correctedTiltY);
+}
+
+// ============================================================================
+// IMPLEMENTATION — FLOOD DETECTION
+// ============================================================================
+
+void computeWaterLevel() {
+    float theta_rad = mpu.combinedTheta * M_PI / 180.0f;
+    float L = flood.olpLength_cm;
+
+    // H = L × cos(θ)
+    flood.waterHeight_cm = L * cosf(theta_rad);
+
+    // Horizontal distance: d = L × sin(θ)
+    flood.horizontalDist_cm = L * sinf(theta_rad);
+
+    // Flood ratio
+    flood.floodRatio = flood.waterHeight_cm / L;
+
+    // Clamp flood ratio
+    if (flood.floodRatio > 1.0f) flood.floodRatio = 1.0f;
+    if (flood.floodRatio < 0.0f) flood.floodRatio = 0.0f;
+
+    // If submerged, add pressure-derived depth
+    if (bmp.online && bmp.baselineSet && bmp.gaugePressure_Pa > thresholds.submersionPressurePa) {
+        float totalHeight = L + bmp.estimatedDepth_cm;
+        flood.waterHeight_cm = totalHeight;
+        flood.floodRatio = totalHeight / L;
+    }
+}
+
+void classifyMode() {
+    uint8_t detectedMode;
+
+    // Priority 1: Submersion (highest priority)
+    if (bmp.online && bmp.baselineSet &&
+        bmp.gaugePressure_Pa > thresholds.submersionPressurePa) {
+        detectedMode = 3;  // SUBMERGED
+    }
+    // Priority 2: Check if tether is taut
+    else if (mpu.lateralAccel > thresholds.lateralAccelTaut &&
+             mpu.combinedTheta > thresholds.tiltTautMin) {
+        // Tether is taut — check if flood or approaching
+        if (mpu.combinedTheta < thresholds.floodTiltMax &&
+            flood.floodRatio > thresholds.floodHRatio) {
+            detectedMode = 2;  // FLOOD
+        } else {
+            detectedMode = 1;  // TAUT
+        }
+    }
+    // Priority 3: Check slack with hysteresis
+    else if (mpu.lateralAccel < thresholds.lateralAccelSlack ||
+             mpu.combinedTheta < thresholds.tiltTautMin) {
+        detectedMode = 0;  // SLACK
+    }
+    // Default: maintain current mode
+    else {
+        detectedMode = flood.currentMode;
+    }
+
+    // --- Persistence filter (debounce) ---
+    if (detectedMode == flood.pendingMode) {
+        flood.persistCount++;
+    } else {
+        flood.pendingMode = detectedMode;
+        flood.persistCount = 1;
+    }
+
+    // Determine required persistence count
+    int requiredPersist = MODE_PERSIST_NORMAL;
+    if (detectedMode == 3) {
+        requiredPersist = MODE_PERSIST_SUBMERGE;  // Faster for submersion
+    }
+
+    // Commit mode transition
+    if (flood.persistCount >= requiredPersist && flood.currentMode != detectedMode) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Mode transition: %d → %d (after %d readings)",
+                 flood.currentMode, detectedMode, flood.persistCount);
+        sendStatusMsg(msg);
+
+        flood.currentMode = detectedMode;
+    }
+}
+
+void updateAlertLevel() {
+    switch (flood.currentMode) {
+        case 0:  // SLACK
+            flood.alertLevel = 0;   // GREEN
+            flood.currentZone = 0;
+            flood.responseLevel = 0;
+            break;
+
+        case 1:  // TAUT
+            if (flood.floodRatio > 0.80f) {
+                flood.alertLevel = 1;   // YELLOW (elevated)
+                flood.responseLevel = 2;
+            } else if (flood.floodRatio > 0.50f) {
+                flood.alertLevel = 1;   // YELLOW
+                flood.responseLevel = 1;
+            } else {
+                flood.alertLevel = 0;   // GREEN (taut but low)
+                flood.responseLevel = 1;
+            }
+            flood.currentZone = 1;
+            break;
+
+        case 2:  // FLOOD
+            flood.alertLevel = 2;   // RED
+            flood.currentZone = 2;
+            flood.responseLevel = 3;
+            break;
+
+        case 3:  // SUBMERGED
+            flood.alertLevel = 3;   // BLACK (critical)
+            flood.currentZone = 3;
+            flood.responseLevel = 4;
+            break;
+    }
+
+    // Sustained rise detection
+    if (flood.rateOfRise_cm_per_15min > 1.0f && flood.floodRatio > 0.5f) {
+        flood.sustainedRise = true;
+    } else {
+        flood.sustainedRise = false;
+    }
+}
+
+void updateRateOfRise() {
+    unsigned long now = millis();
+    unsigned long elapsed = now - flood.lastRateCalcMs;
+
+    // Calculate rate every 60 seconds minimum
+    if (elapsed >= 60000) {
+        float deltaH = flood.waterHeight_cm - flood.lastHeight_cm;
+        float elapsedMin = elapsed / 60000.0f;
+
+        // Normalize to cm per 15 minutes
+        float ratePerMin = deltaH / elapsedMin;
+        flood.rateOfRise_cm_per_15min = ratePerMin * 15.0f;
+
+        flood.lastHeight_cm = flood.waterHeight_cm;
+        flood.lastRateCalcMs = now;
+    }
+}
+
+void updateSessionStats() {
+    if (flood.currentMode >= 1) {
+        // Only track when tether is taut (meaningful measurement)
+        if (flood.waterHeight_cm > flood.peakHeight_cm) {
+            flood.peakHeight_cm = flood.waterHeight_cm;
+        }
+        if (flood.waterHeight_cm < flood.minHeight_cm) {
+            flood.minHeight_cm = flood.waterHeight_cm;
+        }
+    }
+}
+
+// ============================================================================
+// IMPLEMENTATION — DYNAMIC SAMPLING
+// ============================================================================
+
+void computeTransmitInterval() {
+    float ratio = flood.floodRatio;
+
+    if (ratio >= RATE_TRANSITION_HIGH) {
+        // Above 80%: use high rate
+        sampling.currentIntervalSec = sampling.highRateSec;
+    } else if (ratio <= RATE_TRANSITION_LOW) {
+        // Below 50%: use normal rate
+        sampling.currentIntervalSec = sampling.normalRateSec;
+    } else {
+        // 50-80%: linear interpolation
+        float t = (ratio - RATE_TRANSITION_LOW) / (RATE_TRANSITION_HIGH - RATE_TRANSITION_LOW);
+        sampling.currentIntervalSec = (uint32_t)(
+            sampling.normalRateSec - t * (sampling.normalRateSec - sampling.highRateSec)
+        );
+    }
+
+    sampling.sampleIntervalSec = sampling.currentIntervalSec;
+}
+
+bool isTransmitDue() {
+    unsigned long now = millis();
+    unsigned long intervalMs = (unsigned long)sampling.currentIntervalSec * 1000UL;
+
+    if (now - sampling.lastTransmitMs >= intervalMs) {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// IMPLEMENTATION — SOFTWARE UART (GPIO 14 → C3)
+// ============================================================================
+
+void c3UartSendByte(uint8_t byte) {
+    // Disable interrupts for precise timing
+    noInterrupts();
+
+    // Start bit (LOW)
+    digitalWrite(C3_DATA_TX_PIN, LOW);
+    delayMicroseconds(SOFT_UART_BIT_TIME_US);
+
+    // 8 data bits (LSB first)
+    for (int i = 0; i < 8; i++) {
+        if (byte & (1 << i)) {
+            digitalWrite(C3_DATA_TX_PIN, HIGH);
+        } else {
+            digitalWrite(C3_DATA_TX_PIN, LOW);
+        }
+        delayMicroseconds(SOFT_UART_BIT_TIME_US);
+    }
+
+    // Stop bit (HIGH)
+    digitalWrite(C3_DATA_TX_PIN, HIGH);
+    delayMicroseconds(SOFT_UART_BIT_TIME_US);
+
+    // Re-enable interrupts
+    interrupts();
+}
+
+void c3UartSendString(const char* str) {
+    while (*str) {
+        c3UartSendByte((uint8_t)*str);
+        str++;
+    }
+}
+
+// ============================================================================
+// IMPLEMENTATION — CSV FRAME BUILDER (39 Fields)
+// ============================================================================
+
+void buildCSVFrame(char* buffer, size_t bufSize) {
+    // Read latest RTC time
+    if (rtc.online) {
+        rtcReadTime();
+    }
+
+    // Read battery
+    readBattery();
+
+    // Compute health score
+    computeHealthScore();
+
+    // Session duration
+    unsigned long sessionSec = (millis() - flood.sessionStartMs) / 1000;
+
+    // Use GPS time if RTC is invalid
+    uint32_t timestampUnix = rtc.unixTime;
+    const char* timestampStr = rtc.dateTimeStr;
+    char gpsFallbackStr[24] = "0000-00-00 00:00:00";
+
+    if (!rtc.valid && gps.fixValid) {
+        // Build timestamp from GPS
+        snprintf(gpsFallbackStr, sizeof(gpsFallbackStr),
+                 "%04u-%02u-%02u %02u:%02u:%02u",
+                 gps.utcYear, gps.utcMonth, gps.utcDay,
+                 gps.utcHour, gps.utcMin, gps.utcSec);
+        timestampStr = gpsFallbackStr;
+        // Approximate unix time from GPS (simplified)
+        timestampUnix = 0;  // Would need proper calculation
+    }
+
+    // SIM fields — S3 doesn't know SIM status, output 0
+    int simRSSI = 0;
+    int simRegistered = 0;
+    int simAvailable = 0;
+
+    snprintf(buffer, bufSize,
+        "%.2f,"   // 1:  theta (degrees)
+        "%.2f,"   // 2:  waterHeight (cm)
+        "%.2f,"   // 3:  correctedTiltX (deg)
+        "%.2f,"   // 4:  correctedTiltY (deg)
+        "%.2f,"   // 5:  olpLength (cm)
+        "%.2f,"   // 6:  horizontalDist (cm)
+        "%.2f,"   // 7:  currentPressure (hPa)
+        "%.2f,"   // 8:  currentTemperature (°C)
+        "%.2f,"   // 9:  baselinePressure (hPa)
+        "%.2f,"   // 10: pressureDeviation (hPa)
+        "%d,"     // 11: submersionState (0-3)
+        "%.2f,"   // 12: estimatedDepth (cm)
+        "%d,"     // 13: bmpAvailable (0/1)
+        "%lu,"    // 14: unixTime
+        "%s,"     // 15: dateTimeString
+        "%d,"     // 16: rtcValid (0/1)
+        "%.3f,"   // 17: ratePer15Min (cm/15m)
+        "%d,"     // 18: floodAlertLevel (0-3)
+        "%lu,"    // 19: sessionDuration (sec)
+        "%.2f,"   // 20: peakHeight (cm)
+        "%.2f,"   // 21: minHeight (cm)
+        "%.6f,"   // 22: latitude
+        "%.6f,"   // 23: longitude
+        "%.1f,"   // 24: altitude (m)
+        "%d,"     // 25: gpsSatellites
+        "%d,"     // 26: gpsFixValid (0/1)
+        "%d,"     // 27: simSignalRSSI
+        "%d,"     // 28: simRegistered (0/1)
+        "%d,"     // 29: simAvailable (0/1)
+        "%d,"     // 30: currentZone (0-3)
+        "%d,"     // 31: currentResponseLevel (0-4)
+        "%d,"     // 32: sustainedRise (0/1)
+        "%.1f,"   // 33: batteryPercent
+        "%lu,"    // 34: sampleInterval (sec)
+        "%lu,"    // 35: transmitInterval (sec)
+        "%d,"     // 36: obLightEnabled (0/1)
+        "%d,"     // 37: algorithmEnabled (0/1)
+        "%d,"     // 38: currentMode (0-3)
+        "%d",     // 39: healthScore (0-100)
+
+        // Field values:
+        mpu.combinedTheta,                         // 1
+        flood.waterHeight_cm,                      // 2
+        mpu.correctedTiltX,                        // 3
+        mpu.correctedTiltY,                        // 4
+        flood.olpLength_cm,                        // 5
+        flood.horizontalDist_cm,                   // 6
+        bmp.pressure_hPa,                          // 7
+        bmp.temperature_C,                         // 8
+        bmp.baselinePressure_hPa,                  // 9
+        (bmp.pressure_hPa - bmp.baselinePressure_hPa), // 10
+        (int)flood.currentMode,                    // 11 (submersionState = mode)
+        bmp.estimatedDepth_cm,                     // 12
+        (int)bmp.online,                           // 13
+        (unsigned long)timestampUnix,              // 14
+        timestampStr,                              // 15
+        (int)rtc.valid,                            // 16
+        flood.rateOfRise_cm_per_15min,             // 17
+        (int)flood.alertLevel,                     // 18
+        (unsigned long)sessionSec,                 // 19
+        flood.peakHeight_cm,                       // 20
+        flood.minHeight_cm,                        // 21
+        gps.latitude,                              // 22
+        gps.longitude,                             // 23
+        gps.altitude,                              // 24
+        (int)gps.satellites,                       // 25
+        (int)gps.fixValid,                         // 26
+        simRSSI,                                   // 27
+        simRegistered,                             // 28
+        simAvailable,                              // 29
+        (int)flood.currentZone,                    // 30
+        (int)flood.responseLevel,                  // 31
+        (int)flood.sustainedRise,                  // 32
+        battery.percent,                           // 33
+        (unsigned long)sampling.sampleIntervalSec, // 34
+        (unsigned long)sampling.currentIntervalSec,// 35
+        (int)sampling.obLightEnabled,              // 36
+        (int)sampling.algorithmEnabled,            // 37
+        (int)flood.currentMode,                    // 38
+        (int)healthScore                           // 39
+    );
+}
+
+// ============================================================================
+// IMPLEMENTATION — TRANSMIT FUNCTIONS
+// ============================================================================
+
+void transmitCSVtoC3(const char* csv) {
+    // Send via software UART on GPIO 14
+    c3UartSendString(csv);
+    c3UartSendByte('\n');
+}
+
+void transmitCSVtoDebugger(const char* csv) {
+    // Send via USB Serial
+    Serial.println(csv);
+}
+
+// ============================================================================
+// IMPLEMENTATION — COMMAND PROCESSING (C3 → S3)
+// ============================================================================
+
+// Command buffer for Serial2 (C3 commands)
+static char c3CmdBuf[128];
+static uint8_t c3CmdIdx = 0;
+
+// Command buffer for USB Serial (debugger commands)
+static char dbgCmdBuf[128];
+static uint8_t dbgCmdIdx = 0;
+
+void processC3Commands() {
+    while (Serial2.available()) {
+        char c = Serial2.read();
+        if (c == '\n' || c == '\r') {
+            if (c3CmdIdx > 0) {
+                c3CmdBuf[c3CmdIdx] = '\0';
+                handleC3Command(c3CmdBuf);
+                c3CmdIdx = 0;
+            }
+        } else if (c3CmdIdx < sizeof(c3CmdBuf) - 1) {
+            c3CmdBuf[c3CmdIdx++] = c;
+        }
+    }
+}
+
+void handleC3Command(const char* cmd) {
+    char msg[128];
+
+    // --- $CFG,normal_sec,high_sec,h_max_cm ---
+    if (strncmp(cmd, "$CFG,", 5) == 0) {
+        uint32_t normalSec, highSec;
+        float hMaxCm;
+
+        int parsed = sscanf(cmd + 5, "%lu,%lu,%f", &normalSec, &highSec, &hMaxCm);
+
+        if (parsed == 3) {
+            // Validate ranges
+            if (normalSec < 10) normalSec = 10;
+            if (normalSec > 3600) normalSec = 3600;
+            if (highSec < 5) highSec = 5;
+            if (highSec > normalSec) highSec = normalSec;
+            if (hMaxCm < 10.0f) hMaxCm = 10.0f;
+            if (hMaxCm > 10000.0f) hMaxCm = 10000.0f;
+
+            sampling.normalRateSec = normalSec;
+            sampling.highRateSec = highSec;
+            flood.olpLength_cm = hMaxCm;
+
+            snprintf(msg, sizeof(msg),
+                     "STATUS:CFG applied — normal=%lus, high=%lus, L=%.1fcm",
+                     normalSec, highSec, hMaxCm);
+            Serial.println(msg);
+
+            // Acknowledge to C3
+            Serial2.println("$CFG_ACK");
+        } else {
+            Serial2.println("$CFG_ERR,PARSE_FAIL");
+            sendErrorMsg("$CFG parse failed — expected $CFG,normal,high,hmax");
+        }
+        return;
+    }
+
+    // --- $DIAGRUN ---
+    if (strcmp(cmd, "$DIAGRUN") == 0) {
+        diag.diagRequested = true;
+        Serial2.println("$DIAGRUN_ACK");
+        sendStatusMsg("Diagnostic run requested by C3");
+        return;
+    }
+
+    // --- $PING ---
+    if (strcmp(cmd, "$PING") == 0) {
+        Serial2.println("$PONG");
+        sendStatusMsg("PING received from C3 — PONG sent");
+        return;
+    }
+
+    // --- $PONG (response to our diagnostic ping) ---
+    if (strcmp(cmd, "$PONG") == 0) {
+        if (diag.waitingForPong) {
+            diag.c3PongReceived = true;
+            diag.waitingForPong = false;
+            sendStatusMsg("PONG received from C3 — link verified");
+        }
+        return;
+    }
+
+    // Unknown command
+    snprintf(msg, sizeof(msg), "WARNING:Unknown C3 command: %s", cmd);
+    Serial.println(msg);
+}
+
+// ============================================================================
+// IMPLEMENTATION — COMMAND PROCESSING (Debugger → S3)
+// ============================================================================
+
+void processDebugCommands() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (dbgCmdIdx > 0) {
+                dbgCmdBuf[dbgCmdIdx] = '\0';
+                handleDebugCommand(dbgCmdBuf);
+                dbgCmdIdx = 0;
+            }
+        } else if (dbgCmdIdx < sizeof(dbgCmdBuf) - 1) {
+            dbgCmdBuf[dbgCmdIdx++] = c;
+        }
+    }
+}
+
+void handleDebugCommand(const char* cmd) {
+    char response[256];
+
+    // --- PING ---
+    if (strcmp(cmd, "PING") == 0) {
+        sendStatusMsg("PONG");
+        return;
+    }
+
+    // --- GETCONFIG ---
+    if (strcmp(cmd, "GETCONFIG") == 0) {
+        snprintf(response, sizeof(response),
+                 "STATUS:CONFIG normal=%lus high=%lus L=%.1fcm mode=%d interval=%lus health=%d battery=%.1f%%",
+                 (unsigned long)sampling.normalRateSec,
+                 (unsigned long)sampling.highRateSec,
+                 flood.olpLength_cm,
+                 flood.currentMode,
+                 (unsigned long)sampling.currentIntervalSec,
+                 healthScore,
+                 battery.percent);
+        Serial.println(response);
+        return;
+    }
+
+    // --- RECALIBRATE ---
+    if (strcmp(cmd, "RECALIBRATE") == 0) {
+        sendStatusMsg("Starting recalibration...");
+        recalibrate();
+        if (bmp.online) {
+            bmpEstablishBaseline();
+        }
+        sendStatusMsg("Recalibration complete");
+        return;
+    }
+
+    // --- GETTHRESH ---
+    if (strcmp(cmd, "GETTHRESH") == 0) {
+        snprintf(response, sizeof(response),
+                 "STATUS:THRESH lateralTaut=%.3f lateralSlack=%.3f tiltMin=%.1f floodTilt=%.1f floodRatio=%.2f subPressure=%.1f",
+                 thresholds.lateralAccelTaut,
+                 thresholds.lateralAccelSlack,
+                 thresholds.tiltTautMin,
+                 thresholds.floodTiltMax,
+                 thresholds.floodHRatio,
+                 thresholds.submersionPressurePa);
+        Serial.println(response);
+        return;
+    }
+
+    // --- SETTHRESH=A,W,D ---
+    // A = lateralAccelTaut, W = floodTiltMax, D = submersionPressurePa
+    if (strncmp(cmd, "SETTHRESH=", 10) == 0) {
+        float A, W, D;
+        int parsed = sscanf(cmd + 10, "%f,%f,%f", &A, &W, &D);
+        if (parsed == 3) {
+            thresholds.lateralAccelTaut = A;
+            thresholds.lateralAccelSlack = A * 0.67f;  // Auto-set hysteresis
+            thresholds.floodTiltMax = W;
+            thresholds.submersionPressurePa = D;
+
+            snprintf(response, sizeof(response),
+                     "STATUS:THRESH_SET A=%.3f W=%.1f D=%.1f",
+                     A, W, D);
+            Serial.println(response);
+        } else {
+            sendErrorMsg("SETTHRESH parse failed — expected SETTHRESH=A,W,D");
+        }
+        return;
+    }
+
+    // --- RESETTHRESH ---
+    if (strcmp(cmd, "RESETTHRESH") == 0) {
+        initThresholds();
+        sendStatusMsg("Thresholds reset to defaults");
+        return;
+    }
+
+    // --- SETAPN (placeholder — S3 doesn't handle SIM) ---
+    if (strncmp(cmd, "SETAPN", 6) == 0) {
+        // Forward to C3 if needed
+        sendStatusMsg("SETAPN — S3 does not handle SIM. Forward to C3.");
+        return;
+    }
+
+    // --- REINITSIM (placeholder) ---
+    if (strcmp(cmd, "REINITSIM") == 0) {
+        sendStatusMsg("REINITSIM — S3 does not handle SIM. Forward to C3.");
+        return;
+    }
+
+    // --- TESTGPRS (placeholder) ---
+    if (strcmp(cmd, "TESTGPRS") == 0) {
+        sendStatusMsg("TESTGPRS — S3 does not handle SIM. Forward to C3.");
+        return;
+    }
+
+    // --- Unknown ---
+    snprintf(response, sizeof(response), "ERROR:Unknown command: %s", cmd);
+    Serial.println(response);
+}
+
+// ============================================================================
+// IMPLEMENTATION — DIAGNOSTICS
+// ============================================================================
+
+void checkDiagSchedule() {
+    unsigned long now = millis();
+
+    // Scheduled 24-hour diagnostic
+    if (now - diag.lastDiagMs >= DIAG_INTERVAL_MS) {
+        diag.diagRequested = true;
+    }
+
+    // Manual diagnostic requested
+    if (diag.diagRequested) {
+        diag.diagRequested = false;
+        diag.lastDiagMs = now;
+        runDiagnostic();
+    }
+
+    // Check PONG timeout during diagnostic
+    if (diag.waitingForPong) {
+        if (now - diag.pingSentMs >= DIAG_PING_TIMEOUT_MS) {
+            diag.c3PongReceived = false;
+            diag.waitingForPong = false;
+            sendWarningMsg("C3 PONG timeout — communication link may be down");
+
+            // Complete diagnostic with failed C3 link
+            char diagFrame[512];
+            buildDiagFrame(diagFrame, sizeof(diagFrame));
+            sendDiagToC3(diagFrame);
+        }
+    }
+}
+
+void runDiagnostic() {
+    sendStatusMsg("=== DIAGNOSTIC RUN STARTING ===");
+    diag.totalFaults = 0;
+
+    // --- MPU6050 Tests ---
+
+    // Test 1: WHO_AM_I
+    uint8_t whoami = mpuReadReg(MPU6050_REG_WHO_AM_I);
+    diag.mpuWhoAmIOk = (whoami == MPU6050_WHO_AM_I_VALUE);
+    if (!diag.mpuWhoAmIOk) {
+        diag.totalFaults++;
+        sendErrorMsg("DIAG: MPU6050 WHO_AM_I failed");
+    }
+
+    // Test 2: Accelerometer magnitude sanity
+    if (mpu.online) {
+        mpuReadSensorData();
+        mpuConvertUnits();
+        float mag = sqrtf(mpu.accX_g * mpu.accX_g +
+                          mpu.accY_g * mpu.accY_g +
+                          mpu.accZ_g * mpu.accZ_g);
+        diag.mpuAccelOk = (mag > 0.7f && mag < 1.4f);
+        if (!diag.mpuAccelOk) {
+            diag.totalFaults++;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "DIAG: Accel magnitude out of range: %.3f g", mag);
+            sendErrorMsg(msg);
+        }
+    } else {
+        diag.mpuAccelOk = false;
+        diag.totalFaults++;
+    }
+
+    // Test 3: Gyro drift measurement (should be near zero when stationary)
+    if (mpu.online) {
+        float sumGx = 0, sumGy = 0, sumGz = 0;
+        for (int i = 0; i < 50; i++) {
+            mpuReadSensorData();
+            mpuConvertUnits();
+            sumGx += fabsf(mpu.gyroX_dps);
+            sumGy += fabsf(mpu.gyroY_dps);
+            sumGz += fabsf(mpu.gyroZ_dps);
+            delayMicroseconds(1000);
+        }
+        float avgDrift = (sumGx + sumGy + sumGz) / 150.0f;
+        diag.mpuGyroOk = (avgDrift < 5.0f);  // Less than 5°/s average drift
+        if (!diag.mpuGyroOk) {
+            diag.totalFaults++;
+            sendErrorMsg("DIAG: Gyro drift excessive");
+        }
+    } else {
+        diag.mpuGyroOk = false;
+        diag.totalFaults++;
+    }
+
+    // --- BMP280 Tests ---
+
+    // Test 4: Chip ID
+    uint8_t bmpId = bmpReadReg(BMP280_REG_CHIP_ID);
+    diag.bmpChipIdOk = (bmpId == BMP280_CHIP_ID_VALUE);
+    if (!diag.bmpChipIdOk) {
+        diag.totalFaults++;
+        sendErrorMsg("DIAG: BMP280 chip ID failed");
+    }
+
+    // Test 5: Pressure range (300-1100 hPa)
+    if (bmp.online) {
+        bmpReadData();
+        diag.bmpPressureOk = (bmp.pressure_hPa > 300.0f && bmp.pressure_hPa < 1100.0f);
+        if (!diag.bmpPressureOk) {
+            diag.totalFaults++;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "DIAG: Pressure out of range: %.2f hPa", bmp.pressure_hPa);
+            sendErrorMsg(msg);
+        }
+    } else {
+        diag.bmpPressureOk = false;
+        diag.totalFaults++;
+    }
+
+    // Test 6: Temperature range (-40 to 85°C)
+    if (bmp.online) {
+        diag.bmpTempOk = (bmp.temperature_C > -40.0f && bmp.temperature_C < 85.0f);
+        if (!diag.bmpTempOk) {
+            diag.totalFaults++;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "DIAG: Temperature out of range: %.2f °C", bmp.temperature_C);
+            sendErrorMsg(msg);
+        }
+    } else {
+        diag.bmpTempOk = false;
+        diag.totalFaults++;
+    }
+
+    // --- DS1307 Tests ---
+
+    // Test 7: Oscillator running
+    if (rtc.online) {
+        I2C_Bus1.beginTransmission(DS1307_ADDR);
+        I2C_Bus1.write(DS1307_REG_SECONDS);
+        I2C_Bus1.endTransmission(false);
+        I2C_Bus1.requestFrom((uint8_t)DS1307_ADDR, (uint8_t)1);
+        if (I2C_Bus1.available()) {
+            uint8_t secReg = I2C_Bus1.read();
+            diag.rtcOscOk = !(secReg & 0x80);  // CH bit should be 0
+        } else {
+            diag.rtcOscOk = false;
+        }
+        if (!diag.rtcOscOk) {
+            diag.totalFaults++;
+            sendErrorMsg("DIAG: RTC oscillator stopped");
+        }
+    } else {
+        diag.rtcOscOk = false;
+        diag.totalFaults++;
+    }
+
+    // Test 8: RTC time validity
+    if (rtc.online) {
+        rtcReadTime();
+        diag.rtcTimeOk = rtc.valid;
+        if (!diag.rtcTimeOk) {
+            diag.totalFaults++;
+            sendErrorMsg("DIAG: RTC time invalid");
+        }
+    } else {
+        diag.rtcTimeOk = false;
+        diag.totalFaults++;
+    }
+
+    // --- GPS Test ---
+
+    // Test 9: UART activity
+    {
+        unsigned long gpsCheckStart = millis();
+        diag.gpsUartOk = false;
+        while (millis() - gpsCheckStart < 2000) {
+            if (Serial1.available()) {
+                diag.gpsUartOk = true;
+                // Flush the bytes
+                while (Serial1.available()) Serial1.read();
+                break;
+            }
+            delay(10);
+        }
+        if (!diag.gpsUartOk) {
+            diag.totalFaults++;
+            sendWarningMsg("DIAG: GPS UART no data");
+        }
+    }
+
+    // --- Battery Test ---
+
+    // Test 10: Battery voltage range (2.8V - 4.3V for LiPo)
+    readBattery();
+    diag.batteryOk = (battery.voltage > 2.8f && battery.voltage < 4.3f);
+    if (!diag.batteryOk) {
+        diag.totalFaults++;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "DIAG: Battery voltage out of range: %.2f V", battery.voltage);
+        sendErrorMsg(msg);
+    }
+
+    // --- C3 Communication Test ---
+    // Send $PING and wait for $PONG (handled asynchronously)
+    sendStatusMsg("DIAG: Pinging C3...");
+    Serial2.println("$PING");
+    diag.waitingForPong = true;
+    diag.pingSentMs = millis();
+    diag.c3PongReceived = false;
+
+    // NOTE: We don't block here. The PONG will be caught in processC3Commands().
+    // checkDiagSchedule() handles the timeout and sends the diag frame.
+
+    // If PONG comes quickly (synchronous check for fast response)
+    unsigned long quickWait = millis();
+    while (millis() - quickWait < 500) {
+        processC3Commands();
+        if (diag.c3PongReceived) break;
+        delay(10);
+    }
+
+    // If we got PONG already, finalize now
+    if (diag.c3PongReceived || !diag.waitingForPong) {
+        if (!diag.c3PongReceived) {
+            diag.totalFaults++;
+        }
+        char diagFrame[512];
+        buildDiagFrame(diagFrame, sizeof(diagFrame));
+        sendDiagToC3(diagFrame);
+        diag.waitingForPong = false;
+    }
+    // Otherwise, checkDiagSchedule() will handle timeout and send diag frame
+}
+
+void buildDiagFrame(char* buffer, size_t bufSize) {
+    snprintf(buffer, bufSize,
+        "$DIAG,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        (int)diag.mpuWhoAmIOk,
+        (int)diag.mpuAccelOk,
+        (int)diag.mpuGyroOk,
+        (int)diag.bmpChipIdOk,
+        (int)diag.bmpPressureOk,
+        (int)diag.bmpTempOk,
+        (int)diag.rtcOscOk,
+        (int)diag.rtcTimeOk,
+        (int)diag.gpsUartOk,
+        (int)diag.batteryOk,
+        (int)diag.c3PongReceived,
+        (int)diag.totalFaults
+    );
+
+    char msg[80];
+    snprintf(msg, sizeof(msg), "=== DIAGNOSTIC COMPLETE — %d faults ===", diag.totalFaults);
+    sendStatusMsg(msg);
+}
+
+void sendDiagToC3(const char* diagFrame) {
+    // Send via Serial2 (command channel to C3)
+    Serial2.println(diagFrame);
+
+    // Also output to debugger
+    Serial.print("STATUS:DIAG_FRAME=");
+    Serial.println(diagFrame);
+}
+
+// ============================================================================
+// IMPLEMENTATION — HEALTH SCORE
+// ============================================================================
+
+void computeHealthScore() {
+    healthScore = 0;
+
+    if (mpu.online)  healthScore += 40;   // Most critical
+    if (bmp.online)  healthScore += 30;   // Pressure/submersion
+    if (rtc.online && rtc.valid) healthScore += 20;  // Timestamps
+    if (gps.online && gps.fixValid) healthScore += 10;  // Location
+}
+
+// ============================================================================
+// IMPLEMENTATION — STATUS MESSAGE UTILITIES
+// ============================================================================
+
+void sendStatusMsg(const char* msg) {
+    Serial.print("STATUS:");
+    Serial.println(msg);
+}
+
+void sendErrorMsg(const char* msg) {
+    Serial.print("ERROR:");
+    Serial.println(msg);
+}
+
+void sendWarningMsg(const char* msg) {
+    Serial.print("WARNING:");
+    Serial.println(msg);
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup() {
+    // ---- Initialize USB Serial (debugger) ----
+    Serial.begin(DEBUG_BAUD);
+    unsigned long serialWait = millis();
+    while (!Serial && millis() - serialWait < 3000) {
+        delay(10);
+    }
+
+    Serial.println();
+    Serial.println("================================================================");
+    Serial.println("  VARUNA FLOOD DETECTION BUOY — ESP32-S3 SENSOR BRAIN");
+    Serial.println("  Firmware v1.0.0");
+    Serial.println("================================================================");
+    Serial.println();
+
+    // ---- Initialize Serial2 (C3 command channel) ----
+    Serial2.begin(C3_CMD_BAUD, SERIAL_8N1, C3_CMD_RX_PIN, C3_CMD_TX_PIN);
+    sendStatusMsg("Serial2 initialized — C3 command channel on GPIO 43(TX)/44(RX)");
+
+    // ---- Initialize software UART (C3 data channel) ----
+    initSoftwareUART();
+
+    // ---- Initialize I2C buses ----
+    initI2CBuses();
+
+    // ---- Initialize default configuration ----
+    initDefaultConfig();
+    initThresholds();
+
+    // ---- Initialize MPU6050 ----
+    sendStatusMsg("Initializing MPU6050...");
+    if (initMPU6050()) {
+        // Run calibration
+        calibrateGyroscope();
+        calibrateAccelerometer();
+    } else {
+        sendErrorMsg("MPU6050 initialization FAILED — core measurement unavailable");
+    }
+
+    // ---- Initialize BMP280 ----
+    sendStatusMsg("Initializing BMP280...");
+    if (initBMP280()) {
+        bmpEstablishBaseline();
+    } else {
+        sendErrorMsg("BMP280 initialization FAILED — submersion detection unavailable");
+    }
+
+    // ---- Initialize DS1307 RTC ----
+    sendStatusMsg("Initializing DS1307 RTC...");
+    initDS1307();
+
+    // ---- Initialize GPS ----
+    sendStatusMsg("Initializing GPS...");
+    initGPS();
+
+    // ---- Initialize Battery ADC ----
+    initBatteryADC();
+    readBattery();
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Battery: %.2f V (%.1f%%)", battery.voltage, battery.percent);
+        sendStatusMsg(msg);
+    }
+
+    // ---- Compute initial health score ----
+    computeHealthScore();
+    {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Health score: %d/100", healthScore);
+        sendStatusMsg(msg);
+    }
+
+    // ---- Initial sensor reading for baseline ----
+    if (mpu.online) {
+        for (int i = 0; i < 100; i++) {
+            mpuReadSensorData();
+            mpuConvertUnits();
+            runComplementaryFilter();
+            delayMicroseconds(FILTER_PERIOD_US);
+        }
+        sendStatusMsg("Complementary filter seeded with 100 initial readings");
+    }
+
+    // ---- Send initial data frame ----
+    {
+        computeWaterLevel();
+        classifyMode();
+        updateAlertLevel();
+        computeTransmitInterval();
+
+        char csv[1024];
+        buildCSVFrame(csv, sizeof(csv));
+        transmitCSVtoC3(csv);
+        transmitCSVtoDebugger(csv);
+        sampling.lastTransmitMs = millis();
+        sendStatusMsg("Initial data frame transmitted");
+    }
+
+    Serial.println();
+    sendStatusMsg("======== INITIALIZATION COMPLETE — ENTERING MAIN LOOP ========");
+    Serial.println();
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop() {
+    unsigned long loopStart = micros();
+
+    // =====================================================================
+    // PHASE 1: SENSOR READING (runs every iteration at ~100Hz)
+    // =====================================================================
+
+    // --- Read MPU6050 ---
+    if (mpu.online) {
+        mpuReadSensorData();
+        mpuConvertUnits();
+    }
+
+    // --- Run complementary filter ---
+    if (mpu.online && mpu.calibrated) {
+        runComplementaryFilter();
+    }
+
+    // --- Read GPS (non-blocking, process available bytes) ---
+    while (Serial1.available()) {
+        uint8_t b = Serial1.read();
+        gpsProcessByte(b);
+    }
+
+    // --- Read BMP280 (less frequently — every 100ms is sufficient) ---
+    static unsigned long lastBmpRead = 0;
+    if (bmp.online && millis() - lastBmpRead >= 100) {
+        bmpReadData();
+        lastBmpRead = millis();
+    }
+
+    // =====================================================================
+    // PHASE 2: FLOOD CLASSIFICATION (runs every iteration)
+    // =====================================================================
+
+    if (mpu.online && mpu.calibrated) {
+        computeWaterLevel();
+        classifyMode();
+        updateAlertLevel();
+    }
+
+    // =====================================================================
+    // PHASE 3: COMMAND PROCESSING (runs every iteration)
+    // =====================================================================
+
+    processC3Commands();
+    processDebugCommands();
+
+    // =====================================================================
+    // PHASE 4: DIAGNOSTIC CHECK
+    // =====================================================================
+
+    checkDiagSchedule();
+
+    // =====================================================================
+    // PHASE 5: DYNAMIC SAMPLING & TRANSMISSION
+    // =====================================================================
+
+    computeTransmitInterval();
+
+    if (isTransmitDue()) {
+        // Update rate of rise
+        updateRateOfRise();
+
+        // Update session statistics
+        updateSessionStats();
+
+        // Read RTC for timestamp
+        if (rtc.online) {
+            rtcReadTime();
+        }
+
+        // Read battery
+        readBattery();
+
+        // Build and transmit CSV frame
+        char csvFrame[1024];
+        buildCSVFrame(csvFrame, sizeof(csvFrame));
+
+        // Stream 1: Software UART → C3 (GPIO 14)
+        transmitCSVtoC3(csvFrame);
+
+        // Stream 2: USB Serial → Debugger
+        transmitCSVtoDebugger(csvFrame);
+
+        // Update timestamp
+        sampling.lastTransmitMs = millis();
+
+        // Debug output for mode awareness
+        static uint8_t lastReportedMode = 255;
+        if (flood.currentMode != lastReportedMode) {
+            lastReportedMode = flood.currentMode;
+            const char* modeNames[] = {"SLACK", "TAUT", "FLOOD", "SUBMERGED"};
+            const char* alertNames[] = {"GREEN", "YELLOW", "RED", "BLACK"};
+            char modeMsg[128];
+            snprintf(modeMsg, sizeof(modeMsg),
+                     "MODE=%s(%d) ALERT=%s H=%.1fcm ratio=%.2f interval=%lus",
+                     modeNames[flood.currentMode], flood.currentMode,
+                     alertNames[flood.alertLevel],
+                     flood.waterHeight_cm, flood.floodRatio,
+                     (unsigned long)sampling.currentIntervalSec);
+            sendStatusMsg(modeMsg);
+        }
+    }
+
+    // =====================================================================
+    // PHASE 6: LOOP TIMING (maintain ~100Hz for filter)
+    // =====================================================================
+
+    unsigned long loopElapsed = micros() - loopStart;
+    if (loopElapsed < FILTER_PERIOD_US) {
+        delayMicroseconds(FILTER_PERIOD_US - loopElapsed);
+    }
+}
