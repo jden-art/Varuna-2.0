@@ -529,3 +529,458 @@ Dark tile: `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png`
 7. Use `window.XLSX` check before Excel export; show alert if not yet loaded
 8. The `.l-nav.scrolled` class can slightly increase background opacity on scroll (add via scroll listener)
 9. Firebase errors should update topbar status to red "Disconnected" and show the connection banner
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Here is the prompt you should use:
+
+---
+
+# PROMPT: Add OTA Firmware Update Feature to My HTML File
+
+## CRITICAL RULES — READ BEFORE DOING ANYTHING
+
+1. **I am uploading ONE `.html` file. That is the ONLY file you are modifying.**
+2. **You must return the COMPLETE file with ALL original code intact.**
+3. **Do NOT delete, modify, rename, restyle, reformat, or reorder ANY existing line of code.**
+4. **Do NOT "improve," "clean up," "refactor," or "simplify" anything that already exists.**
+5. **Do NOT invent instructions that were not listed below. Follow ONLY the changes described here.**
+6. **Do NOT add comments like "rest of your code remains the same" or truncate the file. Output the FULL file, every single line.**
+7. **If you are unsure about something, leave the original code untouched. When in doubt, do nothing.**
+8. **The only acceptable diff between your output and my input should be the three additions described below. Nothing else.**
+
+---
+
+## CHANGE 1 OF 3: Add GitHub Constants
+
+**WHERE:** Find my existing Firebase initialization inside the `<script type="module">` block. There will be lines like:
+
+```javascript
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getDatabase, ref, onValue, set } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+```
+
+and then later:
+
+```javascript
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+```
+
+**WHAT TO DO:** Immediately AFTER the line where `db` is created (or wherever the database is initialized), INSERT these lines. Do not replace anything. Just add after:
+
+```javascript
+// ============================================================
+// GITHUB OTA CONFIGURATION
+// ============================================================
+const GITHUB_OWNER = 'YourGitHubUsername';
+const GITHUB_REPO  = 'varuna-firmware';
+const GITHUB_API   = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases`;
+
+// Expose Firebase references globally for OTA functions
+window._firebaseDB = db;
+window._fbRef = ref;
+window._fbSet = set;
+window._fbOnValue = onValue;
+window._fbOff = (reference) => { off(reference); };
+```
+
+**ALSO:** Make sure `off` is imported from the Firebase database module. Find the existing import line that imports from `firebase-database.js` and add `off` to the import list IF it is not already there. For example, if the line currently reads:
+
+```javascript
+import { getDatabase, ref, onValue, set } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+```
+
+Change it to:
+
+```javascript
+import { getDatabase, ref, onValue, set, off } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+```
+
+That is the ONLY modification to an existing line allowed in this entire task.
+
+---
+
+## CHANGE 2 OF 3: Replace the Existing OTA Modal HTML
+
+**WHERE:** Find the existing OTA modal in the HTML. It starts with:
+
+```html
+<div class="ota-modal-overlay" id="otaModalOverlay">
+```
+
+**WHAT TO DO:** Replace the ENTIRE OTA modal block (from `<div class="ota-modal-overlay" id="otaModalOverlay">` through its closing `</div>` tags) with the following. Do NOT touch any HTML before or after the modal block:
+
+```html
+<!-- ============== OTA FIRMWARE UPDATE MODAL ============== -->
+<div class="ota-modal-overlay" id="otaModalOverlay">
+    <div class="ota-modal" style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:28px;width:460px;max-width:95vw;">
+
+        <!-- Header -->
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <span style="font-size:16px;font-weight:600;color:var(--text);">⚡ Firmware OTA Update</span>
+            <button onclick="closeOtaModal()" style="background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer;" aria-label="Close">✕</button>
+        </div>
+
+        <!-- Description -->
+        <p style="color:var(--text3);font-size:13px;margin-bottom:20px;line-height:1.5;">
+            Select a firmware version from GitHub Releases.
+            The C3 will download the binary and flash the S3 via UART bootloader.
+            This takes 1–3 minutes. <span style="color:var(--amber);">Do not interrupt.</span>
+        </p>
+
+        <!-- GitHub Release Dropdown -->
+        <div style="margin-bottom:16px;">
+            <label style="display:block;color:var(--text3);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">Select Firmware Version</label>
+            <select id="otaReleaseSelect" onchange="onOtaReleaseSelected()" style="width:100%;padding:10px 14px;background:var(--bg0);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text);font-family:var(--mono);font-size:13px;outline:none;cursor:pointer;">
+                <option value="">Click to load releases...</option>
+            </select>
+        </div>
+
+        <!-- Selected Release Info -->
+        <div id="otaReleaseInfo" style="display:none;justify-content:space-between;padding:8px 12px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:var(--radius-xs);margin-bottom:16px;font-size:13px;">
+            <span id="otaReleaseName" style="color:var(--accent);font-weight:500;"></span>
+            <span id="otaReleaseSize" style="color:var(--text3);"></span>
+        </div>
+
+        <!-- Progress Bar -->
+        <div id="otaProgressContainer" style="display:none;margin-bottom:12px;">
+            <div style="width:100%;height:6px;background:var(--bg0);border-radius:3px;overflow:hidden;margin-bottom:6px;">
+                <div id="otaProgressFill" style="height:100%;background:var(--accent);border-radius:3px;transition:width 0.5s ease;width:0%;"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text3);">
+                <span id="otaProgressText">Waiting...</span>
+                <span id="otaProgressPercent">0%</span>
+            </div>
+        </div>
+
+        <!-- Status Message -->
+        <div id="otaStatus" style="padding:8px 12px;border-radius:var(--radius-xs);font-size:12px;margin-bottom:16px;min-height:20px;"></div>
+
+        <!-- Buttons -->
+        <div style="display:flex;justify-content:flex-end;gap:12px;">
+            <button onclick="closeOtaModal()" style="padding:8px 20px;background:transparent;border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text3);cursor:pointer;font-size:13px;">Cancel</button>
+            <button id="otaFlashBtn" onclick="startOtaFlash()" disabled style="padding:8px 24px;background:var(--bg4);border:none;border-radius:var(--radius-xs);color:var(--text4);font-weight:600;cursor:not-allowed;font-size:13px;">
+                Select a version first
+            </button>
+        </div>
+    </div>
+</div>
+```
+
+---
+
+## CHANGE 3 OF 3: Add OTA JavaScript Functions
+
+**WHERE:** Inside the same `<script type="module">` block, AFTER the GitHub constants you added in Change 1 (and after whatever existing code follows), INSERT the following block of JavaScript. Do NOT replace any existing functions. Just add this new code:
+
+```javascript
+// ============================================================
+// OTA UPDATE VIA GITHUB RELEASES
+// ============================================================
+
+let otaReleases = [];
+let otaSelectedRelease = null;
+let otaMonitorRef = null;
+let otaInProgress = false;
+
+window.openOtaModal = function() {
+    document.getElementById('otaModalOverlay').classList.add('open');
+    fetchGitHubReleases();
+};
+
+window.closeOtaModal = function() {
+    document.getElementById('otaModalOverlay').classList.remove('open');
+    if (otaMonitorRef) {
+        try { window._fbOff(otaMonitorRef); } catch(e) {}
+        otaMonitorRef = null;
+    }
+};
+
+async function fetchGitHubReleases() {
+    const select = document.getElementById('otaReleaseSelect');
+    select.innerHTML = '<option value="">Loading releases from GitHub...</option>';
+
+    try {
+        const response = await fetch(GITHUB_API);
+        if (!response.ok) throw new Error('GitHub API returned ' + response.status);
+
+        otaReleases = await response.json();
+
+        if (!otaReleases.length) {
+            select.innerHTML = '<option value="">No releases found in repository</option>';
+            return;
+        }
+
+        select.innerHTML = '<option value="">— Select firmware version —</option>';
+
+        otaReleases.forEach((release, index) => {
+            const binAsset = release.assets.find(a => a.name.endsWith('.bin'));
+            if (binAsset) {
+                const date = new Date(release.published_at).toLocaleDateString();
+                const sizeKB = (binAsset.size / 1024).toFixed(0);
+                const opt = document.createElement('option');
+                opt.value = index;
+                opt.textContent = `${release.tag_name} — ${binAsset.name} (${sizeKB} KB) — ${date}`;
+                select.appendChild(opt);
+            }
+        });
+
+        if (typeof varunaConsole !== 'undefined' && varunaConsole.initialized) {
+            varunaConsole.addLine(`Loaded ${otaReleases.length} firmware releases from GitHub`, 'info');
+        }
+
+    } catch (error) {
+        select.innerHTML = '<option value="">Error: ' + error.message + '</option>';
+        console.error('GitHub API error:', error);
+    }
+}
+
+window.onOtaReleaseSelected = function() {
+    const select = document.getElementById('otaReleaseSelect');
+    const index = parseInt(select.value);
+    const flashBtn = document.getElementById('otaFlashBtn');
+    const infoDiv = document.getElementById('otaReleaseInfo');
+
+    if (isNaN(index) || index < 0 || index >= otaReleases.length) {
+        otaSelectedRelease = null;
+        flashBtn.disabled = true;
+        flashBtn.style.background = 'var(--bg4)';
+        flashBtn.style.color = 'var(--text4)';
+        flashBtn.style.cursor = 'not-allowed';
+        flashBtn.textContent = 'Select a version first';
+        infoDiv.style.display = 'none';
+        return;
+    }
+
+    const release = otaReleases[index];
+    const binAsset = release.assets.find(a => a.name.endsWith('.bin'));
+
+    if (!binAsset) {
+        otaSelectedRelease = null;
+        flashBtn.disabled = true;
+        flashBtn.textContent = 'No .bin file in this release';
+        return;
+    }
+
+    otaSelectedRelease = {
+        tagName: release.tag_name,
+        name: release.name,
+        fileName: binAsset.name,
+        downloadUrl: binAsset.browser_download_url,
+        size: binAsset.size,
+        publishedAt: release.published_at
+    };
+
+    document.getElementById('otaReleaseName').textContent = release.tag_name + ' — ' + binAsset.name;
+    document.getElementById('otaReleaseSize').textContent = (binAsset.size / 1024).toFixed(1) + ' KB';
+    infoDiv.style.display = 'flex';
+
+    flashBtn.disabled = false;
+    flashBtn.style.background = 'var(--green)';
+    flashBtn.style.color = '#000';
+    flashBtn.style.cursor = 'pointer';
+    flashBtn.textContent = 'Flash ' + release.tag_name + ' to Device';
+};
+
+window.startOtaFlash = async function() {
+    if (!otaSelectedRelease || otaInProgress) return;
+
+    otaInProgress = true;
+    const flashBtn = document.getElementById('otaFlashBtn');
+    flashBtn.disabled = true;
+    flashBtn.style.background = 'var(--amber)';
+    flashBtn.style.color = '#000';
+    flashBtn.textContent = 'Sending to buoy...';
+
+    document.getElementById('otaProgressContainer').style.display = 'block';
+    setOtaProgress('Sending OTA command to Firebase...', 5);
+    setOtaStatus('Writing command to Firebase...', 'info');
+
+    if (typeof varunaConsole !== 'undefined' && varunaConsole.initialized) {
+        varunaConsole.addLine('═══ OTA UPDATE STARTING ═══', 'system');
+        varunaConsole.addLine('Version: ' + otaSelectedRelease.tagName, 'info');
+    }
+
+    try {
+        const otaPath = window._fbRef(window._firebaseDB, 'devices/VARUNA_001/commands/ota');
+        await window._fbSet(otaPath, {
+            url: otaSelectedRelease.downloadUrl,
+            size: otaSelectedRelease.size,
+            fileName: otaSelectedRelease.fileName,
+            tagName: otaSelectedRelease.tagName,
+            pending: true,
+            status: 'pending'
+        });
+
+        setOtaStatus('Command sent — waiting for buoy (polls every 5s)...', 'info');
+        setOtaProgress('Waiting for buoy to respond...', 10);
+
+        startOtaMonitor();
+
+    } catch (error) {
+        setOtaStatus('Error: ' + error.message, 'error');
+        setOtaProgress('Failed', 0);
+        document.getElementById('otaProgressFill').style.background = 'var(--red)';
+        flashBtn.disabled = false;
+        flashBtn.style.background = 'var(--green)';
+        flashBtn.textContent = 'Flash ' + otaSelectedRelease.tagName + ' to Device';
+        otaInProgress = false;
+    }
+};
+
+function startOtaMonitor() {
+    const otaPath = window._fbRef(window._firebaseDB, 'devices/VARUNA_001/commands/ota');
+    otaMonitorRef = otaPath;
+
+    window._fbOnValue(otaPath, (snapshot) => {
+        const data = snapshot.val();
+        if (!data) return;
+
+        const status = data.status || 'unknown';
+        const flashBtn = document.getElementById('otaFlashBtn');
+        const fill = document.getElementById('otaProgressFill');
+
+        switch (status) {
+            case 'pending':
+                setOtaProgress('Waiting for buoy to pick up command...', 10);
+                fill.style.background = 'var(--accent)';
+                break;
+
+            case 'downloading':
+                setOtaProgress('Buoy is downloading firmware from GitHub...', 30);
+                fill.style.background = 'var(--accent)';
+                setOtaStatus('C3 is downloading .bin from GitHub releases...', 'info');
+                logOta('C3 downloading firmware from GitHub...', 'info');
+                break;
+
+            case 'flashing':
+                setOtaProgress('Flashing S3 processor via UART bootloader...', 65);
+                fill.style.background = 'var(--amber)';
+                setOtaStatus('C3 is flashing the S3 — DO NOT DISCONNECT', 'warn');
+                logOta('Flashing S3 via SLIP bootloader...', 'warning');
+                break;
+
+            case 'success':
+                setOtaProgress('Update complete!', 100);
+                fill.style.background = 'var(--green)';
+                setOtaStatus('✓ Firmware update successful!', 'success');
+                flashBtn.textContent = '✓ Update Successful';
+                flashBtn.style.background = 'var(--green)';
+                logOta('═══ OTA UPDATE SUCCESSFUL ═══', 'status');
+                finishOta();
+                break;
+
+            case 'failed':
+                const reason = data.message || 'Unknown error';
+                setOtaProgress('Update failed', 100);
+                fill.style.background = 'var(--red)';
+                setOtaStatus('✗ Failed: ' + reason, 'error');
+                flashBtn.textContent = 'Failed — Try Again';
+                flashBtn.style.background = 'var(--red)';
+                flashBtn.style.color = '#fff';
+                flashBtn.disabled = false;
+                logOta('═══ OTA FAILED: ' + reason + ' ═══', 'error');
+                finishOta();
+                break;
+        }
+    });
+}
+
+function finishOta() {
+    otaInProgress = false;
+    if (otaMonitorRef) {
+        try { window._fbOff(otaMonitorRef); } catch(e) {}
+        otaMonitorRef = null;
+    }
+    setTimeout(() => {
+        const flashBtn = document.getElementById('otaFlashBtn');
+        if (otaSelectedRelease) {
+            flashBtn.disabled = false;
+            flashBtn.style.background = 'var(--green)';
+            flashBtn.style.color = '#000';
+            flashBtn.style.cursor = 'pointer';
+            flashBtn.textContent = 'Flash ' + otaSelectedRelease.tagName + ' to Device';
+        }
+    }, 4000);
+}
+
+function setOtaProgress(text, percent) {
+    document.getElementById('otaProgressText').textContent = text;
+    document.getElementById('otaProgressPercent').textContent = percent + '%';
+    document.getElementById('otaProgressFill').style.width = percent + '%';
+}
+
+function setOtaStatus(text, type) {
+    const el = document.getElementById('otaStatus');
+    el.textContent = text;
+    const colors = {
+        info: 'var(--accent)',
+        warn: 'var(--amber)',
+        success: 'var(--green)',
+        error: 'var(--red)'
+    };
+    const bgs = {
+        info: 'rgba(59,130,246,0.06)',
+        warn: 'rgba(245,158,11,0.06)',
+        success: 'rgba(16,185,129,0.06)',
+        error: 'rgba(239,68,68,0.06)'
+    };
+    el.style.color = colors[type] || 'var(--text3)';
+    el.style.background = bgs[type] || 'transparent';
+}
+
+function logOta(text, type) {
+    if (typeof varunaConsole !== 'undefined' && varunaConsole.initialized) {
+        varunaConsole.addLine(text, type || 'info');
+    }
+}
+```
+
+**IMPORTANT NOTE ABOUT `window.` PREFIX:** Because the code is inside a `<script type="module">` block, functions called from HTML `onclick` attributes must be attached to `window`. That is why `openOtaModal`, `closeOtaModal`, `onOtaReleaseSelected`, and `startOtaFlash` are assigned as `window.functionName = function()`. If the original file already has existing `openOtaModal` or `closeOtaModal` function definitions, REMOVE only those specific old function definitions and replace them with the new ones above. Do NOT remove any other functions.
+
+---
+
+## SUMMARY OF ALL CHANGES (and NOTHING else)
+
+| # | What | Action |
+|---|------|--------|
+| 1 | Firebase database import line | Add `off` to the import if not already present |
+| 2 | After `db` initialization | INSERT GitHub constants + `window._firebase*` globals |
+| 3 | Existing OTA modal HTML block | REPLACE with new modal HTML |
+| 4 | In the `<script>` section | INSERT new OTA JavaScript functions |
+| 5 | Old `openOtaModal`/`closeOtaModal` definitions if they exist | REPLACE only those specific functions with the new `window.` versions |
+
+**NOTHING ELSE CHANGES. Every other line of HTML, CSS, and JavaScript must be identical to the original file.**
+
+**Output the complete, full HTML file.**
+
+---
