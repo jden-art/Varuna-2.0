@@ -1,7 +1,25 @@
 # Varuna — Complete Implementation Roadmap
 
 ---
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
 
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyAAvL-yCNXxDglQYc5aIMVhUZCJ7XXIOVo",
+  authDomain: "varuna-git-1e145.firebaseapp.com",
+  databaseURL: "https://varuna-git-1e145-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "varuna-git-1e145",
+  storageBucket: "varuna-git-1e145.firebasestorage.app",
+  messagingSenderId: "296662102641",
+  appId: "1:296662102641:web:8c41cda4b23a9a9bc321d0"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+---
 ## How This is Organized
 
 ```
