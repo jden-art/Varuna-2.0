@@ -1,3 +1,17 @@
+/home/anura/Downloads/Varuna/QUIRK/c3_git_fb_web.ino/c3_git_fb_web.ino.ino: In function 'void pushCSVToFirebase(const char*)':
+/home/anura/Downloads/Varuna/QUIRK/c3_git_fb_web.ino/c3_git_fb_web.ino.ino:858:14: error: 'latestPath' was not declared in this scope
+  858 |     snprintf(latestPath, sizeof(latestPath), "devices/%s/latest", DEVICE_ID);
+      |              ^~~~~~~~~~
+Multiple libraries were found for "SD.h"
+  Used: /home/anura/.arduino15/packages/esp32/hardware/esp32/3.3.7/libraries/SD
+  Not used: /home/anura/.arduino15/libraries/SD
+exit status 1
+
+Compilation error: 'latestPath' was not declared in this scope
+
+
+
+
 https://varuna-git-1e145-default-rtdb.asia-southeast1.firebasedatabase.app
 https://varuna-git-1e145-default-rtdb.asia-southeast1.firebasedatabase.app/
 devices
