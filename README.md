@@ -1,6 +1,33 @@
 https://console.firebase.google.com/u/0/project/varuna-git-1e145/database/varuna-git-1e145-default-rtdb/data/~2F
 
+**FIREBASE_HOST:**
+```cpp
+#define FIREBASE_HOST "varuna-git-1e145-default-rtdb.asia-southeast1.firebasedatabase.app"
+```
 
+---
+
+**FIREBASE_AUTH** — you need your Database Secret. Get it here:
+
+1. Go to your Firebase Console → Project Settings (gear icon)
+2. Click **Service accounts** tab
+3. Scroll down to **Database secrets**
+4. Click **Show** and copy it
+
+It'll look like a long random string: `ABcd1234efgh5678...`
+
+```cpp
+#define FIREBASE_AUTH "paste-your-secret-here"
+```
+
+---
+
+**Also fix DEVICE_ID while you're in there** so OTA works:
+```cpp
+#define DEVICE_ID "VARUNA_001"
+```
+
+Those are the only three lines to change in `C3.ino`.
 
 
 # Varuna — Complete Implementation Roadmap
