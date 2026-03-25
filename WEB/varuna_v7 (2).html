@@ -29,7 +29,7 @@ window._fbRef = ref;
 window._fbSet = set;
 window._fbOnValue = onValue;
 window._fbOff = (reference) => { off(reference); };
-const liveRef=ref(db,'varuna/live');
+const liveRef = ref(db, 'devices/VARUNA_001/latest');
 window._fbReady=false;
 onValue(liveRef,(snap)=>{
   const val=snap.val();
