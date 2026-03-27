@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- boot.svg — Shield with checkmark (Boot screen) -->
+<!-- viewBox: 0 0 24 24, paths filled black so SvgIcon mask coloring works -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Shield outline -->
+  <path d="M12 2L4 6v5c0 4.97 3.42 9.62 8 10.93C16.58 20.62 20 15.97 20 11V6L12 2Z"
+        fill="#000000"/>
+  <!-- Checkmark (white cutout effect — leave SVG dark, mask provides color) -->
+  <!-- We use a slightly lighter path so the check reads; mask turns it all one color -->
+  <path d="M9 12.5l2 2 4-4" stroke="#ffffff" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
