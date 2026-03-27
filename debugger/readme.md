@@ -1,3 +1,663 @@
+```
+You are an expert QML/Qt Quick UI designer and developer specializing in
+embedded automotive-grade interfaces. I am going to provide you with a QML
+UI file (or multiple files). Your task is to COMPLETELY REDESIGN the visual
+presentation and rewrite the UI code following the exact specifications
+below. Every single detail matters. Do not skip or simplify anything.
+
+═══════════════════════════════════════════════════════════════
+CRITICAL RULE — BACKEND PRESERVATION (READ THIS FIRST)
+═══════════════════════════════════════════════════════════════
+
+You have FULL CREATIVE FREEDOM to completely redesign, reimagine,
+restructure, and rebuild the UI from scratch to make it as visually
+stunning, polished, and professional as possible. You are NOT limited
+to the original layout, arrangement, color scheme, component structure,
+or visual hierarchy. Tear it apart and rebuild it beautifully.
+
+HOWEVER — you MUST preserve ALL backend integration points perfectly.
+This means:
+
+1. EVERY signal/slot connection to C++ backend must remain intact
+   and functional. If the original code has:
+     Connections { target: backendObject; ... }
+   your redesigned code MUST keep the exact same connection with
+   the exact same target and signal names.
+
+2. EVERY property binding to a C++ exposed property must use the
+   EXACT SAME property name and object reference. If the original
+   has:
+     text: myBackend.temperatureValue
+   your redesigned version must still read from myBackend.temperatureValue
+   even if you display it in a completely different visual component.
+
+3. EVERY function call to the backend must remain unchanged:
+     onClicked: myBackend.togglePower()
+   must still call myBackend.togglePower() — you can wrap it in
+   additional UI animation logic, but the backend call MUST fire.
+
+4. EVERY context property, registered QML type, and backend model
+   (ListModel from C++, QAbstractItemModel, etc.) must be consumed
+   with the exact same names and role names.
+
+5. ALL "objectName" properties that the C++ backend uses for
+   findChild<>() lookups MUST be preserved on the correct items.
+
+6. If the backend expects certain QML items to exist (e.g., for
+   dynamic object creation via QQmlComponent), maintain those
+   structural expectations.
+
+APPROACH: Before redesigning, first analyze the provided QML and
+extract a complete list of:
+  - All C++ backend object references (context properties, registered types)
+  - All signal connections (Connections{} blocks, onSignalName handlers)
+  - All property bindings to backend (model.roleName, backend.property)
+  - All function/method calls to backend (backend.methodName())
+  - All objectName values used for C++ lookups
+  - All model references (ListModel, C++ models, delegates)
+
+Present this list FIRST before the redesigned code, formatted as:
+
+╔═══════════════════════════════════════════════════════════════╗
+║  BACKEND INTERFACE MAP (Preserved Exactly)                    ║
+╠═══════════════════════════════════════════════════════════════╣
+║ Backend Objects: [list them]                                  ║
+║ Signal Connections: [list them]                               ║
+║ Property Bindings: [list them]                                ║
+║ Method Calls: [list them]                                     ║
+║ Object Names: [list them]                                     ║
+║ Models & Roles: [list them]                                   ║
+╚═══════════════════════════════════════════════════════════════╝
+
+This serves as a contract — every item in this table MUST appear
+in the final redesigned QML code. If even ONE is missing, the
+redesign is invalid.
+
+THE GOLDEN RULE: The backend developer should be able to swap the
+old QML files with your new QML files and EVERYTHING should work
+identically from a functional/data perspective — only the VISUAL
+APPEARANCE and ANIMATION BEHAVIOR changes. Zero backend modifications.
+The user should see a completely transformed, beautiful interface
+while every button still triggers the same action, every display
+still shows the same data, and every interaction still produces
+the same functional result.
+
+═══════════════════════════════════════════════════════════════
+CREATIVE REDESIGN MANDATE
+═══════════════════════════════════════════════════════════════
+
+You are EXPECTED and ENCOURAGED to:
+
+✓ Completely change the layout structure if it improves the UX
+  (e.g., move a sidebar to a bottom bar, convert a list into
+  cards, turn a flat page into a tabbed interface, etc.)
+✓ Add visual elements that didn't exist before (decorative
+  separators, subtle background gradients, section headers,
+  status indicators, progress visualizations, etc.)
+✓ Reorder information hierarchy for better visual flow
+  (most important info = most prominent placement)
+✓ Split a cluttered single-page layout into a clean multi-tab
+  or multi-section layout with smooth transitions between them
+✓ Introduce new micro-interactions and animations that make the
+  UI feel alive and responsive (as long as they hit 60fps on RPi4)
+✓ Redesign every single component (buttons, sliders, toggles,
+  inputs, lists, headers, footers, modals) from scratch to match
+  the Tesla × Google design language specified below
+✓ Add tasteful empty states, loading states, and error states
+  even if the original UI didn't have them
+✓ Implement visual feedback for EVERY user interaction
+✓ Add smooth page/view transitions even if the original had none
+✓ Improve information density — show the same data more elegantly
+  with better typography, spacing, and visual hierarchy
+✓ Transform ugly or default-styled components into custom-designed
+  equivalents that look like they belong in a $100K vehicle dashboard
+
+You are NOT allowed to:
+✗ Remove any functionality that the backend provides
+✗ Rename or alter any backend-facing identifiers
+✗ Ignore any data source — all backend data must still be displayed
+  (though HOW and WHERE you display it is your creative choice)
+✗ Add backend dependencies that don't exist in the original
+✗ Create UI elements that call backend methods not in the original
+
+═══════════════════════════════════════════════════════════════
+PLATFORM CONSTRAINTS (CRITICAL)
+═══════════════════════════════════════════════════════════════
+
+Target Hardware: Raspberry Pi 4 Model B — 4GB RAM
+- GPU: VideoCore VI (OpenGL ES 3.1, Vulkan 1.0)
+- CPU: Quad-core Cortex-A72 @ 1.5GHz
+- Qt Version: Qt 5.15 LTS or Qt 6.5+ (confirm with me which to use)
+- Renderer: Qt Quick Scene Graph (OpenGL ES 2.0/3.0 backend)
+- MUST maintain 60fps at all times. If a visual effect risks dropping
+  frames, provide a simpler fallback with a comment explaining why.
+
+Performance Rules (NON-NEGOTIABLE):
+1. NO JavaScript-heavy logic in property bindings — use declarative
+   bindings or C++ backend signals wherever possible
+2. NO shader effects (ShaderEffect, ShaderEffectSource) unless
+   absolutely necessary — if used, keep fragment shaders under
+   20 instructions
+3. LIMIT concurrent animations to a maximum of 8 simultaneous
+   property animators at any given moment
+4. USE Animator types (XAnimator, OpacityAnimator, ScaleAnimator,
+   RotationAnimator) instead of Animation types wherever possible,
+   as Animators run on the render thread and are smoother on RPi4
+5. USE layer.enabled SPARINGLY — each layered item consumes an FBO
+   (framebuffer object); never nest layered items
+6. Image assets should use power-of-2 dimensions when possible and
+   be pre-scaled to display size — no runtime scaling of large images
+7. Use "smooth: false" on items that don't need anti-aliased rendering
+8. Prefer "visible: false" over "opacity: 0" for hidden elements to
+   avoid unnecessary rendering
+9. Use Loader {} for screens/views not currently displayed to free
+   memory and GPU resources
+10. Avoid rounded rectangles (radius) on large elements — use
+    pre-made rounded PNG assets instead if the rectangle exceeds
+    400x400px
+11. Text elements: set renderType: Text.NativeRendering for small
+    text to reduce texture atlas pressure
+12. ListView/GridView: set cacheBuffer appropriately (don't cache
+    entire massive lists), use hybrid delegates
+
+═══════════════════════════════════════════════════════════════
+SCREEN ADAPTABILITY & RESPONSIVE DESIGN (MANDATORY)
+═══════════════════════════════════════════════════════════════
+
+The UI MUST be fully adaptive and render correctly on ALL screen
+sizes and resolutions. It must look equally polished whether
+displayed on a 5-inch 800x480 panel, a 7-inch 1024x600 display,
+a 10.1-inch 1280x800 screen, a 15.6-inch 1920x1080 monitor,
+or any other resolution the RPi4 may output via HDMI or DSI.
+
+Responsive Architecture Requirements:
+
+1. NEVER hardcode pixel dimensions for layout containers.
+   ALL top-level layout dimensions must use relative sizing:
+     width: parent.width * 0.85    // percentage-based
+     height: parent.height - headerBar.height  // relational
+   The ONLY acceptable hardcoded pixel values are:
+     - Minimum touch target sizes (minimum 44x44px for accessibility)
+     - Icon dimensions (20, 24, 32px — these are fixed assets)
+     - Border widths (1px dividers)
+     - Small fixed spacing (4, 8px micro-padding)
+
+2. DEFINE BREAKPOINTS in Theme.qml for adaptive layout switching:
+
+   readonly property bool isCompact: root.width < 600
+   // Compact: phones, small 5" panels (< 600px wide)
+   // Single column, bottom nav, stacked layout
+
+   readonly property bool isMedium: root.width >= 600 && root.width < 1024
+   // Medium: 7" tablets, standard RPi displays (600–1023px)
+   // Optional side nav (collapsed), 2-column where appropriate
+
+   readonly property bool isExpanded: root.width >= 1024
+   // Expanded: 10"+ screens, desktop monitors (1024px+)
+   // Full side nav, multi-column layouts, more content visible
+
+   Components must query these breakpoints to adapt their layout:
+
+   // Example: Navigation adapts to screen size
+   TNavBar {
+       orientation: Theme.isCompact ? Qt.Horizontal : Qt.Vertical
+       // Bottom bar on small screens, side bar on large screens
+       width: Theme.isCompact ? parent.width
+            : Theme.isMedium ? dp(56)
+            : dp(72)
+   }
+
+3. IMPLEMENT a dp() (density-independent pixel) scaling function
+   in Theme.qml based on a reference resolution:
+
+   // Reference design resolution: 1280x720
+   readonly property real scaleFactor: Math.min(
+       root.width / 1280.0,
+       root.height / 720.0
+   )
+
+   function dp(value) {
+       return Math.round(value * scaleFactor)
+   }
+
+   ALL spacing, padding, margins, font sizes, border radii, and
+   component dimensions must use dp() to scale proportionally:
+
+     font.pixelSize: Theme.dp(15)       // body text
+     padding: Theme.dp(16)              // card padding
+     radius: Theme.dp(12)               // card corner radius
+     spacing: Theme.dp(8)               // layout spacing
+     height: Theme.dp(48)               // button height
+
+   This ensures the UI maintains identical proportions and visual
+   balance regardless of whether it's on a 480p or 1080p screen.
+
+4. FONT SCALING must be handled through dp() but with additional
+   safeguards:
+   - Minimum readable font size: dp(10) but never below 8px actual
+   - Maximum display font size: dp(48) but never above 64px actual
+   - Implement in Theme.qml:
+
+     function sp(value) {
+         // sp = scaled pixels for text (with min/max clamps)
+         var scaled = Math.round(value * scaleFactor)
+         return Math.max(8, Math.min(scaled, 64))
+     }
+
+   Use sp() for all font.pixelSize declarations.
+
+5. LAYOUT FLOW must adapt intelligently:
+
+   For COMPACT screens (< 600px):
+   - Single-column layout exclusively
+   - Bottom navigation bar (horizontal, icon-only, 56px tall)
+   - Full-width cards with 12px horizontal margin
+   - Modals become full-screen overlays
+   - Headers shrink: reduce title font, hide subtitle if needed
+   - Collapsible sections to save vertical space
+   - Swipe gestures for page navigation (optional)
+
+   For MEDIUM screens (600–1023px):
+   - Single or two-column layout depending on content
+   - Collapsed side navigation (icon-only, 56px wide) OR bottom nav
+   - Cards can sit side-by-side in pairs
+   - Modals are centered overlays (80% screen width max)
+   - Standard spacing and typography
+
+   For EXPANDED screens (1024px+):
+   - Multi-column layouts (2 or 3 columns)
+   - Expanded side navigation with icon + label (200–240px wide)
+   - Dashboard-style grid of cards
+   - Modals are centered with max-width of 560px
+   - More generous whitespace and larger typography
+   - Can show more data simultaneously (e.g., detail panel beside list)
+
+6. GRID SYSTEM: Implement a flexible column grid:
+
+   property int columnCount: Theme.isCompact ? 4
+                            : Theme.isMedium ? 8
+                            : 12
+
+   Components should span appropriate numbers of grid columns.
+   Cards in a dashboard might span:
+   - Compact: 4/4 columns (full width)
+   - Medium: 4/8 columns (half width, two per row)
+   - Expanded: 4/12 columns (third width, three per row)
+
+7. TOUCH TARGET ADAPTATION:
+   - On all screen sizes, interactive elements must be minimum 44x44px
+     ACTUAL rendered pixels (after dp scaling). If dp(44) results in
+     less than 44 actual pixels, clamp to 44px.
+   - Add invisible padding/hit areas if visual element is smaller than
+     44px but must remain tappable
+
+8. IMAGE & ICON SCALING:
+   - Icons: use dp() for sizing, set sourceSize to match display size
+     to avoid texture waste
+   - Background images: use fillMode: Image.PreserveAspectCrop
+   - Never stretch images disproportionally
+
+9. SCROLLING CONSIDERATIONS:
+   - On compact screens, content that fits on expanded screens without
+     scrolling may need to become scrollable — wrap in Flickable or
+     ScrollView with appropriate clip: true
+   - Use ScrollBar.vertical with auto-hide behavior (opacity fades
+     out after 1.5s of inactivity)
+   - Scrollbar styling: 3px wide, accent color at 40% opacity,
+     rounded ends
+
+10. ORIENTATION HANDLING:
+    - If the screen is portrait (height > width), treat it as compact
+      layout regardless of pixel width
+    - If the screen is landscape (width > height), use the breakpoint
+      system described above
+    - The root item should handle orientation changes gracefully with
+      no visual glitches — use anchors and bindings, never absolute
+      positioning
+
+11. SAFE AREAS:
+    - Maintain minimum 16dp padding from all screen edges on compact
+    - Maintain minimum 24dp padding on medium and expanded
+    - Content must never touch or overflow screen boundaries
+    - Account for potential system UI overlays (status bars, notch
+      areas) by using a configurable safeAreaTop / safeAreaBottom
+      property in Theme.qml (default: 0)
+
+12. TESTING MINDSET:
+    The UI must look intentionally designed — not "stretched" or
+    "squished" — at ALL of these resolutions:
+    - 800 × 480   (5" RPi touchscreen)
+    - 1024 × 600  (7" RPi touchscreen)
+    - 1280 × 720  (HD Ready)
+    - 1280 × 800  (10" tablet-style)
+    - 1920 × 1080 (Full HD monitor)
+    At each resolution, the layout should feel like it was specifically
+    designed for that size, not merely scaled.
+
+═══════════════════════════════════════════════════════════════
+DESIGN LANGUAGE & VISUAL IDENTITY
+═══════════════════════════════════════════════════════════════
+
+The UI must embody a fusion of TWO specific design philosophies:
+
+【 GOOGLE MATERIAL DESIGN 3 — Animation & Motion Philosophy 】
+
+- Easing curves: Use Qt.bezier(0.2, 0.0, 0.0, 1.0) for standard
+  transitions (Material 3 "Emphasized" easing). For exits/dismissals,
+  use Qt.bezier(0.4, 0.0, 1.0, 1.0) ("Emphasized Accelerate").
+  For entrance: Qt.bezier(0.0, 0.0, 0.0, 1.0) ("Emphasized Decelerate")
+- Duration standards (use dp-aware values — faster on small screens):
+  • Small elements (icons, toggles): 150–200ms
+  • Medium elements (cards, list items): 250–350ms
+  • Large elements (page transitions, modals): 400–500ms
+  • Micro-interactions (ripples, hover feedback): 100–150ms
+- Motion principles:
+  • SHARED AXIS transitions for navigation within the same hierarchy
+    (content slides along a single axis with coordinated fade)
+  • CONTAINER TRANSFORM for expanding a card/item into a full view
+    (element morphs from its original bounds to fill the screen)
+  • FADE THROUGH for switching between unrelated views
+    (outgoing element fades out + scales down slightly to 0.92,
+     incoming element fades in + scales up from 0.92 to 1.0)
+  • Staggered animations for lists: each item delays by 35-50ms
+    after the previous one, creating a cascade/waterfall effect
+- Ripple/touch feedback: On press, show a subtle radial fill animation
+  from the touch point, using a semi-transparent white (#1AFFFFFF)
+  expanding circle. Duration: 300ms. Use OpacityAnimator for fade-out.
+- Elevation & depth: Simulate Material elevation using subtle drop
+  shadows. Since real-time shadows are expensive on RPi4, use
+  pre-rendered shadow PNGs (9-patch style) or BorderImage with
+  shadow assets OR use a slightly lighter border-top (1px #2A2A35)
+  to simulate depth without GPU cost. Provide 3 elevation levels:
+  • Level 1 (resting): subtle border trick or 2dp shadow asset, 8%
+  • Level 2 (raised/hovered): 6dp shadow asset, 12% opacity
+  • Level 3 (floating/modal): 12dp shadow asset, 18% opacity
+
+【 TESLA AUTOMOTIVE UI — Visual Style & Layout Philosophy 】
+
+- Color palette (STRICT):
+  • Primary Background: #0C0C0E (near-black with subtle blue undertone)
+  • Secondary Background: #1A1A1F (dark charcoal for cards/panels)
+  • Tertiary Background: #252530 (for nested containers, input fields)
+  • Surface Variant: #1E1E28 (alternate card background)
+  • Dividers/Borders: #2A2A35 at 1px, never thicker
+  • Primary Text: #EAEAEA (not pure white — reduces eye strain)
+  • Secondary Text: #8A8A95 (muted for labels, timestamps, hints)
+  • Disabled Text: #4A4A55
+  • Accent Color Primary: #3E82FC (Tesla-inspired electric blue)
+  • Accent Color Hover: #5A9CFF (lighter variant for hover states)
+  • Accent Color Active/Pressed: #2B6BE0 (darker for pressed states)
+  • Accent Subtle: #3E82FC with 10% opacity (for tinted backgrounds)
+  • Success: #34C759 | Warning: #FFB830 | Error: #FF453A
+  • Glass/Overlay: #0C0C0E with 75% opacity
+    (on RPi4, skip blur — just use semi-transparent flat color)
+
+- Typography (ALL sizes must use sp() function for screen adaptation):
+  • Font Family: Use "Inter" (preferred), "Roboto", or "Product Sans"
+    — specify as a FontLoader in QML. If unavailable, fall back to
+    system sans-serif.
+  • Weights: Light (300) for large displays, Regular (400) for body,
+    Medium (500) for labels/buttons, SemiBold (600) for headings
+  • Sizes (reference values — actual rendered via sp()):
+    - Hero/Display: sp(44), weight 300, letter-spacing: -1.5
+    - H1: sp(32), weight 600, letter-spacing: -0.5
+    - H2: sp(24), weight 600
+    - H3: sp(18), weight 500
+    - Body: sp(15), weight 400, line-height: 1.5
+    - Caption: sp(12), weight 400, color: secondary text
+    - Overline: sp(10), weight 500, UPPERCASE, letter-spacing: 1.5
+    - Button Text: sp(14), weight 500, letter-spacing: 0.5
+
+- Layout principles:
+  • Base grid unit: dp(4). All spacing multiples of dp(4)
+  • Generous whitespace — Tesla UIs breathe. Never cram elements.
+  • Edge padding: dp(24) on expanded, dp(16) on compact
+  • Cards: dp(16)–dp(20) internal padding
+  • Between-card spacing: dp(12)–dp(16)
+  • Full-width layouts preferred on compact screens
+  • Multi-column grid on expanded screens
+  • Navigation adapts per breakpoints (described above)
+  • Content corners: dp(12) for cards, dp(8) for buttons,
+    dp(20) for modals, dp(4) for chips/tags
+
+- Iconography:
+  • Simple, single-weight line icons (1.5–2px stroke)
+  • Sizes: dp(20) inline, dp(24) navigation, dp(32) primary actions
+  • Active: filled variant or accent color
+  • Inactive: secondary text color (#8A8A95)
+
+═══════════════════════════════════════════════════════════════
+ANIMATION DETAILS (BE EXTREMELY SPECIFIC)
+═══════════════════════════════════════════════════════════════
+
+For every interactive element, define FOUR states and their transitions:
+1. DEFAULT → HOVERED: subtle brightness increase (+5% lightness on
+   background) or thin accent border glow, 150ms, standard easing
+2. HOVERED → PRESSED: scale down to 0.97, background darkens slightly,
+   100ms, ease-out
+3. PRESSED → RELEASED: ripple completes, scale returns to 1.0, 200ms,
+   spring-like easing (overshoot: 1.02 → 1.0, keep subtle)
+4. RELEASED → DEFAULT: all properties return to rest, 250ms
+
+Page/View Transitions:
+- Forward navigation: New page slides in from right
+  (x: parent.width → 0) with opacity 0 → 1, while current page
+  slides left (x: 0 → -parent.width * 0.3) with opacity 1 → 0.5.
+  Duration: 400ms, emphasized easing.
+- Back navigation: Reverse of above.
+- Use ParallelAnimation with NumberAnimator and OpacityAnimator.
+- Transition distance must be relative (parent.width), never
+  hardcoded pixels, so it works on all screen sizes.
+
+Loading/Skeleton States:
+- While content loads, show skeleton placeholders: rounded rectangles
+  (#1A1A1F) with a subtle shimmer animation. Skeleton shapes should
+  adapt to screen width just like real content would.
+
+Toggle/Switch Animations:
+- Track: dp(44) x dp(24) rounded rectangle. OFF: #3A3A45. ON: accent.
+  Transition: 200ms color animation.
+- Thumb: dp(20) circle, slides left↔right, 200ms ease-in-out.
+
+List Item Appearance (on screen load):
+- Fade in + translate Y from dp(20) to 0, staggered 40ms per item.
+- Maximum stagger for 10 items = 400ms cascade.
+
+Number/Value Changes:
+- Scale pulse (1.0 → 1.08 → 1.0, 200ms) on value update.
+
+═══════════════════════════════════════════════════════════════
+COMPONENT ARCHITECTURE
+═══════════════════════════════════════════════════════════════
+
+Structure the QML code as modular, reusable components:
+
+/components/
+  Theme.qml          — Singleton: colors, fonts, spacing, dp(), sp(),
+                        breakpoints, animation tokens, safe areas
+  TButton.qml        — Primary button with ripple, adapts size via dp()
+  TIconButton.qml    — Icon-only circular button
+  TCard.qml          — Elevated card, adapts padding via dp()
+  TNavBar.qml        — Adapts between side bar / bottom bar per breakpoint
+  TToggle.qml        — Animated toggle switch, scaled via dp()
+  TSlider.qml        — Custom styled slider
+  TTextField.qml     — Input field with floating label animation
+  TListItem.qml      — List item with press feedback, full-width
+  TModal.qml         — Overlay modal, adapts size per breakpoint
+  TPageTransition.qml — Reusable page transition (relative distances)
+  TIcon.qml          — Icon wrapper with dp()-based size
+  TSkeleton.qml      — Skeleton placeholder, width-adaptive
+  TStatusBadge.qml   — Status indicator dot/badge
+  TDivider.qml       — Styled divider, full-width or inset
+  TResponsiveGrid.qml — Responsive grid layout that adapts columns
+                         based on breakpoints automatically
+
+/qmldir              — Module definition file
+
+Each component must:
+- Accept width/height from parent or use dp() defaults
+- NEVER assume a specific screen resolution
+- Have clear "property" APIs at the top
+- Include inline documentation with responsive behavior notes
+- Handle all interaction states
+- Have a "disabled" state (opacity: 0.38, no interactions)
+
+═══════════════════════════════════════════════════════════════
+CODE QUALITY STANDARDS
+═══════════════════════════════════════════════════════════════
+
+1. Every file starts with a comment block:
+   // FileName.qml
+   // Description: [what this component/page does]
+   // Backend dependencies: [list any backend objects this file uses]
+   // Responsive behavior: [how it adapts across breakpoints]
+   // Performance notes: [any RPi4-specific considerations]
+
+2. Property declarations at the top, grouped:
+   // — Configuration Properties —
+   // — Style Properties —
+   // — State Properties —
+   // — Signal Declarations —
+   // — Backend Bindings (DO NOT MODIFY) —
+
+3. Descriptive id names: "navBarRoot", "contentArea", "headerTitle"
+   — never "rect1", "item2"
+
+4. ALL colors from Theme.qml singleton — ZERO hardcoded colors
+   in page files
+
+5. ALL dimensions use dp() or sp() — ZERO hardcoded pixel sizes
+   for layout elements (exceptions: 1px borders, icon source sizes)
+
+6. All magic numbers named or commented
+
+7. Animations guarded by visibility
+
+8. Backend properties commented:
+   // BACKEND BINDING — preserved from original
+   text: myBackend.sensorValue
+
+9. Backend signals commented:
+   // BACKEND SIGNAL — preserved from original
+   onDataUpdated: { /* original logic preserved */ }
+
+═══════════════════════════════════════════════════════════════
+WHAT TO DELIVER
+═══════════════════════════════════════════════════════════════
+
+1. The BACKEND INTERFACE MAP table — comes FIRST before any code
+2. Theme.qml singleton with ALL design tokens including dp(), sp(),
+   breakpoint booleans, safe area properties
+3. Complete, copy-paste-ready QML code for EVERY file — fully
+   redesigned with responsive layouts
+4. A RESPONSIVE BEHAVIOR TABLE showing how major layout sections
+   adapt across the three breakpoints (compact/medium/expanded):
+
+   ┌──────────────────┬────────────┬────────────┬────────────┐
+   │ Component        │ Compact    │ Medium     │ Expanded   │
+   ├──────────────────┼────────────┼────────────┼────────────┤
+   │ Navigation       │ Bottom bar │ Side (icon)│ Side (full)│
+   │ Main content     │ 1 column   │ 1-2 cols   │ 2-3 cols   │
+   │ Cards            │ Full width │ Half width │ Third width│
+   │ Modal dialogs    │ Fullscreen │ 80% width  │ 560px max  │
+   │ Typography scale │ 0.85x     │ 1.0x       │ 1.0–1.1x  │
+   └──────────────────┴────────────┴────────────┴────────────┘
+
+5. A MIGRATION GUIDE:
+   - Files changed / added
+   - Asset files needed (fonts, shadow PNGs, icons)
+   - New QML module imports required
+   - Step-by-step swap instructions
+
+6. A PERFORMANCE NOTES section:
+   - Elements needing potential RPi4 optimization
+   - 60fps risk areas and implemented fallbacks
+   - Estimated concurrent animation count (heaviest screen)
+   - Memory usage considerations
+   - Scaling performance impact (dp() calculations)
+
+═══════════════════════════════════════════════════════════════
+ABSOLUTE DON'TS (VIOLATIONS = COMPLETE REJECTION)
+═══════════════════════════════════════════════════════════════
+
+✗ Do NOT use pure white (#FFFFFF) backgrounds — ever
+✗ Do NOT use pure black (#000000) — use #0C0C0E minimum
+✗ Do NOT use drop shadows via Qt.labs or Qt5Compat.GraphicalEffects
+  on RPi4
+✗ Do NOT create "toy-like" or "prototype-looking" UIs
+✗ Do NOT misalign ANY element
+✗ Do NOT use Comic Sans, serif fonts, or decorative typefaces
+✗ Do NOT hardcode screen dimensions — use anchors, relative sizing,
+  dp(), and breakpoints
+✗ Do NOT hardcode layout widths/heights in raw pixels
+  (use dp() or parent-relative percentages)
+✗ Do NOT assume any specific screen resolution — the UI must work
+  on 800x480 through 1920x1080 and everything in between
+✗ Do NOT create components that overflow the screen at ANY resolution
+✗ Do NOT create layouts that leave excessive empty space on large
+  screens or feel cramped on small screens
+✗ Do NOT leave any interactive element without visual feedback
+✗ Do NOT use Qt Quick Controls default styling
+✗ Do NOT put complex JS in Component.onCompleted for visual logic
+✗ Do NOT rename, remove, modify, or break ANY backend interface point
+✗ Do NOT add calls to backend methods that don't exist in the original
+✗ Do NOT assume backend properties that aren't in the original code
+✗ Do NOT change the type of any backend data consumption
+✗ Do NOT use absolute positioning (x, y coordinates) for primary
+  layout — use anchors, Layouts (RowLayout, ColumnLayout, GridLayout),
+  or positioners (Row, Column, Grid, Flow) exclusively.
+  The only exception is for decorative overlays or animation targets.
+
+═══════════════════════════════════════════════════════════════
+FINAL CHECKLIST (VERIFY BEFORE DELIVERING)
+═══════════════════════════════════════════════════════════════
+
+□ Every backend object reference from the original appears in the
+  redesigned code — not one is missing
+□ Every signal connection is preserved with identical target/signal
+□ Every property binding to backend data is intact
+□ Every backend method call fires in the same user-interaction context
+□ Every objectName is preserved on its correct component
+□ All models are consumed with correct role names
+□ No new backend dependencies were introduced
+□ All animations use Animator types where possible
+□ No more than 8 concurrent animations on any single screen
+□ layer.enabled used on 3 or fewer items per screen
+□ No GraphicalEffects imports
+□ All colors from Theme.qml
+□ ALL dimensions use dp() or sp() — no hardcoded layout pixels
+□ Breakpoints defined and all major components adapt
+□ UI renders correctly at 800x480 (compact)
+□ UI renders correctly at 1024x600 (medium)
+□ UI renders correctly at 1280x720 (medium/expanded)
+□ UI renders correctly at 1920x1080 (expanded)
+□ No content overflow or clipping at any resolution
+□ No excessive whitespace or wasted space at any resolution
+□ Touch targets are minimum 44px at all resolutions
+□ Navigation adapts between bottom bar and side bar
+□ Every interactive element has hover/press/disabled states
+□ Page transitions use relative distances (not hardcoded pixels)
+□ Responsive behavior table provided
+□ Code compiles without errors (valid QML syntax throughout)
+
+═══════════════════════════════════════════════════════════════
+
+Here is the QML UI to redesign:
+
+[PASTE YOUR QML CODE / FILES HERE]
+
+Redesign it completely following every specification above. You have
+full creative freedom to reimagine the visual design, layout, and
+animation — make it breathtakingly beautiful and adaptive to every
+screen size. But ensure that swapping in your new files requires
+ZERO changes to the C++ backend. The result should look and feel
+like a premium fusion of Google's Material You fluidity and Tesla's
+dark, sophisticated automotive interface — running buttery smooth
+at 60fps on a Raspberry Pi 4 and looking perfectly intentional on
+screens ranging from 800x480 to 1920x1080.
+```
+
+
 
 # VARUNA Debugger — Full Phase & Step Plan (Corrected)
 
